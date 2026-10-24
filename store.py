@@ -8,6 +8,7 @@
 """
 import abc
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import io
 import json
@@ -33,6 +34,8 @@ WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))
 DB_PATH = os.environ.get("TGND_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tgnd.db"))
 BACKEND = os.environ.get("TGND_BACKEND", "sqlite")
 DB_NAME = "tgnd.db.xz"
+LOCK_NAME = "tgnd.lock"
+LOCK_TTL = 120                     # 锁超过这么久没释放就视为残留
 
 
 # ---------- 基础工具 ----------
@@ -94,6 +97,25 @@ def is_db_msg(msg) -> bool:
         if getattr(a, "file_name", None) == DB_NAME:
             return True
     return False
+
+
+def is_lock_msg(msg) -> bool:
+    doc = getattr(msg, "document", None)
+    if doc is None:
+        return False
+    for a in doc.attributes:
+        if getattr(a, "file_name", None) == LOCK_NAME:
+            return True
+    return False
+
+
+def parse_lock(msg):
+    """返回 (token, ts)。"""
+    try:
+        d = json.loads((msg.message or "").strip() or "{}")
+        return d.get("lock", ""), float(d.get("ts", 0))
+    except Exception:
+        return "", 0.0
 
 
 def parse_name(msg):
@@ -386,16 +408,46 @@ def make_backend(name: str | None = None, **kw) -> Backend:
 
 
 # ---------- 业务层 ----------
+class _WriteGuard:
+    """把 `async with self.lock:` 升级成「抢分布式锁 + 互斥 + 收尾上传快照」。"""
+
+    def __init__(self, store):
+        self.s = store
+
+    async def __aenter__(self):
+        await self.s.acquire()
+        await self.s.mutex.acquire()
+        return self
+
+    async def __aexit__(self, *exc):
+        try:
+            if self.s.dirty:
+                try:
+                    await self.s.snapshot()
+                except Exception as e:
+                    log.warning("快照上传失败: %s", e)
+        finally:
+            self.s.mutex.release()
+            try:
+                await self.s.release()
+            except Exception as e:
+                log.warning("释放锁失败: %s", e)
+
+
 class Store:
     def __init__(self, client: TelegramClient, chat, backend: Backend | None = None):
         self.client = client
         self.chat = chat
         self.backend = backend or make_backend()
-        self.lock = asyncio.Lock()
+        self.mutex = asyncio.Lock()
+        self.lock = _WriteGuard(self)
         self.dirty = False
         self.last_id = 0
         self.snap_msg_id = 0
         self.snap_doc_id = 0
+        self.lock_msg_id = 0
+        self._in_guard = False
+        self.token = self._make_token()
 
     @property
     def entries(self):
@@ -522,18 +574,19 @@ class Store:
     async def delete(self, path: str, recursive=True):
         p = norm(path)
         await self.ensure_fresh()
-        e = self.backend.get(p)
-        if not e:
-            raise FileNotFoundError(p)
-        if e.is_dir:
-            if self.children(p) and not recursive:
-                raise OSError("目录非空")
-            kids = [x for x in self.backend.paths_under(p) if x != p]
-            for k in sorted(kids, key=len, reverse=True):
-                await self._drop(k)
-            await self._drop(p)
-        else:
-            await self._drop(p)
+        async with self.lock:
+            e = self.backend.get(p)
+            if not e:
+                raise FileNotFoundError(p)
+            if e.is_dir:
+                if self.children(p) and not recursive:
+                    raise OSError("目录非空")
+                kids = [x for x in self.backend.paths_under(p) if x != p]
+                for k in sorted(kids, key=len, reverse=True):
+                    await self._drop(k)
+                await self._drop(p)
+            else:
+                await self._drop(p)
 
     async def move(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
@@ -684,6 +737,101 @@ class Store:
         ent = await self.client.get_entity(self.chat)
         full = await self.client(GetFullChannelRequest(ent))
         return getattr(full.full_chat, "pinned_msg_id", None)
+
+    @staticmethod
+    def _make_token() -> str:
+        """锁标识：盐由 TG_SESSION 派生，再和 session 一起哈希。"""
+        sess = os.environ.get("TG_SESSION", "")
+        salt = hashlib.sha256(sess.encode()).hexdigest()[:16]
+        return hashlib.sha256((salt + sess).encode()).hexdigest()[:32]
+
+    async def _lock_msg(self):
+        async for m in self.client.iter_messages(self.chat, limit=10):
+            if is_lock_msg(m):
+                return m
+        return None
+
+    async def _lock_bytes(self, m) -> bytes:
+        fd, tmp = tempfile.mkstemp(prefix="tgnd_lock_")
+        os.close(fd)
+        try:
+            await self.client.download_media(m, file=tmp)
+            with open(tmp, "rb") as f:
+                return f.read()
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    async def _set_lock(self, msg_id: int, payload: bytes):
+        await self.client.edit_message(
+            self.chat, msg_id, file=io.BytesIO(payload), force_document=True,
+            attributes=[DocumentAttributeFilename(LOCK_NAME)])
+
+    async def acquire(self, timeout: int = 60):
+        """锁就是一个 tgnd.lock 文件：大小 1 且内容 0x00 = 空闲，大小 32 = 锁定（内容为持有者 token）。"""
+        mine = self.token.encode()
+        end = time.time() + timeout
+        while True:
+            m = await self._lock_msg()
+            if m is None:
+                msg = await self.client.send_file(
+                    self.chat, io.BytesIO(mine), caption="", force_document=True,
+                    attributes=[DocumentAttributeFilename(LOCK_NAME)])
+                self.lock_msg_id = msg.id
+                log.info("创建锁 msg %d", msg.id)
+                return
+            size = m.document.size if m.document else 0
+            if size == 1:                                  # 空闲
+                await self._set_lock(m.id, mine)
+                self.lock_msg_id = m.id
+                log.info("锁 msg %d 空闲 → 占用", m.id)
+                return
+            data = await self._lock_bytes(m)
+            if data == mine:                               # 已经是自己的锁
+                self.lock_msg_id = m.id
+                return
+            age = time.time() - (m.date.timestamp() if m.date else 0)
+            if age > LOCK_TTL:                             # 残留锁，强制释放
+                log.warning("锁 msg %d 已 %.0fs 未释放，强制置空", m.id, age)
+                await self._set_lock(m.id, b"\x00")
+                continue
+            if time.time() > end:
+                raise TimeoutError("索引正被另一个节点写入，等待超时")
+            await asyncio.sleep(1.5)
+
+    async def release(self):
+        """把锁文件改成 1 字节的 0x00，表示空闲。"""
+        if not self.lock_msg_id:
+            return
+        try:
+            await self._set_lock(self.lock_msg_id, b"\x00")
+        except Exception as e:
+            log.warning("释放锁失败: %s", e)
+        self.lock_msg_id = 0
+
+    @asynccontextmanager
+    async def guard(self):
+        """写操作统一入口：先同步远端 → 抢锁 → 干完上传快照 → 放锁。"""
+        if self._in_guard:                      # 重入（_drop 等内部调用）
+            yield
+            return
+        self._in_guard = True
+        try:
+            await self.ensure_fresh()
+            await self.acquire()
+            try:
+                yield
+            finally:
+                if self.dirty:
+                    try:
+                        await self.snapshot()
+                    except Exception as e:
+                        log.warning("快照上传失败: %s", e)
+                await self.release()
+        finally:
+            self._in_guard = False
 
     async def ensure_fresh(self):
         """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。
