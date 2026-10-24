@@ -63,15 +63,18 @@ def base_of(p: str) -> str:
 
 
 def digest_of(path: str, bufsize: int = 4 << 20) -> str:
-    """内容摘要：sha256（16 进制，64 hex）。用于识别与校验，也用于秒传。"""
-    h = hashlib.sha256()
+    """内容摘要：SHAKE-128 取 128 bit（32 hex）。用于识别与校验，也用于秒传。
+
+    32 字符 + ".序号"，稳稳在 TG 的 64 字符文件名额度内，不用再截断。
+    """
+    h = hashlib.shake_128()
     with open(path, "rb") as f:
         while True:
             b = f.read(bufsize)
             if not b:
                 break
             h.update(b)
-    return h.hexdigest()
+    return h.hexdigest(16)
 
 
 def is_path_session(val: str) -> bool:
@@ -565,7 +568,7 @@ class Store:
                     digest = old.md5
             base_idx = start_index if start_index is not None else (
                 (max(parts) + 1) if parts else 0)
-            tag = (digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest())[:40]  # TG 文件名上限 64 字符，留出 ".序号"
+            tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()[:32]
             nparts = max(1, (size + S - 1) // S) if size else 0
             self.backend.set_file(p, digest or tag, size, mt, parts, 1, nparts)
             self.dirty = True
@@ -639,7 +642,7 @@ class Store:
             return e
         size = e.size
         digest = e.md5
-        tag = (digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest())[:40]  # TG 文件名上限 64 字符，留出 ".序号"
+        tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()[:32]
         S = SLICE
         parts: dict[int, int] = {}
 
