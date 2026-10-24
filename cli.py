@@ -24,7 +24,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from store import Store, norm, base_of  # noqa: E402
+from store import Store, norm, base_of, make_session, is_path_session  # noqa: E402
 
 
 def load_env():
@@ -70,7 +70,9 @@ def human(n):
 
 
 def copy_session(src):
-    """服务在跑时 session 有写锁，复制一份给 CLI 用。"""
+    """服务在跑时 session 有写锁，复制一份给 CLI 用。StringSession 无需复制。"""
+    if not is_path_session(src):
+        return None
     dst = tempfile.mktemp(prefix="tgnd_cli_", suffix=".session")
     s = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     d = sqlite3.connect(dst)
@@ -85,7 +87,7 @@ async def get_store():
     load_env()
     src = os.environ["TG_SESSION"]
     tmp = copy_session(src)
-    client = TelegramClient(tmp, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"],
+    client = TelegramClient(tmp or make_session(src), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"],
                             proxy=build_proxy())
     await client.connect()
     if not await client.is_user_authorized():
@@ -98,6 +100,8 @@ async def get_store():
 
 
 def cleanup(tmp):
+    if not tmp:
+        return
     try:
         os.unlink(tmp)
     except OSError:

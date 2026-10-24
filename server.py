@@ -20,7 +20,7 @@ from urllib.parse import quote, unquote, urlsplit
 from aiohttp import web
 from telethon import TelegramClient
 
-from store import Store, norm, parent_of, base_of
+from store import make_session, is_path_session, Store, norm, parent_of, base_of
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dav")
@@ -360,8 +360,10 @@ async def ensure_chat(client, cfg_path="/app/tgnd/chat.json", title="tgnd") -> i
 async def main():
     if not (API_ID and API_HASH):
         sys.exit("缺 TG_API_ID / TG_API_HASH")
-    os.makedirs(os.path.dirname(SESSION), exist_ok=True)
-    client = TelegramClient(SESSION, API_ID, API_HASH)
+    sess = make_session(SESSION)
+    if isinstance(sess, str):
+        os.makedirs(os.path.dirname(sess), exist_ok=True)
+    client = TelegramClient(sess, API_ID, API_HASH)
     await client.connect()
     if not await client.is_user_authorized():
         sys.exit("session 未授权")

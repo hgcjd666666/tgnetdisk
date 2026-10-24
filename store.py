@@ -7,16 +7,72 @@
   超过 SLICE_MB 的文件自动切成多条消息，索引层拼回一个文件。
 """
 import asyncio
+import io
 import logging
 import os
 import time
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.types import DocumentAttributeFilename
 
 log = logging.getLogger("store")
 
 SLICE = int(os.environ.get("SLICE_MB", "1900")) * 1024 * 1024
+
+
+class SliceReader(io.RawIOBase):
+    """把一个文件的 [start, start+length) 当成独立文件交给 telethon，流式读，不落盘不进内存。"""
+
+    def __init__(self, f, start: int, length: int):
+        self._f = f
+        self._start = start
+        self._len = length
+        f.seek(start)
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._f.tell() - self._start
+
+    def seek(self, off, whence=0):
+        base = {0: 0, 1: self.tell(), 2: self._len}[whence]
+        pos = max(0, min(base + off, self._len))
+        self._f.seek(self._start + pos)
+        return pos
+
+    def read(self, n=-1):
+        left = self._len - self.tell()
+        if left <= 0:
+            return b""
+        if n is None or n < 0 or n > left:
+            n = left
+        return self._f.read(n)
+
+    def readinto(self, b):
+        data = self.read(len(b))
+        b[:len(data)] = data
+        return len(data)
+
+    def fileno(self):
+        raise OSError("no fileno")
+
+    def close(self):
+        pass
+
+
+def is_path_session(val: str) -> bool:
+    """TG_SESSION 是文件路径，还是 base64 的 StringSession。"""
+    return val.startswith("/") or val.startswith("./") or val.endswith(".session") or "/" in val
+
+
+def make_session(val: str):
+    """文件路径原样返回；否则当作 StringSession 字符串解码，无需 sqlite。"""
+    return val if is_path_session(val) else StringSession(val)
 
 
 def norm(p: str) -> str:
@@ -183,9 +239,9 @@ class Store:
             base_idx = start_index if start_index is not None else (
                 (max(e.parts) + 1) if e.parts else 0)
 
-            async def send(local, idx_no):
+            async def send(src, idx_no):
                 msg = await self.client.send_file(
-                    self.chat, local, caption=p, force_document=True,
+                    self.chat, src, caption=p, force_document=True,
                     attributes=[DocumentAttributeFilename(f"{now}.{idx_no}")],
                 )
                 sz = int(msg.document.size or 0) if msg.document else 0
@@ -198,23 +254,14 @@ class Store:
                 await send(local_path, base_idx)
             else:
                 n = 0
+                pos = 0
                 with open(local_path, "rb") as f:
-                    while True:
-                        chunk = f.read(S)
-                        if not chunk:
-                            break
-                        part = f"/tmp/tgnd_part_{os.getpid()}_{time.time_ns()}_{n}"
-                        with open(part, "wb") as pf:
-                            pf.write(chunk)
-                        try:
-                            await send(part, base_idx + n)
-                        finally:
-                            try:
-                                os.unlink(part)
-                            except OSError:
-                                pass
+                    while pos < size:
+                        length = min(S, size - pos)
+                        await send(SliceReader(f, pos, length), base_idx + n)
+                        pos += length
                         n += 1
-                        log.info("分片 %d 完成 (%d 字节)", base_idx + n - 1, len(chunk))
+                        log.info("分片 %d 完成 (%d 字节)", base_idx + n - 1, length)
             e.mtime = int(time.time())
             self.entries[p] = e
             return e
