@@ -187,8 +187,13 @@ async def dav_put(request, store):
         with os.fdopen(fd, "wb") as f:
             async for chunk in request.content.iter_chunked(1 << 20):
                 f.write(chunk)
-        mtime = int(time.time())
-        if request.headers.get("X-Update-Mtime") == "false":
+        # 客户端若带了 X-OC-Mtime（ownCloud/Nextcloud 约定）就用它，否则交给 store 取文件 mtime
+        raw = request.headers.get("X-OC-Mtime") or request.headers.get("X-Update-Mtime")
+        try:
+            mtime = int(float(raw)) if raw and raw != "false" else None
+        except ValueError:
+            mtime = None
+        if mtime is not None and mtime <= 0:
             mtime = None
         existed = path in store.entries
         await store.put_file(path, tmp, mtime)

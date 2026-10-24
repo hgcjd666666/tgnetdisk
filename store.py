@@ -234,7 +234,9 @@ class Store:
                 await self._del_ids(old.slices)
                 old = None
             await self._ensure_parents(p)
-            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
+            # 文件名用文件 mtime，且冒号用全角，避免落到 Windows 等半角文件系统时炸掉
+            now = time.strftime("%Y-%m-%d %H：%M：%S", time.localtime(mt))
             e = old if (old and not old.is_dir) else Entry(p, False, int(time.time()))
             base_idx = start_index if start_index is not None else (
                 (max(e.parts) + 1) if e.parts else 0)
@@ -262,7 +264,7 @@ class Store:
                         pos += length
                         n += 1
                         log.info("分片 %d 完成 (%d 字节)", base_idx + n - 1, length)
-            e.mtime = int(time.time())
+            e.mtime = mt
             self.entries[p] = e
             return e
 
