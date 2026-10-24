@@ -52,15 +52,29 @@ def base_of(p: str) -> str:
     return norm(p).rsplit("/", 1)[-1]
 
 
-def md5_of(path: str, bufsize: int = 1 << 20) -> str:
-    h = hashlib.md5()
-    with open(path, "rb") as f:
-        while True:
-            b = f.read(bufsize)
-            if not b:
-                break
-            h.update(b)
-    return h.hexdigest()
+try:
+    import xxhash
+
+    def md5_of(path: str, bufsize: int = 4 << 20) -> str:
+        """内容摘要：xxh3_128（32 hex），只用于识别和校验，不考虑碰撞。"""
+        h = xxhash.xxh3_128()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(bufsize)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+except ImportError:                                       # 没装 xxhash 就退回 md5
+    def md5_of(path: str, bufsize: int = 1 << 20) -> str:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            while True:
+                b = f.read(bufsize)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
 
 
 def is_path_session(val: str) -> bool:
@@ -365,6 +379,7 @@ class Store:
         self.dirty = False
         self.last_id = 0
         self.snap_msg_id = 0
+        self.snap_doc_id = 0
 
     @property
     def entries(self):
@@ -592,6 +607,17 @@ class Store:
         os.close(fd)
         try:
             self.backend.dump(tmp)
+            size = os.path.getsize(tmp)
+            if self.snap_msg_id:
+                try:
+                    await self.client.edit_message(
+                        self.chat, self.snap_msg_id, file=tmp, force_document=True,
+                        attributes=[DocumentAttributeFilename(DB_NAME)])
+                    self.dirty = False
+                    log.info("索引快照已就地替换 (msg %d, %d 字节)", self.snap_msg_id, size)
+                    return None
+                except Exception as e:
+                    log.warning("就地替换失败，改为新发一条: %s", e)
             msg = await self.client.send_file(
                 self.chat, tmp, force_document=True,
                 attributes=[DocumentAttributeFilename(DB_NAME)])
@@ -637,17 +663,24 @@ class Store:
         return getattr(full.full_chat, "pinned_msg_id", None)
 
     async def ensure_fresh(self):
-        """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。"""
+        """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。
+
+        快照用 edit_message 原地替换，消息 id 不变，所以靠 document.id 判断内容是否换过。
+        """
         try:
             pid = await self._pinned_id()
+            if not pid:
+                return False
+            m = await self.client.get_messages(self.chat, ids=pid)
         except Exception as e:
             log.warning("检查置顶失败: %s", e)
             return False
-        if not pid:
+        if not m or not is_db_msg(m):
             return False
-        if self.snap_msg_id and pid == self.snap_msg_id:
+        doc_id = getattr(getattr(m, "document", None), "id", 0)
+        if self.snap_doc_id and doc_id == self.snap_doc_id and pid == self.snap_msg_id:
             return False
-        log.info("检测到索引快照更新 (本地 %s → 远端 %s)，先同步", self.snap_msg_id, pid)
+        log.info("检测到索引快照更新 (doc %s → %s)，先同步", self.snap_doc_id, doc_id)
         await self.load(pid)
         return True
 
@@ -668,6 +701,7 @@ class Store:
             await self.client.download_media(best, file=tmp)
             self.backend.restore(tmp)
             self.snap_msg_id = best.id
+            self.snap_doc_id = getattr(getattr(best, "document", None), "id", 0)
             log.info("已从 TG 载入索引快照 (msg %d)", best.id)
             return True
         finally:
