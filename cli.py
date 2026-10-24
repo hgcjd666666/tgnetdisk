@@ -13,6 +13,8 @@
   tgnd cp <源> <目标>
   tgnd stat <路径>
   tgnd gc [--dry-run]       清理 TG 上没人引用的消息 + 索引里指向已删消息的记录
+  tgnd export-sql [文件.sql]     导出索引为 SQL 文本
+  tgnd import-sql <文件.sql>     从 SQL 文本重建索引
   tgnd reindex              全量扫聊天记录重建索引（正常不需要）
 
 环境变量（默认读 /opt/tgnd/env）:
@@ -30,7 +32,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from store import (Store, LockBusy, norm, base_of, make_session,
-                   is_path_session, digest_of, is_online)  # noqa: E402
+                   is_path_session, digest_of, is_online, DB_PATH)  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -319,7 +321,8 @@ async def cmd_pushdir(st, args):
             print(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
 
     # 只有「把索引推到 TG」这一步需要锁，而且一次 edit 同时落库 + 放锁
-    if st.dirty and is_online():
+    if st.dirty:
+        # 哈希算完、上传之前，先把清单落一次库：崩溃也不至于重算
         print("上传索引快照…", flush=True)
         await st.snapshot_locked()
     print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
@@ -402,6 +405,35 @@ def cmd_stat(st, args):
 USAGE = __doc__
 
 
+async def cmd_export_sql(st, args):
+    """把本地索引导出成 SQL 文本。"""
+    import sqlite3
+    out = args[0] if args else None
+    con = sqlite3.connect(DB_PATH)
+    sql = "\n".join(con.iterdump()) + "\n"
+    con.close()
+    if out:
+        open(out, "w", encoding="utf-8").write(sql)
+        print(f"已导出 {out}（{len(sql)} 字节）")
+    else:
+        sys.stdout.write(sql)
+
+
+async def cmd_import_sql(st, args):
+    """从 SQL 文本重建本地索引（会先清空现有库）。"""
+    import sqlite3
+    if not args:
+        sys.exit("用法: tgnd import-sql <文件.sql>")
+    sql = open(args[0], encoding="utf-8").read()
+    con = sqlite3.connect(DB_PATH)
+    con.executescript(sql)
+    con.commit()
+    n = con.execute("select count(*) from files").fetchone()[0]
+    d = con.execute("select count(*) from dirs").fetchone()[0]
+    con.close()
+    print(f"已导入：{n} 个文件、{d} 个目录")
+
+
 async def main():
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help", "help"):
@@ -427,6 +459,10 @@ async def main():
             await cmd_mv(st, args)
         elif cmd == "cp":
             await cmd_cp(st, args)
+        elif cmd == "export-sql":
+            await cmd_export_sql(st, args)
+        elif cmd == "import-sql":
+            await cmd_import_sql(st, args)
         elif cmd == "gc":
             dry = "--dry-run" in args or "-n" in args
             orphans, missing = await st.gc(dry_run=dry)
