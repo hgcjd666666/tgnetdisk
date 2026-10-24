@@ -547,16 +547,15 @@ class Store:
         # 阶段二：真正把字节传上 TG，这段时间不持锁
         async def send(src, idx_no):
             attrs = [DocumentAttributeFilename(f"{tag}.{idx_no}")]
-            cap = json.dumps({"i": idx_no})
             try:
                 ref = await upload_parallel(self.client, src)
             except Exception as ex:
                 log.warning("并行上传失败，退回顺序: %s", ex)
-                msg = await self.client.send_file(self.chat, src, caption=cap,
-                                                  force_document=True, attributes=attrs)
+                msg = await self.client.send_file(self.chat, src, force_document=True,
+                                                  attributes=attrs)
             else:
-                msg = await self.client.send_file(self.chat, ref, caption=cap,
-                                                  force_document=True, attributes=attrs)
+                msg = await self.client.send_file(self.chat, ref, force_document=True,
+                                                  attributes=attrs)
             parts[idx_no] = msg.id
             self.last_id = max(self.last_id, msg.id)
             return msg
@@ -821,6 +820,7 @@ class Store:
                 self.lock_msg_id = m.id
                 return
             if time.time() > end:
+                log.error("等待索引写锁超过 %d 秒，判定异常退出", timeout)
                 raise TimeoutError("索引正被另一个节点写入，等待超时")
             await asyncio.sleep(1.5)
 
