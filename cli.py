@@ -318,7 +318,7 @@ async def cmd_pushdir(st, args):
 
     # 只有「把索引推到 TG」这一步需要锁，而且一次 edit 同时落库 + 放锁
     if st.dirty:
-        print("上传索引快照（锁内只一次写）…", flush=True)
+        print("上传索引快照…", flush=True)
         await st.snapshot_locked()
     print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
 

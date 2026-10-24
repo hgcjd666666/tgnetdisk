@@ -887,7 +887,8 @@ class Store:
         try:
             self.backend.dump(tmp)                 # 本地压缩，锁外做
             size = os.path.getsize(tmp)
-            await self.acquire()
+            if ONLINE:
+                await self.acquire()
             try:
                 if self.snap_msg_id:
                     try:
@@ -916,8 +917,10 @@ class Store:
                 log.info("索引快照已上传并放锁 (msg %d, %d 字节)", msg.id, size)
                 return msg.id
             finally:
-                if self._holding:
+                if ONLINE and self._holding:
                     await self.release()
+                else:
+                    self._holding = False
         finally:
             try:
                 os.unlink(tmp)
@@ -1111,8 +1114,10 @@ class Store:
         self._in_guard = True
         try:
             await self.ensure_fresh()
-            if not self._holding:
+            if ONLINE and not self._holding:
                 await self.acquire(timeout=timeout, nonblock=(timeout <= 0))
+            elif not ONLINE:
+                self._holding = True
         except Exception:
             self._in_guard = False
             raise
