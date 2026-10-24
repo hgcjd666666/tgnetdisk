@@ -30,7 +30,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from store import (Store, LockBusy, norm, base_of, make_session,
-                   is_path_session, digest_of)  # noqa: E402
+                   is_path_session, digest_of, ONLINE)  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -341,7 +341,7 @@ async def cmd_pushdir(st, args):
         except Exception as ex:
             failed += 1
             print(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
-        if i % 100 == 0 and st.dirty:
+        if ONLINE and i % 100 == 0 and st.dirty:
             try:
                 await st.snapshot_locked()      # 拿不到锁会在 acquire 里抛 LockBusy
             except LockBusy:
