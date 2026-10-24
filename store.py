@@ -830,8 +830,13 @@ class Store:
         log.info("扫描 %d 条消息，%d 个 md5，快照 %d 条", n, len(parts_by_md5), len(snaps))
         return n
 
-    async def snapshot(self):
-        """把索引压成快照传到 TG，置顶并删掉旧的。"""
+    async def snapshot(self, final: bool = False):
+        """把索引压成快照传到 TG，置顶并删掉旧的。
+
+        final=True 时顺便把 caption 改回 lock:null 并清持有标记——
+        一次 edit 同时完成「落库 + 释放锁」，少一次 TG 写。
+        """
+        cap = LOCK_IDLE if final else self._lock_text()
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
         os.close(fd)
         try:
@@ -842,15 +847,19 @@ class Store:
                     await self.client.edit_message(
                         self.chat, self.snap_msg_id, file=tmp, force_document=True,
                         attributes=[DocumentAttributeFilename(DB_NAME)],
-                        text=self._lock_text())
+                        text=cap)
+                    if final:
+                        self._holding = False
                     self.dirty = False
                     log.info("索引快照已就地替换 (msg %d, %d 字节)", self.snap_msg_id, size)
                     return None
                 except Exception as e:
                     log.warning("就地替换失败，改为新发一条: %s", e)
             msg = await self.client.send_file(
-                self.chat, tmp, force_document=True, caption=self._lock_text(),
+                self.chat, tmp, force_document=True, caption=cap,
                 attributes=[DocumentAttributeFilename(DB_NAME)])
+            if final:
+                self._holding = False
             old = self.snap_msg_id
             self.snap_msg_id = msg.id
             if old and old != msg.id:

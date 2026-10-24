@@ -306,21 +306,25 @@ async def cmd_pushdir(st, args):
             if done_n % 20 == 0 or done_n == len(jobs):
                 print(f"  哈希 {done_n}/{len(jobs)}", flush=True)
 
-    print(f"哈希完成，持锁写入索引…", flush=True)
-    await st.acquire()
-    try:
-        for f, d, size, digest, mt in prepared:
-            try:
-                e = await st.register(d, f, digest=digest, size=size, mtime=mt)
-                if e.skipped:
-                    skipped += 1
-            except Exception as ex:
-                failed += 1
-                print(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
-        if st.dirty:
-            await st.snapshot()
-    finally:
-        await st.release()
+    print("写入本地索引（不持锁）…", flush=True)
+    for f, d, size, digest, mt in prepared:
+        try:
+            e = await st.register(d, f, digest=digest, size=size, mtime=mt)
+            if e.skipped:
+                skipped += 1
+        except Exception as ex:
+            failed += 1
+            print(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
+
+    # 只有「把索引推到 TG」这一步需要锁，而且一次 edit 同时落库 + 放锁
+    if st.dirty:
+        print("持锁上传索引快照…", flush=True)
+        await st.acquire()
+        try:
+            await st.snapshot(final=True)
+        finally:
+            if st._holding:
+                await st.release()
     print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
 
     # 阶段二：不持锁传字节；每 10 个文件短暂拿一次锁把结果落库
@@ -342,12 +346,17 @@ async def cmd_pushdir(st, args):
         except Exception as ex:
             failed += 1
             print(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
-        if i % 10 == 0:
+        if i % 10 == 0 and st.dirty:
             try:
-                async with st.guard(timeout=0):      # 拿不到锁就跳过，后面再落
-                    pass
+                await st.acquire(timeout=0)
             except LockBusy:
                 print("  (索引锁被占用，跳过本次落库)", flush=True)
+            else:
+                try:
+                    await st.snapshot(final=True)
+                finally:
+                    if st._holding:
+                        await st.release()
     try:
         async with st.guard(timeout=30):
             pass
