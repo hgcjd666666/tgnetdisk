@@ -2,4 +2,9 @@
 !store.py
 !server.py
 !cli.py
+!tests.py
+!hashdir.py
 !.gitignore
+!README.md
+!env.example
+!tgnetdisk.service

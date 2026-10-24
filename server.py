@@ -20,7 +20,7 @@ from urllib.parse import quote, unquote, urlsplit
 from aiohttp import web
 from telethon import TelegramClient
 
-from store import make_session, is_path_session, Store, norm, parent_of, base_of
+from store import LockBusy, make_session, is_path_session, Store, norm, parent_of, base_of
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dav")
@@ -29,7 +29,7 @@ API_ID = int(os.environ.get("TG_API_ID", "0"))
 API_HASH = os.environ.get("TG_API_HASH", "")
 PHONE = os.environ.get("TG_PHONE", "")
 CHAT = os.environ.get("TG_CHAT", "")
-SESSION = os.environ.get("TG_SESSION", "/app/tgnd/session")
+SESSION = os.environ.get("TG_SESSION", "/opt/tgnd/session")
 DEVICE = os.environ.get("TG_DEVICE", "tgnd")
 PORT = int(os.environ.get("PORT", "8087"))
 DAV_USER = os.environ.get("DAV_USER", "admin")
@@ -333,6 +333,9 @@ async def handle(request, store):
             return await dav_unlock(request, store)
         if m == "PROPPATCH":
             return await dav_proppatch(request, store)
+    except LockBusy:
+        return web.Response(status=503, text="index lock busy, retry later",
+                            headers={"Retry-After": "3"})
     except FileNotFoundError:
         return web.Response(status=404, text="not found")
     except FileExistsError:
@@ -350,7 +353,7 @@ async def handle(request, store):
     return web.Response(status=405, text="method not allowed")
 
 
-async def ensure_chat(client, cfg_path="/app/tgnd/chat.json", title="tgnd") -> int:
+async def ensure_chat(client, cfg_path="/opt/tgnd/chat.json", title="tgnd") -> int:
     """复用/创建私有超级群作为存储空间。"""
     if os.path.exists(cfg_path):
         try:
@@ -389,7 +392,6 @@ async def main():
         chat = await ensure_chat(client)
     store = Store(client, chat)
     await store.load()
-    await store.sync(full=True)
 
     app = web.Application(client_max_size=0)
     app.router.add_route("*", "/{tail:.*}", lambda r: handle(r, store))
@@ -398,16 +400,13 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info("WebDAV 已启动: http://0.0.0.0:%d/", PORT)
-    i = 0
     while True:
         await asyncio.sleep(30)
-        i += 1
         try:
-            await store.sync(full=(i % 20 == 0))
-            if store.dirty:
+            if store.dirty:                 # 兜底：有未落盘的改动就补一次快照
                 await store.snapshot()
         except Exception as e:
-            log.warning("后台同步失败: %s", e)
+            log.warning("后台快照失败: %s", e)
 
 
 if __name__ == "__main__":

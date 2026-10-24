@@ -1,0 +1,15 @@
+[Unit]
+Description=tgnetdisk WebDAV (Telegram-backed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tgnd
+EnvironmentFile=/opt/tgnd/env
+ExecStart=/opt/venv/bin/python /opt/tgnd/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

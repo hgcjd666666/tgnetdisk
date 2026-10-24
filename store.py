@@ -55,29 +55,16 @@ def base_of(p: str) -> str:
     return norm(p).rsplit("/", 1)[-1]
 
 
-try:
-    import xxhash
-
-    def md5_of(path: str, bufsize: int = 4 << 20) -> str:
-        """内容摘要：xxh3_128（32 hex），只用于识别和校验，不考虑碰撞。"""
-        h = xxhash.xxh3_128()
-        with open(path, "rb") as f:
-            while True:
-                b = f.read(bufsize)
-                if not b:
-                    break
-                h.update(b)
-        return h.hexdigest()
-except ImportError:                                       # 没装 xxhash 就退回 md5
-    def md5_of(path: str, bufsize: int = 1 << 20) -> str:
-        h = hashlib.md5()
-        with open(path, "rb") as f:
-            while True:
-                b = f.read(bufsize)
-                if not b:
-                    break
-                h.update(b)
-        return h.hexdigest()
+def digest_of(path: str, bufsize: int = 4 << 20) -> str:
+    """内容摘要：sha256（16 进制，64 hex）。用于识别与校验，也用于秒传。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(bufsize)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
 
 
 def is_path_session(val: str) -> bool:
@@ -97,6 +84,10 @@ def is_db_msg(msg) -> bool:
         if getattr(a, "file_name", None) == DB_NAME:
             return True
     return False
+
+
+class LockBusy(Exception):
+    """索引写锁被别的节点占着，且调用方要求「不等待」时抛出。"""
 
 
 def is_lock_msg(msg) -> bool:
@@ -215,7 +206,7 @@ async def upload_parallel(client, src, workers=None, part=PART):
 
 
 class Entry:
-    __slots__ = ("path", "is_dir", "mtime", "md5", "size", "parts", "status", "expect")
+    __slots__ = ("path", "is_dir", "mtime", "md5", "size", "parts", "status", "expect", "skipped")
 
     def __init__(self, path, is_dir, mtime=0, md5="", size=0, parts=None,
                  status=0, expect=0):
@@ -227,6 +218,7 @@ class Entry:
         self.parts = parts or {}
         self.status = status          # 0=完成 1=上传中
         self.expect = expect          # 预期分片数
+        self.skipped = False          # 上传时命中「已存在且内容相同」
 
     @property
     def slices(self):
@@ -277,6 +269,12 @@ class Backend(abc.ABC):
     def paths_under(self, prefix: str) -> list: ...
 
     @abc.abstractmethod
+    def get_meta(self, k: str, default: str = "") -> str: ...
+
+    @abc.abstractmethod
+    def set_meta(self, k: str, v: str): ...
+
+    @abc.abstractmethod
     def dump(self, dst: str): ...
 
     @abc.abstractmethod
@@ -303,6 +301,7 @@ class SqliteBackend(Backend):
                 mtime INTEGER DEFAULT 0, parts TEXT DEFAULT '{}');
             CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY, mtime INTEGER DEFAULT 0);
             CREATE INDEX IF NOT EXISTS idx_files_md5 ON files(md5);
+            CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
         """)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(files)")}
         if "status" not in cols:
@@ -359,6 +358,15 @@ class SqliteBackend(Backend):
     def pending(self):
         return [tuple(r) for r in self.db.execute(
             "select path,md5,expect,size,mtime from files where status=1")]
+
+    def get_meta(self, k, default=""):
+        r = self.db.execute("select v from meta where k=?", (k,)).fetchone()
+        return r[0] if r else default
+
+    def set_meta(self, k, v):
+        self.db.execute("insert into meta(k,v) values(?,?) "
+                        "on conflict(k) do update set v=?", (k, str(v), str(v)))
+        self.db.commit()
 
     def set_dir(self, path, mtime):
         self.db.execute("insert or replace into dirs(path,mtime) values(?,?)", (norm(path), mtime))
@@ -433,23 +441,25 @@ class _WriteGuard:
         self.s = store
 
     async def __aenter__(self):
-        await self.s.acquire()
+        if not self.s.fast:
+            await self.s.acquire()
         await self.s.mutex.acquire()
         return self
 
     async def __aexit__(self, *exc):
         try:
-            if self.s.dirty:
+            if not self.s.fast and self.s.dirty:
                 try:
                     await self.s.snapshot()
                 except Exception as e:
                     log.warning("快照上传失败: %s", e)
         finally:
             self.s.mutex.release()
-            try:
-                await self.s.release()
-            except Exception as e:
-                log.warning("释放锁失败: %s", e)
+            if not self.s.fast:
+                try:
+                    await self.s.release()
+                except Exception as e:
+                    log.warning("释放锁失败: %s", e)
 
 
 class Store:
@@ -464,8 +474,13 @@ class Store:
         self.snap_msg_id = 0
         self.snap_doc_id = 0
         self.lock_msg_id = 0
+        self.fast = False                  # True 时跳过分布式锁与快照（只测数据路径）
         self._in_guard = False
         self.token = self._make_token()
+        self._holding = False        # 当前是否持有 TG 锁
+        self._lease = 0.0            # 租约秒数（>0 表示批量模式）
+        self._lease_task = None
+        self._last_op = 0.0
 
     @property
     def entries(self):
@@ -502,11 +517,11 @@ class Store:
 
     async def put_file(self, path: str, local_path: str, mtime: int | None = None,
                        slice_size: int | None = None, append: bool = False,
-                       start_index: int | None = None):
+                       start_index: int | None = None, skip_same: bool = False):
         p = norm(path)
         size = os.path.getsize(local_path)
         S = slice_size or SLICE
-        digest = None if append else md5_of(local_path)
+        digest = None if append else digest_of(local_path)
         mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
         await self.ensure_fresh()
 
@@ -514,6 +529,10 @@ class Store:
         async with self.lock:
             old = self.backend.get(p)
             if old and not old.is_dir and not append:
+                if skip_same and old.status == 0 and old.md5 == digest and old.size == size:
+                    old.skipped = True
+                    log.info("跳过（已存在且内容相同）: %s", p)
+                    return old
                 await self._drop(p)
                 old = None
             await self._ensure_parents(p)
@@ -576,6 +595,71 @@ class Store:
         # 阶段三：提交结果，锁只在这几百毫秒内再持一次
         async with self.lock:
             self.backend.set_file(p, digest or tag, size, mt, parts, 0, nparts)
+            self.dirty = True
+        return self.backend.get(p)
+
+    async def register(self, path: str, local_path: str):
+        """阶段一：只登记「待上传」，不传字节（持锁几百毫秒内完成）。"""
+        p = norm(path)
+        size = os.path.getsize(local_path)
+        digest = digest_of(local_path)
+        mt = int(os.path.getmtime(local_path))
+        async with self.lock:
+            old = self.backend.get(p)
+            if old and not old.is_dir and old.status == 0 and old.md5 == digest and old.size == size:
+                old.skipped = True
+                return old
+            await self._ensure_parents(p)
+            if digest:
+                for opath, osize, oparts in self.backend.find_by_md5(digest):
+                    if oparts:
+                        self.backend.set_file(p, digest, osize, mt, dict(oparts), 0, 0)
+                        self.dirty = True
+                        return self.backend.get(p)
+            nparts = max(1, (size + SLICE - 1) // SLICE) if size else 0
+            self.backend.set_file(p, digest, size, mt, {}, 1, nparts)
+            self.dirty = True
+            return self.backend.get(p)
+
+    async def upload_pending(self, path: str, local_path: str):
+        """阶段二+三：把登记过的文件真正传上 TG，然后提交（锁只在提交那一瞬）。"""
+        p = norm(path)
+        e = self.backend.get(p)
+        if e is None or e.is_dir or e.status == 0:
+            return e
+        size = e.size
+        digest = e.md5
+        tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()
+        S = SLICE
+        parts: dict[int, int] = {}
+
+        async def send(src, idx_no):
+            attrs = [DocumentAttributeFilename(f"{tag}.{idx_no}")]
+            try:
+                ref = await upload_parallel(self.client, src)
+            except Exception as ex:
+                log.warning("并行上传失败，退回顺序: %s", ex)
+                msg = await self.client.send_file(self.chat, src, force_document=True, attributes=attrs)
+            else:
+                msg = await self.client.send_file(self.chat, ref, force_document=True, attributes=attrs)
+            parts[idx_no] = msg.id
+            self.last_id = max(self.last_id, msg.id)
+
+        if size == 0:
+            pass
+        elif size <= S:
+            await send(local_path, 0)
+        else:
+            n = 0
+            pos = 0
+            with open(local_path, "rb") as f:
+                while pos < size:
+                    length = min(S, size - pos)
+                    await send(SliceReader(f, pos, length), n)
+                    pos += length
+                    n += 1
+        async with self.lock:
+            self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts))
             self.dirty = True
         return self.backend.get(p)
 
@@ -672,13 +756,47 @@ class Store:
             except Exception as e:
                 log.warning("删除消息失败: %s", e)
 
+    # ---------- 清理 ----------
+    async def gc(self, dry_run: bool = False):
+        """清理：TG 上没人引用的文件消息（孤儿）+ 索引里指向不存在消息的记录。"""
+        async with self.lock:
+            live = {}
+            async for m in self.client.iter_messages(self.chat):
+                nm = parse_name(m)
+                if nm:
+                    live[m.id] = nm
+            used, missing = set(), []
+            for e in self.backend.all_entries().values():
+                if e.is_dir or not e.parts:
+                    continue
+                for mid in e.parts.values():
+                    used.add(mid)
+                if any(mid not in live for mid in e.parts.values()):
+                    missing.append(e.path)
+            orphans = sorted(mid for mid in live if mid not in used)
+            log.info("TG 文件消息 %d，被引用 %d，孤儿 %d，无效记录 %d",
+                     len(live), len(used), len(orphans), len(missing))
+            if dry_run:
+                return orphans, missing
+            if orphans:
+                await self._del_ids(orphans)
+            for p in missing:
+                self.backend.remove(p)
+            if missing:
+                self.dirty = True
+            return orphans, missing
+
     # ---------- 同步 / 快照 ----------
     async def sync(self, full: bool = True):
         """扫描 TG 消息，补全 md5 → 分片映射，并记录最新快照消息。"""
         parts_by_md5 = {}
         snaps = []
         n = 0
-        async for m in self.client.iter_messages(self.chat, reverse=True):
+        last = 0 if full else int(self.backend.get_meta("last_id", "0") or 0)
+        kw = {"reverse": True}
+        if last:
+            kw["min_id"] = last
+        async for m in self.client.iter_messages(self.chat, limit=None, **kw):
             n += 1
             if is_db_msg(m):
                 snaps.append(m)
@@ -690,11 +808,14 @@ class Store:
             parts_by_md5.setdefault(md5, {})[idx] = m.id
             if m.id > self.last_id:
                 self.last_id = m.id
+            if m.id > last:
+                last = m.id
         for md5, parts in parts_by_md5.items():
             for opath, osize, oparts in self.backend.find_by_md5(md5):
                 if oparts != parts:
                     self.backend.set_file(opath, md5, osize, int(time.time()), parts)
-        for path, md5, expect, size, mtime in self.backend.pending():
+        self.backend.set_meta("last_id", last)
+        for path, md5, expect, size, mtime in (self.backend.pending() if full else []):
             got = parts_by_md5.get(md5, {})
             if expect and len(got) >= expect:
                 self.backend.set_file(path, md5, size, mtime, got, 0, expect)
@@ -796,7 +917,7 @@ class Store:
             self.chat, msg_id, file=io.BytesIO(payload), force_document=True,
             attributes=[DocumentAttributeFilename(LOCK_NAME)])
 
-    async def acquire(self, timeout: int = 60):
+    async def acquire(self, timeout: int = 60, nonblock: bool = False):
         """锁就是一个 tgnd.lock 文件：大小 1 且内容 0x00 = 空闲，大小 32 = 锁定（内容为持有者 token）。"""
         mine = self.token.encode()
         end = time.time() + timeout
@@ -807,18 +928,23 @@ class Store:
                     self.chat, io.BytesIO(mine), caption="", force_document=True,
                     attributes=[DocumentAttributeFilename(LOCK_NAME)])
                 self.lock_msg_id = msg.id
+                self._holding = True
                 log.info("创建锁 msg %d", msg.id)
                 return
             size = m.document.size if m.document else 0
             if size == 1:                                  # 空闲
                 await self._set_lock(m.id, mine)
                 self.lock_msg_id = m.id
+                self._holding = True
                 log.info("锁 msg %d 空闲 → 占用", m.id)
                 return
             data = await self._lock_bytes(m)
             if data == mine:                               # 已经是自己的锁
                 self.lock_msg_id = m.id
+                self._holding = True
                 return
+            if nonblock:
+                raise LockBusy("索引写锁被另一个节点持有")
             if time.time() > end:
                 log.error("等待索引写锁超过 %d 秒，判定异常退出", timeout)
                 raise TimeoutError("索引正被另一个节点写入，等待超时")
@@ -833,6 +959,7 @@ class Store:
         except Exception as e:
             log.warning("释放锁失败: %s", e)
         self.lock_msg_id = 0
+        self._holding = False
 
     async def _clear_own_stale_lock(self, timeout: int = 120):
         """启动时：自己的残留锁直接置空，别人的锁就轮询等它释放。"""
@@ -862,33 +989,90 @@ class Store:
                 waited = True
             await asyncio.sleep(2)
 
+    def _touch(self):
+        """记录一次写操作时间，租约靠它判断「空闲多久了」。"""
+        self._last_op = time.time()
+
+    async def _lease_watch(self):
+        """租约守护：空闲满 lease 秒才落库 + 放锁。"""
+        while True:
+            await asyncio.sleep(0.3)
+            if self._in_guard:                 # 正在写，别动
+                continue
+            if time.time() - self._last_op < self._lease:
+                continue
+            log.info("租约空闲满 %.1fs，落库并释放锁", self._lease)
+            try:
+                if self.dirty:
+                    await self.snapshot()
+            except Exception as e:
+                log.warning("租约到期写快照失败: %s", e)
+            finally:
+                await self.release()
+            return
+
+    async def wait_released(self, timeout: float = 300):
+        """等租约真正释放（批量任务跑完、进程退出前调用）。"""
+        t = self._lease_task
+        if t and not t.done():
+            try:
+                await asyncio.wait_for(t, timeout)
+            except asyncio.TimeoutError:
+                log.warning("等待租约释放超时 %.0fs", timeout)
+
     @asynccontextmanager
-    async def guard(self):
-        """写操作统一入口：先同步远端 → 抢锁 → 干完上传快照 → 放锁。"""
-        if self._in_guard:                      # 重入（_drop 等内部调用）
+    async def guard(self, lease: float = 0.0, timeout: int = 60):
+        """写操作统一入口。
+
+        lease=0（默认）：抢锁 → 干完 → 写快照 → 放锁。
+        lease>0（批量模式）：抢到锁就一直拿着，期间不写快照也不放锁，
+                            空闲满 lease 秒后由 _lease_watch 统一落库并释放。
+        """
+        if self._in_guard:                      # 重入
+            self._touch()
             yield
             return
         self._in_guard = True
         try:
             await self.ensure_fresh()
-            await self.acquire()
+            if not self._holding:
+                await self.acquire(timeout=timeout, nonblock=(timeout <= 0))
+        except Exception:
+            self._in_guard = False
+            raise
+
+        if lease > 0:
+            self._lease = lease
+            self._touch()
+            if self._lease_task is None or self._lease_task.done():
+                self._lease_task = asyncio.create_task(self._lease_watch())
             try:
                 yield
             finally:
+                self._touch()
+                self._in_guard = False
+            return
+
+        try:
+            yield
+        finally:
+            try:
                 if self.dirty:
                     try:
                         await self.snapshot()
                     except Exception as e:
                         log.warning("快照上传失败: %s", e)
+            finally:
                 await self.release()
-        finally:
-            self._in_guard = False
+                self._in_guard = False
 
     async def ensure_fresh(self):
         """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。
 
         快照用 edit_message 原地替换，消息 id 不变，所以靠 document.id 判断内容是否换过。
         """
+        if self._holding and self._lease:
+            return False                       # 批量模式下锁一直是自己的，不用反复查
         try:
             pid = await self._pinned_id()
             if not pid:

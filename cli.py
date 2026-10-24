@@ -5,14 +5,17 @@
   tgnd ls [路径]
   tgnd ll [路径]            带大小/时间
   tgnd mkdir <路径>
+  tgnd pushdir [--no-skip] [--lease 3] [-x 排除模式] <本地目录> <远端根>   批量上传，全程持锁
   tgnd put [--slice 1900M] [--offset N] [--length N] <本地文件...> <远端路径>
   tgnd get <远端路径> [本地文件]
   tgnd rm <路径...>
   tgnd mv <源> <目标>
   tgnd cp <源> <目标>
   tgnd stat <路径>
+  tgnd gc [--dry-run]       清理 TG 上没人引用的消息 + 索引里指向已删消息的记录
+  tgnd reindex              全量扫聊天记录重建索引（正常不需要）
 
-环境变量（默认读 /app/tgnd/env）:
+环境变量（默认读 /opt/tgnd/env）:
   TG_API_ID, TG_API_HASH, TG_SESSION, TG_CHAT
 """
 import asyncio
@@ -22,10 +25,12 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from store import Store, norm, base_of, make_session, is_path_session  # noqa: E402
+from store import (Store, LockBusy, norm, base_of, make_session,
+                   is_path_session, digest_of)  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -36,7 +41,7 @@ def load_env():
         return
     here = os.path.dirname(os.path.abspath(__file__))
     for path in [os.environ.get("TGND_ENV", ""), os.path.join(here, "env"),
-                 os.path.join(here, ".env"), "/app/tgnd/env"]:
+                 os.path.join(here, ".env"), "/opt/tgnd/env"]:
         if path and os.path.exists(path):
             for line in open(path):
                 line = line.strip()
@@ -101,7 +106,6 @@ async def get_store():
     chat = int(chat) if chat.lstrip("-").isdigit() else chat
     st = Store(client, chat)
     await st.load()
-    await st.sync(full=True)
     return client, st, tmp
 
 
@@ -144,8 +148,30 @@ def parse_size(v: str) -> int:
     return int(float(v) * mult)
 
 
+def _collect(srcs, remote, into=False):
+    """把命令行给的文件/目录展开成 [(本地文件, 远端路径)]，目录保留相对结构。"""
+    jobs = []
+    multi = len(srcs) > 1 or remote.endswith("/")
+    for s in srcs:
+        if os.path.isdir(s):
+            sabs = os.path.abspath(s)
+            base = sabs if into else os.path.dirname(sabs)
+            for dp, _, ns in os.walk(sabs):
+                for n in sorted(ns):
+                    full = os.path.join(dp, n)
+                    rel = os.path.relpath(full, base).replace(os.sep, "/")
+                    jobs.append((full, remote.rstrip("/") + "/" + rel))
+        else:
+            if not os.path.isfile(s):
+                sys.exit(f"本地文件不存在: {s}")
+            dst = (remote.rstrip("/") + "/" + os.path.basename(s)) if multi else remote
+            jobs.append((s, dst))
+    return jobs
+
+
 async def cmd_put(st, args):
-    slice_size, offset, length, rest = None, None, None, []
+    slice_size = offset = length = None
+    skip, dry, rest = True, False, []
     i = 0
     while i < len(args):
         a = args[i]
@@ -155,45 +181,160 @@ async def cmd_put(st, args):
             offset = parse_size(args[i + 1]); i += 2
         elif a in ("--length", "-l"):
             length = parse_size(args[i + 1]); i += 2
+        elif a == "--no-skip":
+            skip = False; i += 1
+        elif a in ("--dry-run", "-n"):
+            dry = True; i += 1
         else:
             rest.append(a); i += 1
     if len(rest) < 2:
-        sys.exit("用法: tgnd put [--slice 1900M] [--offset N] [--length N] <本地文件...> <远端路径>")
+        sys.exit("用法: tgnd put [--slice 1900M] [--no-skip] [--dry-run] <本地文件或目录...> <远端路径>")
     remote = rest[-1]
     if not remote.startswith("/"):
         sys.exit("远端路径要以 / 开头")
-    files = rest[:-1]
-    for f in files:
-        if not os.path.isfile(f):
-            sys.exit(f"本地文件不存在: {f}")
-        dst = remote
-        if len(files) > 1 or remote.endswith("/"):
-            dst = remote.rstrip("/") + "/" + os.path.basename(f)
-        if offset is not None or length is not None:
-            # 只取源文件的 [offset, offset+length) 这一段，作为新分片追加
-            off = offset or 0
-            fd, tmp = tempfile.mkstemp(prefix="tgnd_rng_")
-            with open(fd, "wb") as out, open(f, "rb") as src:
-                src.seek(off)
-                left = length if length is not None else os.path.getsize(f) - off
-                while left > 0:
-                    b = src.read(min(1 << 20, left))
-                    if not b:
-                        break
-                    out.write(b)
-                    left -= len(b)
-            try:
-                si = (off // slice_size) if slice_size else None
-                e = await st.put_file(dst, tmp, slice_size=slice_size, append=True, start_index=si)
-            finally:
+    jobs = _collect(rest[:-1], remote)
+    if not jobs:
+        sys.exit("没有可上传的文件")
+    total = len(jobs)
+    if total > 1 or rest[:-1] != [jobs[0][0]]:
+        print(f"共 {total} 个文件待处理")
+
+    ok = skipped = failed = 0
+    for idx, (f, dst) in enumerate(jobs, 1):
+        tag = f"[{idx}/{total}]"
+        try:
+            if offset is not None or length is not None:
+                off = offset or 0
+                fd, tmp = tempfile.mkstemp(prefix="tgnd_rng_")
+                with open(fd, "wb") as out, open(f, "rb") as src:
+                    src.seek(off)
+                    left = length if length is not None else os.path.getsize(f) - off
+                    while left > 0:
+                        b = src.read(min(1 << 20, left))
+                        if not b:
+                            break
+                        out.write(b)
+                        left -= len(b)
                 try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-            print(f"OK {f}[{off}:+{(length if length is not None else 'EOF')}] -> {dst} 共 {len(e.slices)} 片 ({human(e.size)})")
+                    si = (off // slice_size) if slice_size else None
+                    e = await st.put_file(dst, tmp, slice_size=slice_size, append=True, start_index=si)
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                ok += 1
+                print(f"{tag} OK   {dst}  ({human(e.size)}, {len(e.slices)} 片)")
+            elif dry:
+                await st.ensure_fresh()
+                old = st.backend.get(dst)
+                same = (old and not old.is_dir and old.status == 0
+                        and old.size == os.path.getsize(f) and old.md5 == digest_of(f))
+                print(f"{tag} {'SKIP' if same else 'NEW '} {dst}  ({human(os.path.getsize(f))})")
+                skipped += 1 if same else 0
+                ok += 0 if same else 1
+            else:
+                e = await st.put_file(dst, f, slice_size=slice_size, skip_same=skip)
+                if e.skipped:
+                    skipped += 1
+                    print(f"{tag} SKIP {dst}  (已存在)")
+                else:
+                    ok += 1
+                    print(f"{tag} OK   {dst}  ({human(e.size)}, {len(e.slices)} 片)")
+        except Exception as ex:
+            failed += 1
+            print(f"{tag} FAIL {dst}: {type(ex).__name__}: {ex}")
+    if total > 1:
+        print(f"\n完成：上传 {ok}，跳过 {skipped}，失败 {failed}，共 {total}")
+
+
+async def cmd_pushdir(st, args):
+    """批量把本地目录/文件推到远端，全程持锁（空闲 3 秒才落库放锁）。
+
+    用法: tgnd pushdir [--no-skip] [--lease 3] <本地目录或文件> <远端根目录>
+    """
+    lease = 3.0
+    skip = True
+    excludes = []
+    rest = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--no-skip":
+            skip = False; i += 1
+        elif a == "--lease":
+            lease = float(args[i + 1]); i += 2
+        elif a in ("--exclude", "-x"):
+            excludes.append(args[i + 1]); i += 2
         else:
-            e = await st.put_file(dst, f, slice_size=slice_size)
-            print(f"OK {f} -> {dst} ({human(e.size)}, {len(e.slices)} 片)")
+            rest.append(a); i += 1
+    if len(rest) < 2:
+        sys.exit("用法: tgnd pushdir [--no-skip] [--lease 3] <本地目录或文件> <远端根目录>")
+    src, dst = rest[0], rest[1]
+    if not dst.startswith("/"):
+        sys.exit("远端路径要以 / 开头")
+    jobs = _collect([src], dst.rstrip("/") + "/", into=True)
+    if excludes:
+        import fnmatch
+        before = len(jobs)
+        jobs = [(f, d) for f, d in jobs
+                if not any(fnmatch.fnmatch(d, pat) or pat.strip("/") in d for pat in excludes)]
+        print(f"排除规则 {excludes}：{before} → {len(jobs)} 个文件", flush=True)
+    if not jobs:
+        sys.exit("没有可上传的文件")
+    total = sum(os.path.getsize(p) for p, _ in jobs)
+    print(f"共 {len(jobs)} 个文件，{human(total)}，租约 {lease}s", flush=True)
+
+    ok = skipped = failed = 0
+    t0 = time.time()
+
+    # 阶段一：一次持锁，把全部文件登记成「待上传」，然后立刻释放
+    print("阶段一：登记待上传清单…", flush=True)
+    async with st.guard():
+        for f, d in jobs:
+            try:
+                e = await st.register(d, f)
+                if e.skipped:
+                    skipped += 1
+            except Exception as ex:
+                failed += 1
+                print(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
+    print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
+
+    # 阶段二：不持锁传字节；每 10 个文件短暂拿一次锁把结果落库
+    def _is_pending(d):
+        try:
+            e = st.get(d)
+        except Exception:
+            return False
+        return e is not None and not e.is_dir and e.status == 1
+
+    todo = [(f, d) for f, d in jobs if _is_pending(d)]
+    print(f"阶段二：待上传 {len(todo)} 个，开始传字节…", flush=True)
+    for i, (f, d) in enumerate(todo, 1):
+        try:
+            e = await st.upload_pending(d, f)
+            ok += 1
+            done = time.time() - t0
+            print(f"[{i}/{len(todo)}] OK {d} ({human(e.size)}) 已用 {done/60:.1f} 分钟", flush=True)
+        except Exception as ex:
+            failed += 1
+            print(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
+        if i % 10 == 0:
+            try:
+                async with st.guard(timeout=0):      # 拿不到锁就跳过，后面再落
+                    pass
+            except LockBusy:
+                print("  (索引锁被占用，跳过本次落库)", flush=True)
+    try:
+        async with st.guard(timeout=30):
+            pass
+    except Exception as ex:
+        print("最终落库失败:", ex, flush=True)
+
+    await st.wait_released()
+    dt = max(1e-6, time.time() - t0)
+    print(f"完成：上传 {ok}，跳过 {skipped}，失败 {failed}，耗时 {dt/60:.1f} 分钟", flush=True)
 
 
 async def cmd_get(st, args):
@@ -254,6 +395,8 @@ async def main():
                 await est_mkdir(st, p)
         elif cmd == "put":
             await cmd_put(st, args)
+        elif cmd in ("pushdir", "push"):
+            await cmd_pushdir(st, args)
         elif cmd == "get":
             await cmd_get(st, args)
         elif cmd == "rm":
@@ -262,6 +405,15 @@ async def main():
             await cmd_mv(st, args)
         elif cmd == "cp":
             await cmd_cp(st, args)
+        elif cmd == "gc":
+            dry = "--dry-run" in args or "-n" in args
+            orphans, missing = await st.gc(dry_run=dry)
+            print(f"{'[预览] ' if dry else ''}孤儿消息 {len(orphans)} 条，无效记录 {len(missing)} 条")
+            for p in missing[:20]:
+                print("  无效记录:", p)
+        elif cmd == "reindex":
+            n = await st.sync(full=True)
+            print(f"已扫描 {n} 条消息重建索引")
         elif cmd in ("stat", "info"):
             cmd_stat(st, args)
         else:
