@@ -446,6 +446,13 @@ class Store:
                 old = None
             await self._ensure_parents(p)
 
+            # 空文件：Telegram 发不了 0 字节文件，只登记在索引里（parts 为空）
+            if size == 0 and not append:
+                self.backend.set_file(p, digest or "", 0, mt, {})
+                self.dirty = True
+                log.info("空文件只登记索引: %s", p)
+                return self.backend.get(p)
+
             # 秒传：同 md5 已有分片，直接共享，只加一条路径记录
             if digest and not append:
                 for opath, osize, oparts in self.backend.find_by_md5(digest):
