@@ -231,7 +231,7 @@ async def cmd_put(st, args):
                 await st.ensure_fresh()
                 old = st.backend.get(dst)
                 same = (old and not old.is_dir and old.status == 0
-                        and old.size == os.path.getsize(f) and old.md5 == digest_of(f))
+                        and old.size == os.path.getsize(f) and old.hash == digest_of(f))
                 print(f"{tag} {'SKIP' if same else 'NEW '} {dst}  ({human(os.path.getsize(f))})")
                 skipped += 1 if same else 0
                 ok += 0 if same else 1
