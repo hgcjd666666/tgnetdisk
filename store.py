@@ -939,7 +939,11 @@ class Store:
                 await self.snapshot()          # 没有快照就先建一条（此时无人持锁）
                 continue
             cur = self._cap(m)
-            if cur in ("", LOCK_IDLE, mine):
+            if cur == mine:                     # 已经是自己持有的，别再 edit（会报未修改）
+                self.snap_msg_id = m.id
+                self._holding = True
+                return
+            if cur in ("", LOCK_IDLE):
                 await self.client.edit_message(self.chat, m.id, text=mine)
                 # 回读确认，防止两个节点同时写
                 m2 = await self.client.get_messages(self.chat, ids=m.id)
@@ -948,10 +952,6 @@ class Store:
                     self._holding = True
                     log.info("锁 msg %d 空闲 → 占用", m.id)
                     return
-            if cur == mine:
-                self.snap_msg_id = m.id
-                self._holding = True
-                return
             if nonblock:
                 raise LockBusy("索引写锁被另一个节点持有")
             if time.time() > end:
