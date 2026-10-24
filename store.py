@@ -565,7 +565,7 @@ class Store:
                     digest = old.md5
             base_idx = start_index if start_index is not None else (
                 (max(parts) + 1) if parts else 0)
-            tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()
+            tag = (digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest())[:40]  # TG 文件名上限 64 字符，留出 ".序号"
             nparts = max(1, (size + S - 1) // S) if size else 0
             self.backend.set_file(p, digest or tag, size, mt, parts, 1, nparts)
             self.dirty = True
@@ -639,7 +639,7 @@ class Store:
             return e
         size = e.size
         digest = e.md5
-        tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()
+        tag = (digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest())[:40]  # TG 文件名上限 64 字符，留出 ".序号"
         S = SLICE
         parts: dict[int, int] = {}
 
