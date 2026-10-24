@@ -598,13 +598,24 @@ class Store:
             except OSError:
                 pass
 
+    async def _find_snapshot(self):
+        """优先从置顶消息拿快照，省得扫聊天记录。"""
+        try:
+            pins = await self.client.get_pinned_messages(self.chat)
+        except Exception as e:
+            log.warning("读取置顶失败: %s", e)
+            pins = []
+        for m in pins:
+            if (m.message or "").strip().replace(" ", "") == DB_CAP:
+                return m
+        async for m in self.client.iter_messages(self.chat):
+            if (m.message or "").strip().replace(" ", "") == DB_CAP:
+                return m
+        return None
+
     async def load(self):
         """启动时从 TG 拉最新快照覆盖本地索引。"""
-        best = None
-        async for m in self.client.iter_messages(self.chat, limit=300):
-            if (m.message or "").strip().replace(" ", "") == DB_CAP:
-                best = m
-                break
+        best = await self._find_snapshot()
         if not best:
             log.info("TG 上没有索引快照，使用本地库")
             return False
