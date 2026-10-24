@@ -289,7 +289,9 @@ async def cmd_pushdir(st, args):
     t0 = time.time()
 
     # 阶段一：先把哈希算完（纯本地，不碰 TG），再一次性持锁写入索引
-    print("预计算哈希…", flush=True)
+    import os as _os
+    HASH_THREADS = int(_os.environ.get("HASH_THREADS", "2"))
+    print(f"预计算哈希（{HASH_THREADS} 线程）…", flush=True)
     import concurrent.futures as _cf
 
     def _prep(item):
@@ -299,7 +301,7 @@ async def cmd_pushdir(st, args):
 
     prepared = []
     done_n = 0
-    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+    with _cf.ThreadPoolExecutor(max_workers=HASH_THREADS) as ex:
         for res in ex.map(_prep, jobs):
             prepared.append(res)
             done_n += 1
@@ -317,7 +319,7 @@ async def cmd_pushdir(st, args):
             print(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
 
     # 只有「把索引推到 TG」这一步需要锁，而且一次 edit 同时落库 + 放锁
-    if st.dirty:
+    if st.dirty and ONLINE:
         print("上传索引快照…", flush=True)
         await st.snapshot_locked()
     print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
