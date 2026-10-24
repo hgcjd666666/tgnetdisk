@@ -340,6 +340,13 @@ async def handle(request, store):
     except Exception as ex:
         log.exception("处理 %s %s 失败: %s", m, request.path, ex)
         return web.Response(status=500, text=str(ex))
+    finally:
+        # 写操作立刻把索引快照推上去，缩短两个节点互相覆盖的窗口
+        if m in ("PUT", "DELETE", "MKCOL", "MOVE", "COPY") and store.dirty:
+            try:
+                await store.snapshot()
+            except Exception as ex:
+                log.warning("写后快照失败: %s", ex)
     return web.Response(status=405, text="method not allowed")
 
 
