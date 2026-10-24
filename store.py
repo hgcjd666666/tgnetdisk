@@ -39,7 +39,9 @@ LOCK_IDLE = "lock:null"
 LOCK_PREFIX = "lock:"
 # 单机模式：ONLINE=0 时不抢锁、不写 caption，快照也尽量少发。
 # 前提是同一时间只有一个节点在写（多节点必须保持 ONLINE=1）。
-ONLINE = os.environ.get("ONLINE", "1").strip().lower() not in ("0", "false", "no", "off")
+def is_online() -> bool:
+    """每次调用都读环境变量——env 文件是运行期才加载的，不能做成模块常量。"""
+    return os.environ.get("ONLINE", "1").strip().lower() not in ("0", "false", "no", "off")
 LOCK_TTL = 120                     # 锁超过这么久没释放就视为残留
 
 
@@ -839,7 +841,7 @@ class Store:
         final=True 时顺便把 caption 改回 lock:null 并清持有标记——
         一次 edit 同时完成「落库 + 释放锁」，少一次 TG 写。
         """
-        cap = (LOCK_IDLE if ONLINE else "") if final else self._lock_text()
+        cap = (LOCK_IDLE if is_online() else "") if final else self._lock_text()
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
         os.close(fd)
         try:
@@ -887,7 +889,7 @@ class Store:
         try:
             self.backend.dump(tmp)                 # 本地压缩，锁外做
             size = os.path.getsize(tmp)
-            if ONLINE:
+            if is_online():
                 await self.acquire()
             try:
                 if self.snap_msg_id:
@@ -917,7 +919,7 @@ class Store:
                 log.info("索引快照已上传并放锁 (msg %d, %d 字节)", msg.id, size)
                 return msg.id
             finally:
-                if ONLINE and self._holding:
+                if is_online() and self._holding:
                     await self.release()
                 else:
                     self._holding = False
@@ -974,7 +976,7 @@ class Store:
 
     def _lock_text(self) -> str:
         """锁状态写在快照消息的 caption 里：空闲 lock:null，锁定 lock:<hash>。单机模式留空。"""
-        if not ONLINE:
+        if not is_online():
             return ""
         return (LOCK_PREFIX + self.token) if self._holding else LOCK_IDLE
 
@@ -995,7 +997,7 @@ class Store:
         空闲时是 `lock:null`，被占用时是 `lock:<sha256(盐+token)>`。
         token 本身是 TG_SESSION 的 sha256 派生值，不暴露 session。
         """
-        if not ONLINE:                     # 单机模式：不碰 TG，直接认为持有
+        if not is_online():                     # 单机模式：不碰 TG，直接认为持有
             self._holding = True
             return
         mine = LOCK_PREFIX + self.token
@@ -1028,7 +1030,7 @@ class Store:
 
     async def release(self):
         """把 caption 改回 lock:null。"""
-        if not ONLINE:
+        if not is_online():
             self._holding = False
             return
         if not self._holding or not self.snap_msg_id:
@@ -1042,7 +1044,7 @@ class Store:
 
     async def _clear_own_stale_lock(self, timeout: int = 120):
         """启动时：锁是自己的残留就置空，是别人的就轮询等它释放。单机模式跳过。"""
-        if not ONLINE:
+        if not is_online():
             return
         end = time.time() + timeout
         mine = LOCK_PREFIX + self.token
@@ -1113,7 +1115,7 @@ class Store:
             self._touch()
             yield
             return
-        if not ONLINE:                          # 单机：不碰锁，只在退出时落库
+        if not is_online():                          # 单机：不碰锁，只在退出时落库
             self._in_guard = True
             try:
                 yield
@@ -1128,9 +1130,9 @@ class Store:
         self._in_guard = True
         try:
             await self.ensure_fresh()
-            if ONLINE and not self._holding:
+            if is_online() and not self._holding:
                 await self.acquire(timeout=timeout, nonblock=(timeout <= 0))
-            elif not ONLINE:
+            elif not is_online():
                 self._holding = True
         except Exception:
             self._in_guard = False
@@ -1163,7 +1165,7 @@ class Store:
 
     async def ensure_fresh(self):
         """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。单机模式直接跳过。"""
-        if not ONLINE:
+        if not is_online():
             return False
         # 快照用 edit_message 原地替换，消息 id 不变，靠 document.id 判断内容是否换过
         if self._holding and self._lease:

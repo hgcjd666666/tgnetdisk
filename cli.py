@@ -30,7 +30,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from store import (Store, LockBusy, norm, base_of, make_session,
-                   is_path_session, digest_of, ONLINE)  # noqa: E402
+                   is_path_session, digest_of, is_online)  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -319,7 +319,7 @@ async def cmd_pushdir(st, args):
             print(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
 
     # 只有「把索引推到 TG」这一步需要锁，而且一次 edit 同时落库 + 放锁
-    if st.dirty and ONLINE:
+    if st.dirty and is_online():
         print("上传索引快照…", flush=True)
         await st.snapshot_locked()
     print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
@@ -343,7 +343,7 @@ async def cmd_pushdir(st, args):
         except Exception as ex:
             failed += 1
             print(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
-        if ONLINE and i % 100 == 0 and st.dirty:
+        if is_online() and i % 100 == 0 and st.dirty:
             try:
                 await st.snapshot_locked()      # 拿不到锁会在 acquire 里抛 LockBusy
             except LockBusy:
