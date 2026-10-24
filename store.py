@@ -342,12 +342,28 @@ class SqliteBackend(Backend):
         return out
 
     def dump(self, dst):
+        """导出快照。WAL 模式下主库文件可能不含最新数据，必须用 backup API 生成一致性副本。"""
         self.db.commit()
-        with open(self.path, "rb") as src, lzma.open(dst, "wb", preset=9) as out:
-            shutil.copyfileobj(src, out)
+        tmpdb = dst + ".db"
+        try:
+            out = sqlite3.connect(tmpdb)
+            self.db.backup(out)
+            out.close()
+            with open(tmpdb, "rb") as src, lzma.open(dst, "wb", preset=9) as fp:
+                shutil.copyfileobj(src, fp)
+        finally:
+            try:
+                os.unlink(tmpdb)
+            except OSError:
+                pass
 
     def restore(self, src):
         self.db.close()
+        for suf in ("", "-wal", "-shm"):
+            try:
+                os.unlink(self.path + suf)
+            except OSError:
+                pass
         with lzma.open(src, "rb") as f, open(self.path, "wb") as out:
             shutil.copyfileobj(f, out)
         self._open()
