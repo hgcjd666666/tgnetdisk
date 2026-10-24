@@ -877,6 +877,50 @@ class Store:
             except OSError:
                 pass
 
+    async def snapshot_locked(self):
+        """压缩快照 → 抢锁 → 一次 edit 完成「上传 + 放锁」。锁内只有一次网络写。"""
+        fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
+        os.close(fd)
+        try:
+            self.backend.dump(tmp)                 # 本地压缩，锁外做
+            size = os.path.getsize(tmp)
+            await self.acquire()
+            try:
+                if self.snap_msg_id:
+                    try:
+                        await self.client.edit_message(
+                            self.chat, self.snap_msg_id, file=tmp, force_document=True,
+                            attributes=[DocumentAttributeFilename(DB_NAME)], text=LOCK_IDLE)
+                        self._holding = False
+                        self.dirty = False
+                        log.info("快照已就地替换并放锁 (msg %d, %d 字节)", self.snap_msg_id, size)
+                        return self.snap_msg_id
+                    except Exception as e:
+                        log.warning("就地替换失败，改为新发一条: %s", e)
+                msg = await self.client.send_file(
+                    self.chat, tmp, force_document=True, caption=LOCK_IDLE,
+                    attributes=[DocumentAttributeFilename(DB_NAME)])
+                old = self.snap_msg_id
+                self.snap_msg_id = msg.id
+                if old and old != msg.id:
+                    await self._del_ids([old])
+                try:
+                    await self.client.pin_message(self.chat, msg, notify=False)
+                except Exception as e:
+                    log.warning("置顶失败: %s", e)
+                self._holding = False
+                self.dirty = False
+                log.info("索引快照已上传并放锁 (msg %d, %d 字节)", msg.id, size)
+                return msg.id
+            finally:
+                if self._holding:
+                    await self.release()
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
     async def _find_snapshot(self):
         """优先从置顶消息里拿快照（锁也置顶，所以这里要按文件名挑）。"""
         for m in await self._pinned():

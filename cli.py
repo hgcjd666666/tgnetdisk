@@ -318,13 +318,8 @@ async def cmd_pushdir(st, args):
 
     # 只有「把索引推到 TG」这一步需要锁，而且一次 edit 同时落库 + 放锁
     if st.dirty:
-        print("持锁上传索引快照…", flush=True)
-        await st.acquire()
-        try:
-            await st.snapshot(final=True)
-        finally:
-            if st._holding:
-                await st.release()
+        print("上传索引快照（锁内只一次写）…", flush=True)
+        await st.snapshot_locked()
     print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
 
     # 阶段二：不持锁传字节；每 10 个文件短暂拿一次锁把结果落库
@@ -346,17 +341,11 @@ async def cmd_pushdir(st, args):
         except Exception as ex:
             failed += 1
             print(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
-        if i % 10 == 0 and st.dirty:
+        if i % 100 == 0 and st.dirty:
             try:
-                await st.acquire(timeout=0)
+                await st.snapshot_locked()      # 拿不到锁会在 acquire 里抛 LockBusy
             except LockBusy:
                 print("  (索引锁被占用，跳过本次落库)", flush=True)
-            else:
-                try:
-                    await st.snapshot(final=True)
-                finally:
-                    if st._holding:
-                        await st.release()
     try:
         async with st.guard(timeout=30):
             pass
