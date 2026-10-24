@@ -35,6 +35,8 @@ DB_PATH = os.environ.get("TGND_DB", os.path.join(os.path.dirname(os.path.abspath
 BACKEND = os.environ.get("TGND_BACKEND", "sqlite")
 DB_NAME = "tgnd.db.xz"
 LOCK_NAME = "tgnd.lock"
+LOCK_IDLE = "lock:null"
+LOCK_PREFIX = "lock:"
 LOCK_TTL = 120                     # 锁超过这么久没释放就视为残留
 
 
@@ -836,14 +838,15 @@ class Store:
                 try:
                     await self.client.edit_message(
                         self.chat, self.snap_msg_id, file=tmp, force_document=True,
-                        attributes=[DocumentAttributeFilename(DB_NAME)])
+                        attributes=[DocumentAttributeFilename(DB_NAME)],
+                        text=self._lock_text())
                     self.dirty = False
                     log.info("索引快照已就地替换 (msg %d, %d 字节)", self.snap_msg_id, size)
                     return None
                 except Exception as e:
                     log.warning("就地替换失败，改为新发一条: %s", e)
             msg = await self.client.send_file(
-                self.chat, tmp, force_document=True,
+                self.chat, tmp, force_document=True, caption=self._lock_text(),
                 attributes=[DocumentAttributeFilename(DB_NAME)])
             old = self.snap_msg_id
             self.snap_msg_id = msg.id
@@ -863,7 +866,10 @@ class Store:
                 pass
 
     async def _find_snapshot(self):
-        """优先从置顶消息拿快照，省得扫聊天记录。"""
+        """优先从置顶消息里拿快照（锁也置顶，所以这里要按文件名挑）。"""
+        for m in await self._pinned():
+            if is_db_msg(m):
+                return m
         try:
             from telethon.tl.functions.channels import GetFullChannelRequest
             ent = await self.client.get_entity(self.chat)
@@ -893,54 +899,57 @@ class Store:
         salt = hashlib.sha256(sess.encode()).hexdigest()[:16]
         return hashlib.sha256((salt + sess).encode()).hexdigest()[:32]
 
-    async def _lock_msg(self):
-        async for m in self.client.iter_messages(self.chat, limit=10):
-            if is_lock_msg(m):
+    async def _pinned(self, limit: int = 50):
+        """只看置顶消息。全量扫聊天记录只应出现在显式 reindex 里。"""
+        try:
+            from telethon.tl.types import InputMessagesFilterPinned
+            msgs = await self.client.get_messages(
+                self.chat, filter=InputMessagesFilterPinned(), limit=limit)
+            return [m for m in msgs if m]
+        except Exception as e:
+            log.warning("读取置顶消息失败: %s", e)
+            return []
+
+    def _lock_text(self) -> str:
+        """锁状态写在快照消息的 caption 里：空闲 lock:null，锁定 lock:<hash>。"""
+        return (LOCK_PREFIX + self.token) if self._holding else LOCK_IDLE
+
+    async def _snap_msg(self):
+        """置顶的那条快照消息（锁状态就在它的 caption 上）。"""
+        for m in await self._pinned():
+            if is_db_msg(m):
                 return m
         return None
 
-    async def _lock_bytes(self, m) -> bytes:
-        fd, tmp = tempfile.mkstemp(prefix="tgnd_lock_")
-        os.close(fd)
-        try:
-            await self.client.download_media(m, file=tmp)
-            with open(tmp, "rb") as f:
-                return f.read()
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-
-    async def _set_lock(self, msg_id: int, payload: bytes):
-        await self.client.edit_message(
-            self.chat, msg_id, file=io.BytesIO(payload), force_document=True,
-            attributes=[DocumentAttributeFilename(LOCK_NAME)])
+    @staticmethod
+    def _cap(msg) -> str:
+        return (getattr(msg, "message", "") or "").strip() if msg else ""
 
     async def acquire(self, timeout: int = 60, nonblock: bool = False):
-        """锁就是一个 tgnd.lock 文件：大小 1 且内容 0x00 = 空闲，大小 32 = 锁定（内容为持有者 token）。"""
-        mine = self.token.encode()
+        """锁 = 置顶快照消息的 caption。
+
+        空闲时是 `lock:null`，被占用时是 `lock:<sha256(盐+token)>`。
+        token 本身是 TG_SESSION 的 sha256 派生值，不暴露 session。
+        """
+        mine = LOCK_PREFIX + self.token
         end = time.time() + timeout
         while True:
-            m = await self._lock_msg()
+            m = await self._snap_msg()
             if m is None:
-                msg = await self.client.send_file(
-                    self.chat, io.BytesIO(mine), caption="", force_document=True,
-                    attributes=[DocumentAttributeFilename(LOCK_NAME)])
-                self.lock_msg_id = msg.id
-                self._holding = True
-                log.info("创建锁 msg %d", msg.id)
-                return
-            size = m.document.size if m.document else 0
-            if size == 1:                                  # 空闲
-                await self._set_lock(m.id, mine)
-                self.lock_msg_id = m.id
-                self._holding = True
-                log.info("锁 msg %d 空闲 → 占用", m.id)
-                return
-            data = await self._lock_bytes(m)
-            if data == mine:                               # 已经是自己的锁
-                self.lock_msg_id = m.id
+                await self.snapshot()          # 没有快照就先建一条（此时无人持锁）
+                continue
+            cur = self._cap(m)
+            if cur in ("", LOCK_IDLE, mine):
+                await self.client.edit_message(self.chat, m.id, text=mine)
+                # 回读确认，防止两个节点同时写
+                m2 = await self.client.get_messages(self.chat, ids=m.id)
+                if self._cap(m2) == mine:
+                    self.snap_msg_id = m.id
+                    self._holding = True
+                    log.info("锁 msg %d 空闲 → 占用", m.id)
+                    return
+            if cur == mine:
+                self.snap_msg_id = m.id
                 self._holding = True
                 return
             if nonblock:
@@ -951,32 +960,32 @@ class Store:
             await asyncio.sleep(1.5)
 
     async def release(self):
-        """把锁文件改成 1 字节的 0x00，表示空闲。"""
-        if not self.lock_msg_id:
+        """把 caption 改回 lock:null。"""
+        if not self._holding or not self.snap_msg_id:
+            self._holding = False
             return
         try:
-            await self._set_lock(self.lock_msg_id, b"\x00")
+            await self.client.edit_message(self.chat, self.snap_msg_id, text=LOCK_IDLE)
         except Exception as e:
             log.warning("释放锁失败: %s", e)
-        self.lock_msg_id = 0
         self._holding = False
 
     async def _clear_own_stale_lock(self, timeout: int = 120):
-        """启动时：自己的残留锁直接置空，别人的锁就轮询等它释放。"""
+        """启动时：锁是自己的残留就置空，是别人的就轮询等它释放。"""
         end = time.time() + timeout
+        mine = LOCK_PREFIX + self.token
         waited = False
         while True:
             try:
-                m = await self._lock_msg()
+                m = await self._snap_msg()
                 if not m:
                     return
-                size = m.document.size if m.document else 0
-                if size == 1:
+                cur = self._cap(m)
+                if cur in ("", LOCK_IDLE):
                     return
-                data = await self._lock_bytes(m)
-                if data == self.token.encode():
+                if cur == mine:
                     log.warning("启动时清理自己残留的锁 msg %d", m.id)
-                    await self._set_lock(m.id, b"\x00")
+                    await self.client.edit_message(self.chat, m.id, text=LOCK_IDLE)
                     return
             except Exception as e:
                 log.warning("启动检查锁失败: %s", e)
