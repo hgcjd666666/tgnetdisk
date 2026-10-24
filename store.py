@@ -32,7 +32,6 @@ PART = 512 * 1024
 WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))
 DB_PATH = os.environ.get("TGND_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tgnd.db"))
 BACKEND = os.environ.get("TGND_BACKEND", "sqlite")
-DB_CAP = '{"db":1}'
 DB_NAME = "tgnd.db.xz"
 
 
@@ -70,6 +69,17 @@ def is_path_session(val: str) -> bool:
 
 def make_session(val: str):
     return val if is_path_session(val) else StringSession(val)
+
+
+def is_db_msg(msg) -> bool:
+    """快照消息靠文件名认：tgnd.db.xz。"""
+    doc = getattr(msg, "document", None)
+    if doc is None:
+        return False
+    for a in doc.attributes:
+        if getattr(a, "file_name", None) == DB_NAME:
+            return True
+    return False
 
 
 def parse_name(msg):
@@ -557,8 +567,7 @@ class Store:
         n = 0
         async for m in self.client.iter_messages(self.chat, reverse=True):
             n += 1
-            cap = (m.message or "").strip().replace(" ", "")
-            if cap == DB_CAP:
+            if is_db_msg(m):
                 snaps.append(m)
                 continue
             nm = parse_name(m)
@@ -584,7 +593,7 @@ class Store:
         try:
             self.backend.dump(tmp)
             msg = await self.client.send_file(
-                self.chat, tmp, caption=DB_CAP, force_document=True,
+                self.chat, tmp, force_document=True,
                 attributes=[DocumentAttributeFilename(DB_NAME)])
             old = self.snap_msg_id
             self.snap_msg_id = msg.id
@@ -612,12 +621,12 @@ class Store:
             pid = getattr(full.full_chat, "pinned_msg_id", None)
             if pid:
                 m = await self.client.get_messages(self.chat, ids=pid)
-                if m and (m.message or "").strip().replace(" ", "") == DB_CAP:
+                if m and is_db_msg(m):
                     return m
         except Exception as e:
             log.warning("读取置顶失败: %s", e)
         async for m in self.client.iter_messages(self.chat):
-            if (m.message or "").strip().replace(" ", "") == DB_CAP:
+            if is_db_msg(m):
                 return m
         return None
 
@@ -646,7 +655,7 @@ class Store:
         """从 TG 拉最新快照覆盖本地索引。"""
         if pid:
             best = await self.client.get_messages(self.chat, ids=pid)
-            if not best or (best.message or "").strip().replace(" ", "") != DB_CAP:
+            if not best or not is_db_msg(best):
                 best = await self._find_snapshot()
         else:
             best = await self._find_snapshot()
