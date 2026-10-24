@@ -1,10 +1,10 @@
-"""Telegram 存储后端：TG 消息按 md5 命名，路径索引走可替换的 Backend，快照压缩后传回 TG 置顶。
+"""Telegram 存储后端：TG 消息按 hash 命名，路径索引走可替换的 Backend，快照压缩后传回 TG 置顶。
 
 约定
-  TG 文件消息文件名 = "<md5>.<分片序号>"    例  d41d8c...427e.0 / .1
+  TG 文件消息文件名 = "<hash>.<分片序号>"    例  d41d8c...427e.0 / .1
   TG 文件消息 caption = {"i": 序号}
   TG 快照消息      文件名 = "tgnd.db.xz"，caption = {"db":1}，置顶
-  Backend 负责 path ↔ md5 与分片 msg_id；默认 SQLite，换成 PostgreSQL 只需再实现一个 Backend
+  Backend 负责 path ↔ hash 与分片 msg_id；默认 SQLite，换成 PostgreSQL 只需再实现一个 Backend
 """
 import abc
 import asyncio
@@ -120,7 +120,7 @@ def parse_lock(msg):
 
 
 def parse_name(msg):
-    """文件名 "<md5>.<序号>" → (md5, 序号)。"""
+    """文件名 "<hash>.<序号>" → (hash, 序号)。"""
     doc = getattr(msg, "document", None)
     if doc is None:
         return None
@@ -216,19 +216,21 @@ async def upload_parallel(client, src, workers=None, part=PART):
 
 
 class Entry:
-    __slots__ = ("path", "is_dir", "mtime", "md5", "size", "parts", "status", "expect", "skipped")
+    __slots__ = ("path", "is_dir", "mtime", "hash", "size", "parts", "status",
+                 "expect", "skipped", "fname")
 
-    def __init__(self, path, is_dir, mtime=0, md5="", size=0, parts=None,
-                 status=0, expect=0):
+    def __init__(self, path, is_dir, mtime=0, hash="", size=0, parts=None,
+                 status=0, expect=0, name=""):
         self.path = path
         self.is_dir = is_dir
         self.mtime = mtime
-        self.md5 = md5
+        self.hash = hash
         self.size = size
         self.parts = parts or {}
         self.status = status          # 0=完成 1=上传中
         self.expect = expect          # 预期分片数
         self.skipped = False          # 上传时命中「已存在且内容相同」
+        self.fname = name             # TG 上的实际文件名前缀（旧数据可能为空，那时按 hash 推）
 
     @property
     def slices(self):
@@ -243,7 +245,7 @@ class Entry:
         return "/" if self.path == "/" else base_of(self.path)
 
     def __repr__(self):
-        return f"<{'D' if self.is_dir else 'F'} {self.path} {self.size} md5={self.md5[:8]} x{len(self.parts)}>"
+        return f"<{'D' if self.is_dir else 'F'} {self.path} {self.size} hash={self.hash[:8]} x{len(self.parts)}>"
 
 
 # ---------- 索引后端接口 ----------
@@ -260,8 +262,8 @@ class Backend(abc.ABC):
     def all_entries(self) -> dict: ...
 
     @abc.abstractmethod
-    def set_file(self, path: str, md5: str, size: int, mtime: int, parts: dict,
-                 status: int = 0, expect: int = 0): ...
+    def set_file(self, path: str, hash: str, size: int, mtime: int, parts: dict,
+                 status: int = 0, expect: int = 0, name: str = ""): ...
 
     @abc.abstractmethod
     def pending(self) -> list: ...
@@ -273,7 +275,7 @@ class Backend(abc.ABC):
     def remove(self, path: str): ...
 
     @abc.abstractmethod
-    def find_by_md5(self, md5: str) -> list: ...
+    def find_by_hash(self, hash: str) -> list: ...
 
     @abc.abstractmethod
     def paths_under(self, prefix: str) -> list: ...
@@ -307,10 +309,10 @@ class SqliteBackend(Backend):
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS files(
-                path TEXT PRIMARY KEY, md5 TEXT NOT NULL, size INTEGER DEFAULT 0,
-                mtime INTEGER DEFAULT 0, parts TEXT DEFAULT '{}');
+                path TEXT PRIMARY KEY, hash TEXT NOT NULL, size INTEGER DEFAULT 0,
+                mtime INTEGER DEFAULT 0, parts TEXT DEFAULT '{}', name TEXT DEFAULT '');
             CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY, mtime INTEGER DEFAULT 0);
-            CREATE INDEX IF NOT EXISTS idx_files_md5 ON files(md5);
+            CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);
             CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
         """)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(files)")}
@@ -318,6 +320,10 @@ class SqliteBackend(Backend):
             self.db.execute("ALTER TABLE files ADD COLUMN status INTEGER DEFAULT 0")
         if "expect" not in cols:
             self.db.execute("ALTER TABLE files ADD COLUMN expect INTEGER DEFAULT 0")
+        if "name" not in cols:
+            self.db.execute("ALTER TABLE files ADD COLUMN name TEXT DEFAULT ''")
+        if "md5" in cols and "hash" not in cols:
+            self.db.execute("ALTER TABLE files RENAME COLUMN md5 TO hash")
         self.db.commit()
 
     def get(self, path):
@@ -325,9 +331,10 @@ class SqliteBackend(Backend):
         if p == "/":
             return Entry("/", True, int(time.time()))
         r = self.db.execute(
-            "select path,md5,size,mtime,parts,status,expect from files where path=?", (p,)).fetchone()
+            "select path,hash,size,mtime,parts,status,expect,name from files where path=?", (p,)).fetchone()
         if r:
-            return Entry(r[0], False, r[3], r[1], r[2], json.loads(r[4] or "{}"), r[5], r[6])
+            return Entry(r[0], False, r[3], r[1], r[2], json.loads(r[4] or "{}"),
+                         r[5], r[6], r[7] or "")
         r = self.db.execute("select path,mtime from dirs where path=?", (p,)).fetchone()
         if r:
             return Entry(r[0], True, r[1])
@@ -353,21 +360,21 @@ class SqliteBackend(Backend):
         out = {"/": Entry("/", True, int(time.time()))}
         for p, m in self.db.execute("select path,mtime from dirs"):
             out[p] = Entry(p, True, m)
-        for p, md5, size, mtime, parts, st, ex in self.db.execute(
-                "select path,md5,size,mtime,parts,status,expect from files"):
-            out[p] = Entry(p, False, mtime, md5, size, json.loads(parts or "{}"), st, ex)
+        for p, hash, size, mtime, parts, st, ex, nm in self.db.execute(
+                "select path,hash,size,mtime,parts,status,expect,name from files"):
+            out[p] = Entry(p, False, mtime, hash, size, json.loads(parts or "{}"), st, ex, nm or "")
         return out
 
-    def set_file(self, path, md5, size, mtime, parts, status=0, expect=0):
+    def set_file(self, path, hash, size, mtime, parts, status=0, expect=0, name=""):
         self.db.execute(
-            "insert or replace into files(path,md5,size,mtime,parts,status,expect)"
-            " values(?,?,?,?,?,?,?)",
-            (norm(path), md5, size, mtime, json.dumps(parts), status, expect))
+            "insert or replace into files(path,hash,size,mtime,parts,status,expect,name)"
+            " values(?,?,?,?,?,?,?,?)",
+            (norm(path), hash, size, mtime, json.dumps(parts), status, expect, name))
         self.db.commit()
 
     def pending(self):
         return [tuple(r) for r in self.db.execute(
-            "select path,md5,expect,size,mtime from files where status=1")]
+            "select path,hash,expect,size,mtime from files where status=1")]
 
     def get_meta(self, k, default=""):
         r = self.db.execute("select v from meta where k=?", (k,)).fetchone()
@@ -388,9 +395,9 @@ class SqliteBackend(Backend):
         self.db.execute("delete from dirs where path=?", (p,))
         self.db.commit()
 
-    def find_by_md5(self, md5):
+    def find_by_hash(self, hash):
         return [(r[0], r[1], json.loads(r[2] or "{}")) for r in self.db.execute(
-            "select path,size,parts from files where md5=?", (md5,))]
+            "select path,size,parts from files where hash=?", (hash,))]
 
     def paths_under(self, prefix):
         prefix = norm(prefix)
@@ -539,7 +546,7 @@ class Store:
         async with self.lock:
             old = self.backend.get(p)
             if old and not old.is_dir and not append:
-                if skip_same and old.status == 0 and old.md5 == digest and old.size == size:
+                if skip_same and old.status == 0 and old.hash == digest and old.size == size:
                     old.skipped = True
                     log.info("跳过（已存在且内容相同）: %s", p)
                     return old
@@ -548,29 +555,29 @@ class Store:
             await self._ensure_parents(p)
 
             if size == 0 and not append:
-                self.backend.set_file(p, digest or "", 0, mt, {}, 0, 0)
+                self.backend.set_file(p, digest or "", 0, mt, {}, 0, 0, digest or "")
                 self.dirty = True
                 log.info("空文件只登记索引: %s", p)
                 return self.backend.get(p)
 
             if digest and not append:
-                for opath, osize, oparts in self.backend.find_by_md5(digest):
+                for opath, osize, oparts in self.backend.find_by_hash(digest):
                     if oparts:
-                        self.backend.set_file(p, digest, osize, mt, oparts, 0, 0)
+                        self.backend.set_file(p, digest, osize, mt, oparts, 0, 0, digest)
                         self.dirty = True
-                        log.info("秒传命中 %s (md5 %s) ← %s", p, digest[:8], opath)
+                        log.info("秒传命中 %s (hash %s) ← %s", p, digest[:8], opath)
                         return self.backend.get(p)
 
             parts = {}
             if append and old and not old.is_dir:
                 parts = dict(old.parts)
                 if not digest:
-                    digest = old.md5
+                    digest = old.hash
             base_idx = start_index if start_index is not None else (
                 (max(parts) + 1) if parts else 0)
-            tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()[:32]
+            tag = (old.fname if old else "") or digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()[:32]
             nparts = max(1, (size + S - 1) // S) if size else 0
-            self.backend.set_file(p, digest or tag, size, mt, parts, 1, nparts)
+            self.backend.set_file(p, digest or tag, size, mt, parts, 1, nparts, tag)
             self.dirty = True
 
         # 阶段二：真正把字节传上 TG，这段时间不持锁
@@ -604,7 +611,7 @@ class Store:
 
         # 阶段三：提交结果，锁只在这几百毫秒内再持一次
         async with self.lock:
-            self.backend.set_file(p, digest or tag, size, mt, parts, 0, nparts)
+            self.backend.set_file(p, digest or tag, size, mt, parts, 0, nparts, tag)
             self.dirty = True
         return self.backend.get(p)
 
@@ -619,18 +626,18 @@ class Store:
         mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
         async with self.lock:
             old = self.backend.get(p)
-            if old and not old.is_dir and old.status == 0 and old.md5 == digest and old.size == size:
+            if old and not old.is_dir and old.status == 0 and old.hash == digest and old.size == size:
                 old.skipped = True
                 return old
             await self._ensure_parents(p)
             if digest:
-                for opath, osize, oparts in self.backend.find_by_md5(digest):
+                for opath, osize, oparts in self.backend.find_by_hash(digest):
                     if oparts:
-                        self.backend.set_file(p, digest, osize, mt, dict(oparts), 0, 0)
+                        self.backend.set_file(p, digest, osize, mt, dict(oparts), 0, 0, digest)
                         self.dirty = True
                         return self.backend.get(p)
             nparts = max(1, (size + SLICE - 1) // SLICE) if size else 0
-            self.backend.set_file(p, digest, size, mt, {}, 1, nparts)
+            self.backend.set_file(p, digest, size, mt, {}, 1, nparts, digest)
             self.dirty = True
             return self.backend.get(p)
 
@@ -641,8 +648,8 @@ class Store:
         if e is None or e.is_dir or e.status == 0:
             return e
         size = e.size
-        digest = e.md5
-        tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()[:32]
+        digest = e.hash
+        tag = getattr(e, "fname", "") or digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()[:32]
         S = SLICE
         parts: dict[int, int] = {}
 
@@ -672,19 +679,19 @@ class Store:
                     pos += length
                     n += 1
         async with self.lock:
-            self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts))
+            self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts), tag)
             self.dirty = True
         return self.backend.get(p)
 
     async def _drop(self, path: str, hard=True):
-        """删记录；hard 时若该 md5 没有别的路径引用，连 TG 消息一起删。"""
+        """删记录；hard 时若该 hash 没有别的路径引用，连 TG 消息一起删。"""
         p = norm(path)
         e = self.backend.get(p)
         self.backend.remove(p)
         self.dirty = True
         if not (hard and e and not e.is_dir and e.parts):
             return
-        left = [x for x in self.backend.find_by_md5(e.md5) if x[2]]
+        left = [x for x in self.backend.find_by_hash(e.hash) if x[2]]
         if left:
             return
         await self._del_ids(list(e.parts.values()))
@@ -720,7 +727,7 @@ class Store:
                 if x.is_dir:
                     self.backend.set_dir(newp, x.mtime)
                 else:
-                    self.backend.set_file(newp, x.md5, x.size, x.mtime, x.parts)
+                    self.backend.set_file(newp, x.hash, x.size, x.mtime, x.parts, 0, 0, x.fname)
             for x in rows:
                 self.backend.remove(x.path)
             self.dirty = True
@@ -739,7 +746,7 @@ class Store:
                 if x.is_dir:
                     self.backend.set_dir(newp, x.mtime)
                 else:
-                    self.backend.set_file(newp, x.md5, x.size, x.mtime, x.parts)
+                    self.backend.set_file(newp, x.hash, x.size, x.mtime, x.parts, 0, 0, x.fname)
             self.dirty = True
 
     # ---------- 读取内容 ----------
@@ -801,8 +808,8 @@ class Store:
 
     # ---------- 同步 / 快照 ----------
     async def sync(self, full: bool = True):
-        """扫描 TG 消息，补全 md5 → 分片映射，并记录最新快照消息。"""
-        parts_by_md5 = {}
+        """扫描 TG 消息，补全 hash → 分片映射，并记录最新快照消息。"""
+        parts_by_hash = {}
         snaps = []
         n = 0
         last = 0 if full else int(self.backend.get_meta("last_id", "0") or 0)
@@ -817,25 +824,25 @@ class Store:
             nm = parse_name(m)
             if not nm:
                 continue
-            md5, idx = nm
-            parts_by_md5.setdefault(md5, {})[idx] = m.id
+            hash, idx = nm
+            parts_by_hash.setdefault(hash, {})[idx] = m.id
             if m.id > self.last_id:
                 self.last_id = m.id
             if m.id > last:
                 last = m.id
-        for md5, parts in parts_by_md5.items():
-            for opath, osize, oparts in self.backend.find_by_md5(md5):
+        for hash, parts in parts_by_hash.items():
+            for opath, osize, oparts in self.backend.find_by_hash(hash):
                 if oparts != parts:
-                    self.backend.set_file(opath, md5, osize, int(time.time()), parts)
+                    self.backend.set_file(opath, hash, osize, int(time.time()), parts, 0, 0, hash)
         self.backend.set_meta("last_id", last)
-        for path, md5, expect, size, mtime in (self.backend.pending() if full else []):
-            got = parts_by_md5.get(md5, {})
+        for path, hash, expect, size, mtime in (self.backend.pending() if full else []):
+            got = parts_by_hash.get(hash, {})
             if expect and len(got) >= expect:
-                self.backend.set_file(path, md5, size, mtime, got, 0, expect)
+                self.backend.set_file(path, hash, size, mtime, got, 0, expect, hash)
                 log.info("补记完成的上传: %s (%d 片)", path, len(got))
         if snaps:
             self.snap_msg_id = max(s.id for s in snaps)
-        log.info("扫描 %d 条消息，%d 个 md5，快照 %d 条", n, len(parts_by_md5), len(snaps))
+        log.info("扫描 %d 条消息，%d 个 hash，快照 %d 条", n, len(parts_by_hash), len(snaps))
         return n
 
     async def snapshot(self, final: bool = False):
