@@ -9,16 +9,57 @@
 import asyncio
 import io
 import logging
+import random
 import os
 import time
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import DocumentAttributeFilename
+from telethon.tl.functions.upload import SaveBigFilePartRequest
+from telethon.tl.types import DocumentAttributeFilename, InputFileBig
 
 log = logging.getLogger("store")
 
 SLICE = int(os.environ.get("SLICE_MB", "1900")) * 1024 * 1024
+PART = 512 * 1024                    # Telegram 单 part 上限
+WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))
+
+
+async def upload_parallel(client, src, workers=None, part=PART):
+    """把文件的 part 并发上传（telethon 默认是顺序的），返回 InputFileBig 供 send_file 直接发。"""
+    if isinstance(src, str):
+        f, own = open(src, "rb"), True
+        try:
+            size = os.fstat(f.fileno()).st_size
+        except OSError:
+            f.seek(0, 2)
+            size = f.tell()
+    else:
+        f, own = src, False
+        size = f.seek(0, 2)
+        f.seek(0)
+    n = max(1, (size + part - 1) // part)
+    fid = random.randrange(1 << 62)
+    sem = asyncio.Semaphore(workers or WORKERS)
+    done = 0
+    step = max(1, n // 200)         # 每 0.5% 报一次进度
+
+    async def one(i):
+        nonlocal done
+        async with sem:
+            f.seek(i * part)
+            data = f.read(part)
+            await client(SaveBigFilePartRequest(fid, i, n, data))
+        done += 1
+        if done % step == 0 or done == n:
+            log.info("  %d/%d part (%.1f%%, 共 %.0f MB)", done, n, 100.0 * done / n, size / 1048576)
+
+    try:
+        await asyncio.gather(*[one(i) for i in range(n)])
+    finally:
+        if own:
+            f.close()
+    return InputFileBig(fid, n, "blob")
 
 
 class SliceReader(io.RawIOBase):
@@ -242,10 +283,16 @@ class Store:
                 (max(e.parts) + 1) if e.parts else 0)
 
             async def send(src, idx_no):
-                msg = await self.client.send_file(
-                    self.chat, src, caption=p, force_document=True,
-                    attributes=[DocumentAttributeFilename(f"{now}.{idx_no}")],
-                )
+                attrs = [DocumentAttributeFilename(f"{now}.{idx_no}")]
+                try:
+                    ref = await upload_parallel(self.client, src)
+                except Exception as ex:            # 并发失败就退回 telethon 顺序上传
+                    log.warning("并行上传失败，退回顺序: %s", ex)
+                    msg = await self.client.send_file(self.chat, src, caption=p,
+                                                      force_document=True, attributes=attrs)
+                else:
+                    msg = await self.client.send_file(self.chat, ref, caption=p,
+                                                      force_document=True, attributes=attrs)
                 sz = int(msg.document.size or 0) if msg.document else 0
                 e.parts[idx_no] = (msg.id, sz)
                 if msg.id > self.last_id:

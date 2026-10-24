@@ -30,6 +30,7 @@ API_HASH = os.environ.get("TG_API_HASH", "")
 PHONE = os.environ.get("TG_PHONE", "")
 CHAT = os.environ.get("TG_CHAT", "")
 SESSION = os.environ.get("TG_SESSION", "/app/tgnd/session")
+DEVICE = os.environ.get("TG_DEVICE", "tgnd")
 PORT = int(os.environ.get("PORT", "8087"))
 DAV_USER = os.environ.get("DAV_USER", "admin")
 DAV_PASS = os.environ.get("DAV_PASS", "")
@@ -368,7 +369,8 @@ async def main():
     sess = make_session(SESSION)
     if isinstance(sess, str):
         os.makedirs(os.path.dirname(sess), exist_ok=True)
-    client = TelegramClient(sess, API_ID, API_HASH)
+    client = TelegramClient(sess, API_ID, API_HASH, device_model=DEVICE,
+                            system_version="Linux", app_version="tgnd")
     await client.connect()
     if not await client.is_user_authorized():
         sys.exit("session 未授权")
@@ -388,12 +390,20 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info("WebDAV 已启动: http://0.0.0.0:%d/", PORT)
+    i = 0
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(30)
+        i += 1
         try:
-            await store.sync(full=False)
+            if i % 20 == 0:                 # 每 10 分钟全量重建，感知别处删掉的文件
+                async with store.lock:
+                    store.entries.clear()
+                    store.last_id = 0
+                await store.sync(full=True)
+            else:
+                await store.sync(full=False)
         except Exception as e:
-            log.warning("增量同步失败: %s", e)
+            log.warning("后台同步失败: %s", e)
 
 
 if __name__ == "__main__":

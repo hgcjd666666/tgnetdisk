@@ -16,6 +16,7 @@
   TG_API_ID, TG_API_HASH, TG_SESSION, TG_CHAT
 """
 import asyncio
+import logging
 import os
 import shutil
 import sqlite3
@@ -25,6 +26,9 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from store import Store, norm, base_of, make_session, is_path_session  # noqa: E402
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
 
 def load_env():
@@ -88,7 +92,8 @@ async def get_store():
     src = os.environ["TG_SESSION"]
     tmp = copy_session(src)
     client = TelegramClient(tmp or make_session(src), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"],
-                            proxy=build_proxy())
+                            proxy=build_proxy(), device_model=os.environ.get("TG_DEVICE", "tgnd"),
+                            system_version="Linux", app_version="tgnd")
     await client.connect()
     if not await client.is_user_authorized():
         sys.exit("session 未授权")
