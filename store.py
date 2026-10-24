@@ -811,6 +811,24 @@ class Store:
             log.warning("释放锁失败: %s", e)
         self.lock_msg_id = 0
 
+    async def _clear_own_stale_lock(self):
+        """启动时清理自己上次崩溃留下的锁；别人的锁不动。"""
+        try:
+            m = await self._lock_msg()
+            if not m:
+                return
+            size = m.document.size if m.document else 0
+            if size == 1:
+                return
+            data = await self._lock_bytes(m)
+            if data == self.token.encode():
+                log.warning("启动时清理自己残留的锁 msg %d", m.id)
+                await self._set_lock(m.id, b"\x00")
+            else:
+                log.warning("启动时发现其他节点的锁 msg %d (size=%d)，保持不动", m.id, size)
+        except Exception as e:
+            log.warning("启动检查锁失败: %s", e)
+
     @asynccontextmanager
     async def guard(self):
         """写操作统一入口：先同步远端 → 抢锁 → 干完上传快照 → 放锁。"""
@@ -865,6 +883,7 @@ class Store:
             best = await self._find_snapshot()
         if not best:
             log.info("TG 上没有索引快照，使用本地库")
+            await self._clear_own_stale_lock()
             return False
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_dl_", suffix=".xz")
         os.close(fd)
@@ -874,6 +893,7 @@ class Store:
             self.snap_msg_id = best.id
             self.snap_doc_id = getattr(getattr(best, "document", None), "id", 0)
             log.info("已从 TG 载入索引快照 (msg %d)", best.id)
+            await self._clear_own_stale_lock()
             return True
         finally:
             try:
