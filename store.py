@@ -1041,7 +1041,9 @@ class Store:
         self._holding = False
 
     async def _clear_own_stale_lock(self, timeout: int = 120):
-        """启动时：锁是自己的残留就置空，是别人的就轮询等它释放。"""
+        """启动时：锁是自己的残留就置空，是别人的就轮询等它释放。单机模式跳过。"""
+        if not ONLINE:
+            return
         end = time.time() + timeout
         mine = LOCK_PREFIX + self.token
         waited = False
@@ -1111,6 +1113,18 @@ class Store:
             self._touch()
             yield
             return
+        if not ONLINE:                          # 单机：不碰锁，只在退出时落库
+            self._in_guard = True
+            try:
+                yield
+            finally:
+                if self.dirty:
+                    try:
+                        await self.snapshot()
+                    except Exception as e:
+                        log.warning("快照上传失败: %s", e)
+                self._in_guard = False
+            return
         self._in_guard = True
         try:
             await self.ensure_fresh()
@@ -1148,10 +1162,10 @@ class Store:
                 self._in_guard = False
 
     async def ensure_fresh(self):
-        """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。
-
-        快照用 edit_message 原地替换，消息 id 不变，所以靠 document.id 判断内容是否换过。
-        """
+        """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。单机模式直接跳过。"""
+        if not ONLINE:
+            return False
+        # 快照用 edit_message 原地替换，消息 id 不变，靠 document.id 判断内容是否换过
         if self._holding and self._lease:
             return False                       # 批量模式下锁一直是自己的，不用反复查
         try:
