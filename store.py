@@ -379,6 +379,7 @@ class Store:
 
     async def mkdir(self, path: str, _force=False):
         p = norm(path)
+        await self.ensure_fresh()
         async with self.lock:
             cur = self.backend.get(p)
             if cur and not _force:
@@ -396,6 +397,7 @@ class Store:
         S = slice_size or SLICE
         digest = None if append else md5_of(local_path)
         mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
+        await self.ensure_fresh()
         async with self.lock:
             old = self.backend.get(p)
             if old and not old.is_dir and not append:
@@ -471,6 +473,7 @@ class Store:
 
     async def delete(self, path: str, recursive=True):
         p = norm(path)
+        await self.ensure_fresh()
         e = self.backend.get(p)
         if not e:
             raise FileNotFoundError(p)
@@ -486,6 +489,7 @@ class Store:
 
     async def move(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
+        await self.ensure_fresh()
         if not self.backend.get(s):
             raise FileNotFoundError(s)
         async with self.lock:
@@ -503,6 +507,7 @@ class Store:
 
     async def copy(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
+        await self.ensure_fresh()
         if not self.backend.get(s):
             raise FileNotFoundError(s)
         async with self.lock:
@@ -601,21 +606,50 @@ class Store:
     async def _find_snapshot(self):
         """优先从置顶消息拿快照，省得扫聊天记录。"""
         try:
-            pins = await self.client.get_pinned_messages(self.chat)
+            from telethon.tl.functions.channels import GetFullChannelRequest
+            ent = await self.client.get_entity(self.chat)
+            full = await self.client(GetFullChannelRequest(ent))
+            pid = getattr(full.full_chat, "pinned_msg_id", None)
+            if pid:
+                m = await self.client.get_messages(self.chat, ids=pid)
+                if m and (m.message or "").strip().replace(" ", "") == DB_CAP:
+                    return m
         except Exception as e:
             log.warning("读取置顶失败: %s", e)
-            pins = []
-        for m in pins:
-            if (m.message or "").strip().replace(" ", "") == DB_CAP:
-                return m
         async for m in self.client.iter_messages(self.chat):
             if (m.message or "").strip().replace(" ", "") == DB_CAP:
                 return m
         return None
 
-    async def load(self):
-        """启动时从 TG 拉最新快照覆盖本地索引。"""
-        best = await self._find_snapshot()
+    async def _pinned_id(self):
+        from telethon.tl.functions.channels import GetFullChannelRequest
+        ent = await self.client.get_entity(self.chat)
+        full = await self.client(GetFullChannelRequest(ent))
+        return getattr(full.full_chat, "pinned_msg_id", None)
+
+    async def ensure_fresh(self):
+        """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。"""
+        try:
+            pid = await self._pinned_id()
+        except Exception as e:
+            log.warning("检查置顶失败: %s", e)
+            return False
+        if not pid:
+            return False
+        if self.snap_msg_id and pid == self.snap_msg_id:
+            return False
+        log.info("检测到索引快照更新 (本地 %s → 远端 %s)，先同步", self.snap_msg_id, pid)
+        await self.load(pid)
+        return True
+
+    async def load(self, pid: int | None = None):
+        """从 TG 拉最新快照覆盖本地索引。"""
+        if pid:
+            best = await self.client.get_messages(self.chat, ids=pid)
+            if not best or (best.message or "").strip().replace(" ", "") != DB_CAP:
+                best = await self._find_snapshot()
+        else:
+            best = await self._find_snapshot()
         if not best:
             log.info("TG 上没有索引快照，使用本地库")
             return False
