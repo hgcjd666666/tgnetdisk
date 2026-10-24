@@ -288,17 +288,39 @@ async def cmd_pushdir(st, args):
     ok = skipped = failed = 0
     t0 = time.time()
 
-    # 阶段一：一次持锁，把全部文件登记成「待上传」，然后立刻释放
-    print("阶段一：登记待上传清单…", flush=True)
-    async with st.guard():
-        for f, d in jobs:
+    # 阶段一：先把哈希算完（纯本地，不碰 TG），再一次性持锁写入索引
+    print("预计算哈希…", flush=True)
+    import concurrent.futures as _cf
+
+    def _prep(item):
+        f, d = item
+        stt = os.stat(f)
+        return (f, d, stt.st_size, digest_of(f), int(stt.st_mtime))
+
+    prepared = []
+    done_n = 0
+    with _cf.ThreadPoolExecutor(max_workers=8) as ex:
+        for res in ex.map(_prep, jobs):
+            prepared.append(res)
+            done_n += 1
+            if done_n % 20 == 0 or done_n == len(jobs):
+                print(f"  哈希 {done_n}/{len(jobs)}", flush=True)
+
+    print(f"哈希完成，持锁写入索引…", flush=True)
+    await st.acquire()
+    try:
+        for f, d, size, digest, mt in prepared:
             try:
-                e = await st.register(d, f)
+                e = await st.register(d, f, digest=digest, size=size, mtime=mt)
                 if e.skipped:
                     skipped += 1
             except Exception as ex:
                 failed += 1
                 print(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
+        if st.dirty:
+            await st.snapshot()
+    finally:
+        await st.release()
     print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
 
     # 阶段二：不持锁传字节；每 10 个文件短暂拿一次锁把结果落库

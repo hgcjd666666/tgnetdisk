@@ -600,12 +600,15 @@ class Store:
             self.dirty = True
         return self.backend.get(p)
 
-    async def register(self, path: str, local_path: str):
-        """阶段一：只登记「待上传」，不传字节（持锁几百毫秒内完成）。"""
+    async def register(self, path: str, local_path: str, digest: str | None = None,
+                       size: int | None = None, mtime: int | None = None):
+        """阶段一：只登记「待上传」，不传字节。哈希可以由调用方预先算好传进来。"""
         p = norm(path)
-        size = os.path.getsize(local_path)
-        digest = digest_of(local_path)
-        mt = int(os.path.getmtime(local_path))
+        if size is None:
+            size = os.path.getsize(local_path)
+        if digest is None:
+            digest = digest_of(local_path)
+        mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
         async with self.lock:
             old = self.backend.get(p)
             if old and not old.is_dir and old.status == 0 and old.md5 == digest and old.size == size:
