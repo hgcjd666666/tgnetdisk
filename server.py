@@ -381,6 +381,7 @@ async def main():
     else:
         chat = await ensure_chat(client)
     store = Store(client, chat)
+    await store.load()
     await store.sync(full=True)
 
     app = web.Application(client_max_size=0)
@@ -395,13 +396,9 @@ async def main():
         await asyncio.sleep(30)
         i += 1
         try:
-            if i % 20 == 0:                 # 每 10 分钟全量重建，感知别处删掉的文件
-                async with store.lock:
-                    store.entries.clear()
-                    store.last_id = 0
-                await store.sync(full=True)
-            else:
-                await store.sync(full=False)
+            await store.sync(full=(i % 20 == 0))
+            if store.dirty:
+                await store.snapshot()
         except Exception as e:
             log.warning("后台同步失败: %s", e)
 

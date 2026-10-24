@@ -100,6 +100,7 @@ async def get_store():
     chat = os.environ["TG_CHAT"]
     chat = int(chat) if chat.lstrip("-").isdigit() else chat
     st = Store(client, chat)
+    await st.load()
     await st.sync(full=True)
     return client, st, tmp
 
@@ -266,6 +267,11 @@ async def main():
         else:
             print(USAGE)
     finally:
+        try:
+            if st.dirty:
+                await st.snapshot()
+        except Exception as e:
+            print("快照上传失败:", e)
         await client.disconnect()
         cleanup(tmp)
 

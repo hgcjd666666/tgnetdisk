@@ -1,16 +1,23 @@
-"""Telegram 存储后端：路径写进消息 caption，TG 就是唯一真相源。
+"""Telegram 存储后端：TG 消息按 md5 命名，路径索引走可替换的 Backend，快照压缩后传回 TG 置顶。
 
-约定：
-  目录: caption = "/photos/"        （以 / 结尾）
-  文件: caption = "/photos/a.txt"   （完整路径）
-  TG 里显示的文件名 = 上传时间 + ".bin"，切片时追加 .0/.1/...
-  超过 SLICE_MB 的文件自动切成多条消息，索引层拼回一个文件。
+约定
+  TG 文件消息文件名 = "<md5>.<分片序号>"    例  d41d8c...427e.0 / .1
+  TG 文件消息 caption = {"i": 序号}
+  TG 快照消息      文件名 = "tgnd.db.xz"，caption = {"db":1}，置顶
+  Backend 负责 path ↔ md5 与分片 msg_id；默认 SQLite，换成 PostgreSQL 只需再实现一个 Backend
 """
+import abc
 import asyncio
+import hashlib
 import io
+import json
 import logging
-import random
+import lzma
 import os
+import random
+import shutil
+import sqlite3
+import tempfile
 import time
 
 from telethon import TelegramClient
@@ -20,50 +27,68 @@ from telethon.tl.types import DocumentAttributeFilename, InputFileBig
 
 log = logging.getLogger("store")
 
-SLICE = int(os.environ.get("SLICE_MB", "1900")) * 1024 * 1024
-PART = 512 * 1024                    # Telegram 单 part 上限
+SLICE = int(os.environ.get("SLICE_MB", "2047")) * 1024 * 1024
+PART = 512 * 1024
 WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))
+DB_PATH = os.environ.get("TGND_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tgnd.db"))
+BACKEND = os.environ.get("TGND_BACKEND", "sqlite")
+DB_CAP = '{"db":1}'
+DB_NAME = "tgnd.db.xz"
 
 
-async def upload_parallel(client, src, workers=None, part=PART):
-    """把文件的 part 并发上传（telethon 默认是顺序的），返回 InputFileBig 供 send_file 直接发。"""
-    if isinstance(src, str):
-        f, own = open(src, "rb"), True
-        try:
-            size = os.fstat(f.fileno()).st_size
-        except OSError:
-            f.seek(0, 2)
-            size = f.tell()
-    else:
-        f, own = src, False
-        size = f.seek(0, 2)
-        f.seek(0)
-    n = max(1, (size + part - 1) // part)
-    fid = random.randrange(1 << 62)
-    sem = asyncio.Semaphore(workers or WORKERS)
-    done = 0
-    step = max(1, n // 200)         # 每 0.5% 报一次进度
+# ---------- 基础工具 ----------
+def norm(p: str) -> str:
+    return "/" + "/".join(x for x in (p or "").split("/") if x)
 
-    async def one(i):
-        nonlocal done
-        async with sem:
-            f.seek(i * part)
-            data = f.read(part)
-            await client(SaveBigFilePartRequest(fid, i, n, data))
-        done += 1
-        if done % step == 0 or done == n:
-            log.info("  %d/%d part (%.1f%%, 共 %.0f MB)", done, n, 100.0 * done / n, size / 1048576)
 
-    try:
-        await asyncio.gather(*[one(i) for i in range(n)])
-    finally:
-        if own:
-            f.close()
-    return InputFileBig(fid, n, "blob")
+def parent_of(p: str):
+    p = norm(p)
+    if p == "/":
+        return None
+    i = p.rfind("/")
+    return "/" if i == 0 else p[:i]
+
+
+def base_of(p: str) -> str:
+    return norm(p).rsplit("/", 1)[-1]
+
+
+def md5_of(path: str, bufsize: int = 1 << 20) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(bufsize)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def is_path_session(val: str) -> bool:
+    return val.startswith("/") or val.startswith("./") or val.endswith(".session") or "/" in val
+
+
+def make_session(val: str):
+    return val if is_path_session(val) else StringSession(val)
+
+
+def parse_name(msg):
+    """文件名 "<md5>.<序号>" → (md5, 序号)。"""
+    doc = getattr(msg, "document", None)
+    if doc is None:
+        return None
+    for a in doc.attributes:
+        fn = getattr(a, "file_name", None)
+        if not fn or "." not in fn:
+            continue
+        head, tail = fn.rsplit(".", 1)
+        if tail.isdigit() and len(head) == 32:
+            return head, int(tail)
+    return None
 
 
 class SliceReader(io.RawIOBase):
-    """把一个文件的 [start, start+length) 当成独立文件交给 telethon，流式读，不落盘不进内存。"""
+    """把文件的一段当成独立文件交给 telethon，流式读，不落盘不进内存。"""
 
     def __init__(self, f, start: int, length: int):
         self._f = f
@@ -106,76 +131,57 @@ class SliceReader(io.RawIOBase):
         pass
 
 
-def is_path_session(val: str) -> bool:
-    """TG_SESSION 是文件路径，还是 base64 的 StringSession。"""
-    return val.startswith("/") or val.startswith("./") or val.endswith(".session") or "/" in val
+async def upload_parallel(client, src, workers=None, part=PART):
+    """并发上传各 part，返回 InputFileBig。"""
+    if isinstance(src, str):
+        f, own = open(src, "rb"), True
+        try:
+            size = os.fstat(f.fileno()).st_size
+        except OSError:
+            f.seek(0, 2)
+            size = f.tell()
+    else:
+        f, own = src, False
+        size = f.seek(0, 2)
+        f.seek(0)
+    n = max(1, (size + part - 1) // part)
+    fid = random.randrange(1 << 62)
+    sem = asyncio.Semaphore(workers or WORKERS)
+    done = 0
+    step = max(1, n // 200)
 
+    async def one(i):
+        nonlocal done
+        async with sem:
+            f.seek(i * part)
+            data = f.read(part)
+            await client(SaveBigFilePartRequest(fid, i, n, data))
+        done += 1
+        if done % step == 0 or done == n:
+            log.info("  %d/%d part (%.1f%%, %.0f MB)", done, n, 100.0 * done / n, size / 1048576)
 
-def make_session(val: str):
-    """文件路径原样返回；否则当作 StringSession 字符串解码，无需 sqlite。"""
-    return val if is_path_session(val) else StringSession(val)
-
-
-def norm(p: str) -> str:
-    return "/" + "/".join(x for x in (p or "").split("/") if x)
-
-
-def parent_of(p: str):
-    p = norm(p)
-    if p == "/":
-        return None
-    i = p.rfind("/")
-    return "/" if i == 0 else p[:i]
-
-
-def base_of(p: str) -> str:
-    return norm(p).rsplit("/", 1)[-1]
-
-
-def slice_index_of(msg):
-    """从 TG 文件名 "2026-10-23 18:23:16.2" 里取最后一段作为分片序号。"""
-    doc = getattr(msg, "document", None)
-    if doc is None:
-        return None
-    for a in doc.attributes:
-        fn = getattr(a, "file_name", None)
-        if not fn:
-            continue
-        tail = fn.rsplit(".", 1)[-1]
-        if tail.isdigit():
-            return int(tail)
-        return None
-    return None
-
-
-def parse_caption(txt: str):
-    """返回 (path, is_dir)；目录以 / 结尾，文件是完整路径。"""
-    txt = (txt or "").strip()
-    if not txt.startswith("/"):
-        return None
-    if txt.endswith("/"):
-        return norm(txt), True
-    return norm(txt), False
+    try:
+        await asyncio.gather(*[one(i) for i in range(n)])
+    finally:
+        if own:
+            f.close()
+    return InputFileBig(fid, n, "blob")
 
 
 class Entry:
-    __slots__ = ("path", "is_dir", "mtime", "parts")
+    __slots__ = ("path", "is_dir", "mtime", "md5", "size", "parts")
 
-    def __init__(self, path, is_dir, mtime=0, msg_id=0, idx=0, size=0):
+    def __init__(self, path, is_dir, mtime=0, md5="", size=0, parts=None):
         self.path = path
         self.is_dir = is_dir
         self.mtime = mtime
-        self.parts: dict[int, tuple[int, int]] = {}
-        if msg_id:
-            self.parts[idx] = (msg_id, size)
-
-    @property
-    def size(self):
-        return sum(sz for _, sz in self.parts.values())
+        self.md5 = md5
+        self.size = size
+        self.parts = parts or {}
 
     @property
     def slices(self):
-        return [self.parts[k][0] for k in sorted(self.parts)]
+        return [self.parts[k] for k in sorted(self.parts)]
 
     @property
     def msg_id(self):
@@ -185,118 +191,250 @@ class Entry:
     def name(self):
         return "/" if self.path == "/" else base_of(self.path)
 
-    def ordered_slices(self):
-        return self.slices
-
     def __repr__(self):
-        return f"<{'D' if self.is_dir else 'F'} {self.path} {self.size} x{len(self.parts)}>"
+        return f"<{'D' if self.is_dir else 'F'} {self.path} {self.size} md5={self.md5[:8]} x{len(self.parts)}>"
 
 
-class Store:
-    def __init__(self, client: TelegramClient, chat):
-        self.client = client
-        self.chat = chat
-        self.entries: dict[str, Entry] = {}
-        self.last_id = 0
-        self.lock = asyncio.Lock()
-        self.entries["/"] = Entry("/", True, int(time.time()))
+# ---------- 索引后端接口 ----------
+class Backend(abc.ABC):
+    """路径索引的抽象。换实现只要实现下面这些方法，业务层不用动。"""
 
-    # ---------- 索引 ----------
-    def _apply(self, m):
-        r = parse_caption(m.message)
-        if not r:
-            return
-        p, is_dir = r
-        mt = int(m.date.timestamp()) if m.date else int(time.time())
-        if is_dir:
-            self.entries[p] = Entry(p, True, mt, m.id)
-            return
-        doc = getattr(m, "document", None)
-        size = int(doc.size or 0) if doc is not None else 0
-        idx = slice_index_of(m)
-        e = self.entries.get(p)
-        if e and not e.is_dir:
-            if idx is None:
-                idx = len(e.parts)
-            old = e.parts.get(idx)
-            e.parts[idx] = (m.id, size)      # 同序号后传的覆盖先传的
-            return old[0] if old else None
-        else:
-            self.entries[p] = Entry(p, False, mt, m.id,
-                                    idx if idx is not None else 0, size)
-            return None
+    @abc.abstractmethod
+    def get(self, path: str) -> Entry | None: ...
 
-    async def sync(self, full: bool = True):
-        kw = dict(reverse=True)
-        if not full and self.last_id:
-            kw["min_id"] = self.last_id
-        n = 0
-        orphans = []
-        async for m in self.client.iter_messages(self.chat, limit=None, **kw):
-            dead = self._apply(m)
-            if dead:
-                orphans.append(dead)
-            if m.id > self.last_id:
-                self.last_id = m.id
-            n += 1
-        if orphans:
-            await self._del_ids(orphans)
-            log.info("清理被覆盖的旧分片 %d 条", len(orphans))
-        log.info("扫描 %d 条消息，索引 %d 个节点", n, len(self.entries))
-        return n
+    @abc.abstractmethod
+    def children(self, path: str) -> list: ...
 
-    # ---------- 查询 ----------
-    def get(self, path) -> Entry | None:
-        return self.entries.get(norm(path))
+    @abc.abstractmethod
+    def all_entries(self) -> dict: ...
+
+    @abc.abstractmethod
+    def set_file(self, path: str, md5: str, size: int, mtime: int, parts: dict): ...
+
+    @abc.abstractmethod
+    def set_dir(self, path: str, mtime: int): ...
+
+    @abc.abstractmethod
+    def remove(self, path: str): ...
+
+    @abc.abstractmethod
+    def find_by_md5(self, md5: str) -> list: ...
+
+    @abc.abstractmethod
+    def paths_under(self, prefix: str) -> list: ...
+
+    @abc.abstractmethod
+    def dump(self, dst: str): ...
+
+    @abc.abstractmethod
+    def restore(self, src: str): ...
+
+    def close(self):
+        pass
+
+
+class SqliteBackend(Backend):
+    def __init__(self, path: str = DB_PATH):
+        self.path = path
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        self._open()
+
+    def _open(self):
+        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS files(
+                path TEXT PRIMARY KEY, md5 TEXT NOT NULL, size INTEGER DEFAULT 0,
+                mtime INTEGER DEFAULT 0, parts TEXT DEFAULT '{}');
+            CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY, mtime INTEGER DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS idx_files_md5 ON files(md5);
+        """)
+        self.db.commit()
+
+    def get(self, path):
+        p = norm(path)
+        if p == "/":
+            return Entry("/", True, int(time.time()))
+        r = self.db.execute("select path,md5,size,mtime,parts from files where path=?", (p,)).fetchone()
+        if r:
+            return Entry(r[0], False, r[3], r[1], r[2], json.loads(r[4] or "{}"))
+        r = self.db.execute("select path,mtime from dirs where path=?", (p,)).fetchone()
+        if r:
+            return Entry(r[0], True, r[1])
+        return None
 
     def children(self, path):
         p = norm(path)
         prefix = p.rstrip("/") + "/"
+        names = [x[0] for x in self.db.execute("select path from dirs")] + \
+                [x[0] for x in self.db.execute("select path from files")]
         out = []
-        for k, e in self.entries.items():
+        for k in names:
             if k == p or not k.startswith(prefix):
                 continue
             if "/" not in k[len(prefix):]:
-                out.append(e)
+                e = self.get(k)
+                if e:
+                    out.append(e)
         out.sort(key=lambda x: (not x.is_dir, x.name.lower()))
         return out
 
+    def all_entries(self):
+        out = {"/": Entry("/", True, int(time.time()))}
+        for p, m in self.db.execute("select path,mtime from dirs"):
+            out[p] = Entry(p, True, m)
+        for p, md5, size, mtime, parts in self.db.execute(
+                "select path,md5,size,mtime,parts from files"):
+            out[p] = Entry(p, False, mtime, md5, size, json.loads(parts or "{}"))
+        return out
+
+    def set_file(self, path, md5, size, mtime, parts):
+        self.db.execute(
+            "insert or replace into files(path,md5,size,mtime,parts) values(?,?,?,?,?)",
+            (norm(path), md5, size, mtime, json.dumps(parts)))
+        self.db.commit()
+
+    def set_dir(self, path, mtime):
+        self.db.execute("insert or replace into dirs(path,mtime) values(?,?)", (norm(path), mtime))
+        self.db.commit()
+
+    def remove(self, path):
+        p = norm(path)
+        self.db.execute("delete from files where path=?", (p,))
+        self.db.execute("delete from dirs where path=?", (p,))
+        self.db.commit()
+
+    def find_by_md5(self, md5):
+        return [(r[0], r[1], json.loads(r[2] or "{}")) for r in self.db.execute(
+            "select path,size,parts from files where md5=?", (md5,))]
+
+    def paths_under(self, prefix):
+        prefix = norm(prefix)
+        pre = prefix.rstrip("/") + "/"
+        out = [x[0] for x in self.db.execute("select path from dirs where path=? or path like ?", (prefix, pre + "%"))]
+        out += [x[0] for x in self.db.execute("select path from files where path=? or path like ?", (prefix, pre + "%"))]
+        return out
+
+    def dump(self, dst):
+        self.db.commit()
+        with open(self.path, "rb") as src, lzma.open(dst, "wb", preset=9) as out:
+            shutil.copyfileobj(src, out)
+
+    def restore(self, src):
+        self.db.close()
+        with lzma.open(src, "rb") as f, open(self.path, "wb") as out:
+            shutil.copyfileobj(f, out)
+        self._open()
+
+    def close(self):
+        try:
+            self.db.close()
+        except Exception:
+            pass
+
+
+BACKENDS = {"sqlite": SqliteBackend}
+
+
+def make_backend(name: str | None = None, **kw) -> Backend:
+    name = (name or BACKEND).lower()
+    if name not in BACKENDS:
+        raise SystemExit(f"未知索引后端: {name}（可选 {list(BACKENDS)}）")
+    return BACKENDS[name](**kw)
+
+
+# ---------- 业务层 ----------
+class Store:
+    def __init__(self, client: TelegramClient, chat, backend: Backend | None = None):
+        self.client = client
+        self.chat = chat
+        self.backend = backend or make_backend()
+        self.lock = asyncio.Lock()
+        self.dirty = False
+        self.last_id = 0
+        self.snap_msg_id = 0
+
+    @property
+    def entries(self):
+        return self.backend.all_entries()
+
+    def get(self, path):
+        return self.backend.get(path)
+
+    def children(self, path):
+        return self.backend.children(path)
+
     # ---------- 写入 ----------
+    async def _ensure_parents(self, p: str):
+        par = parent_of(p)
+        chain = []
+        while par and par != "/":
+            chain.append(par)
+            par = parent_of(par)
+        for d in reversed(chain):
+            if not self.backend.get(d):
+                self.backend.set_dir(d, int(time.time()))
+
+    async def mkdir(self, path: str, _force=False):
+        p = norm(path)
+        async with self.lock:
+            cur = self.backend.get(p)
+            if cur and not _force:
+                return cur
+            await self._ensure_parents(p)
+            self.backend.set_dir(p, int(time.time()))
+            self.dirty = True
+            return self.backend.get(p)
+
     async def put_file(self, path: str, local_path: str, mtime: int | None = None,
                        slice_size: int | None = None, append: bool = False,
                        start_index: int | None = None):
-        """上传文件。slice_size 指定分片大小；append 时作为新分片并入已有文件。"""
         p = norm(path)
         size = os.path.getsize(local_path)
         S = slice_size or SLICE
+        digest = None if append else md5_of(local_path)
+        mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
         async with self.lock:
-            old = self.entries.get(p)
-            if old and not append:
-                await self._del_ids(old.slices)
+            old = self.backend.get(p)
+            if old and not old.is_dir and not append:
+                await self._drop(p)
                 old = None
             await self._ensure_parents(p)
-            mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
-            # 文件名用文件 mtime，且冒号用全角，避免落到 Windows 等半角文件系统时炸掉
-            now = time.strftime("%Y-%m-%d %H：%M：%S", time.localtime(mt))
-            e = old if (old and not old.is_dir) else Entry(p, False, int(time.time()))
+
+            # 秒传：同 md5 已有分片，直接共享，只加一条路径记录
+            if digest and not append:
+                for opath, osize, oparts in self.backend.find_by_md5(digest):
+                    if oparts:
+                        self.backend.set_file(p, digest, osize, mt, oparts)
+                        self.dirty = True
+                        log.info("秒传命中 %s (md5 %s) ← %s", p, digest[:8], opath)
+                        return self.backend.get(p)
+
+            parts = {}
+            if append and old and not old.is_dir:
+                parts = dict(old.parts)
+                if not digest:
+                    digest = old.md5
             base_idx = start_index if start_index is not None else (
-                (max(e.parts) + 1) if e.parts else 0)
+                (max(parts) + 1) if parts else 0)
+            tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()
 
             async def send(src, idx_no):
-                attrs = [DocumentAttributeFilename(f"{now}.{idx_no}")]
+                attrs = [DocumentAttributeFilename(f"{tag}.{idx_no}")]
+                cap = json.dumps({"i": idx_no})
                 try:
                     ref = await upload_parallel(self.client, src)
-                except Exception as ex:            # 并发失败就退回 telethon 顺序上传
+                except Exception as ex:
                     log.warning("并行上传失败，退回顺序: %s", ex)
-                    msg = await self.client.send_file(self.chat, src, caption=p,
+                    msg = await self.client.send_file(self.chat, src, caption=cap,
                                                       force_document=True, attributes=attrs)
                 else:
-                    msg = await self.client.send_file(self.chat, ref, caption=p,
+                    msg = await self.client.send_file(self.chat, ref, caption=cap,
                                                       force_document=True, attributes=attrs)
-                sz = int(msg.document.size or 0) if msg.document else 0
-                e.parts[idx_no] = (msg.id, sz)
-                if msg.id > self.last_id:
-                    self.last_id = msg.id
+                parts[idx_no] = msg.id
+                self.last_id = max(self.last_id, msg.id)
                 return msg
 
             if size <= S and not append:
@@ -311,126 +449,175 @@ class Store:
                         pos += length
                         n += 1
                         log.info("分片 %d 完成 (%d 字节)", base_idx + n - 1, length)
-            e.mtime = mt
-            self.entries[p] = e
-            return e
 
-    async def _ensure_parents(self, p: str):
-        par = parent_of(p)
-        chain = []
-        while par and par != "/" and par not in self.entries:
-            chain.append(par)
-            par = parent_of(par)
-        for d in reversed(chain):
-            await self.mkdir(d, _force=True)
+            self.backend.set_file(p, digest or tag,
+                                  size if not append else (old.size if old else size), mt, parts)
+            self.dirty = True
+            return self.backend.get(p)
 
-    async def mkdir(self, path: str, _force=False):
+    async def _drop(self, path: str, hard=True):
+        """删记录；hard 时若该 md5 没有别的路径引用，连 TG 消息一起删。"""
         p = norm(path)
-        if p == "/":
-            return self.entries["/"]
-        e = self.entries.get(p)
-        if e and e.is_dir:
-            return e
-        if e and not e.is_dir and not _force:
-            raise FileExistsError(p)
-        if not _force:
-            await self._ensure_parents(p)
-        msg = await self.client.send_message(self.chat, p.rstrip("/") + "/")
-        mt = int(msg.date.timestamp()) if msg.date else int(time.time())
-        self.entries[p] = Entry(p, True, mt, msg.id)
-        if msg.id > self.last_id:
-            self.last_id = msg.id
-        return self.entries[p]
-
-    async def _del_ids(self, ids):
-        ids = [i for i in ids if i]
-        for i in range(0, len(ids), 100):
-            try:
-                await self.client.delete_messages(self.chat, ids[i:i + 100])
-            except Exception as e:
-                log.warning("删除消息失败: %s", e)
+        e = self.backend.get(p)
+        self.backend.remove(p)
+        self.dirty = True
+        if not (hard and e and not e.is_dir and e.parts):
+            return
+        left = [x for x in self.backend.find_by_md5(e.md5) if x[2]]
+        if left:
+            return
+        await self._del_ids(list(e.parts.values()))
+        log.info("删除 %s 的 %d 个分片消息", p, len(e.parts))
 
     async def delete(self, path: str, recursive=True):
         p = norm(path)
-        e = self.entries.get(p)
+        e = self.backend.get(p)
         if not e:
             raise FileNotFoundError(p)
         if e.is_dir:
             if self.children(p) and not recursive:
                 raise OSError("目录非空")
-            targets = [x for x in self.entries.values()
-                       if x.path == p or x.path.startswith(p.rstrip("/") + "/")]
+            kids = [x for x in self.backend.paths_under(p) if x != p]
+            for k in sorted(kids, key=len, reverse=True):
+                await self._drop(k)
+            await self._drop(p)
         else:
-            targets = [e]
-        ids = []
-        for t in targets:
-            ids.extend(t.slices)
-        await self._del_ids(ids)
-        for t in targets:
-            self.entries.pop(t.path, None)
+            await self._drop(p)
 
     async def move(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
-        e = self.entries.get(s)
-        if not e:
+        if not self.backend.get(s):
             raise FileNotFoundError(s)
-        if d in self.entries:
-            raise FileExistsError(d)
-        await self._ensure_parents(d)
-        if e.is_dir:
-            moving = sorted([x for x in self.entries.values()
-                             if x.path == s or x.path.startswith(s.rstrip("/") + "/")],
-                            key=lambda x: len(x.path))
-            for x in moving:
-                await self._rewrite_path(x, d + x.path[len(s):])
-        else:
-            await self._rewrite_path(e, d)
-
-    async def _rewrite_path(self, e: Entry, newp: str):
-        cap = (newp.rstrip("/") + "/") if e.is_dir else newp
-        for mid in e.slices:
-            await self.client.edit_message(self.chat, mid, cap)
-        self.entries.pop(e.path, None)
-        e.path = newp
-        self.entries[newp] = e
+        async with self.lock:
+            rows = [self.backend.get(x) for x in self.backend.paths_under(s)]
+            rows = [x for x in rows if x]
+            for x in rows:
+                newp = d + x.path[len(s):]
+                if x.is_dir:
+                    self.backend.set_dir(newp, x.mtime)
+                else:
+                    self.backend.set_file(newp, x.md5, x.size, x.mtime, x.parts)
+            for x in rows:
+                self.backend.remove(x.path)
+            self.dirty = True
 
     async def copy(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
-        e = self.entries.get(s)
-        if not e:
+        if not self.backend.get(s):
             raise FileNotFoundError(s)
-        if e.is_dir:
-            await self.mkdir(d)
-            for c in self.children(s):
-                await self.copy(c.path, d.rstrip("/") + "/" + c.name)
-        else:
-            tmp = await self.download_to_temp(s)
-            try:
-                await self.put_file(d, tmp, e.mtime)
-            finally:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+        async with self.lock:
+            rows = [self.backend.get(x) for x in self.backend.paths_under(s)]
+            for x in rows:
+                if not x:
+                    continue
+                newp = d + x.path[len(s):]
+                if x.is_dir:
+                    self.backend.set_dir(newp, x.mtime)
+                else:
+                    self.backend.set_file(newp, x.md5, x.size, x.mtime, x.parts)
+            self.dirty = True
 
-    # ---------- 读取 ----------
+    # ---------- 读取内容 ----------
     async def iter_content(self, path: str):
-        e = self.entries.get(norm(path))
+        e = self.backend.get(path)
         if not e or e.is_dir:
             raise FileNotFoundError(path)
-        msgs = await self.client.get_messages(self.chat, ids=e.ordered_slices())
-        if not isinstance(msgs, list):
-            msgs = [msgs]
-        for msg in msgs:
-            if msg is None:
+        for k in sorted(e.parts):
+            m = await self.client.get_messages(self.chat, ids=e.parts[k])
+            if not m or not getattr(m, "document", None):
                 continue
-            async for c in self.client.iter_download(msg):
-                yield c
+            async for piece in self.client.iter_download(m):
+                yield piece
 
     async def download_to_temp(self, path: str) -> str:
-        import tempfile
-        fd, tmp = tempfile.mkstemp(prefix="tgnd_")
-        with open(fd, "wb") as f:
-            async for c in self.iter_content(path):
-                f.write(c)
+        fd, tmp = tempfile.mkstemp(prefix="tgnd_dl_")
+        with os.fdopen(fd, "wb") as f:
+            async for piece in self.iter_content(path):
+                f.write(piece)
         return tmp
+
+    async def _del_ids(self, ids):
+        ids = [i for i in ids if i]
+        for k in range(0, len(ids), 100):
+            try:
+                await self.client.delete_messages(self.chat, ids[k:k + 100])
+            except Exception as e:
+                log.warning("删除消息失败: %s", e)
+
+    # ---------- 同步 / 快照 ----------
+    async def sync(self, full: bool = True):
+        """扫描 TG 消息，补全 md5 → 分片映射，并记录最新快照消息。"""
+        parts_by_md5 = {}
+        snaps = []
+        n = 0
+        async for m in self.client.iter_messages(self.chat, reverse=True):
+            n += 1
+            cap = (m.message or "").strip().replace(" ", "")
+            if cap == DB_CAP:
+                snaps.append(m)
+                continue
+            nm = parse_name(m)
+            if not nm:
+                continue
+            md5, idx = nm
+            parts_by_md5.setdefault(md5, {})[idx] = m.id
+            if m.id > self.last_id:
+                self.last_id = m.id
+        for md5, parts in parts_by_md5.items():
+            for opath, osize, oparts in self.backend.find_by_md5(md5):
+                if oparts != parts:
+                    self.backend.set_file(opath, md5, osize, int(time.time()), parts)
+        if snaps:
+            self.snap_msg_id = max(s.id for s in snaps)
+        log.info("扫描 %d 条消息，%d 个 md5，快照 %d 条", n, len(parts_by_md5), len(snaps))
+        return n
+
+    async def snapshot(self):
+        """把索引压成快照传到 TG，置顶并删掉旧的。"""
+        fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
+        os.close(fd)
+        try:
+            self.backend.dump(tmp)
+            msg = await self.client.send_file(
+                self.chat, tmp, caption=DB_CAP, force_document=True,
+                attributes=[DocumentAttributeFilename(DB_NAME)])
+            old = self.snap_msg_id
+            self.snap_msg_id = msg.id
+            if old and old != msg.id:
+                await self._del_ids([old])
+            try:
+                await self.client.pin_message(self.chat, msg, notify=False)
+            except Exception as e:
+                log.warning("置顶失败: %s", e)
+            self.dirty = False
+            log.info("索引快照已上传 (msg %d, %d 字节)", msg.id, os.path.getsize(tmp))
+            return msg
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    async def load(self):
+        """启动时从 TG 拉最新快照覆盖本地索引。"""
+        best = None
+        async for m in self.client.iter_messages(self.chat, limit=300):
+            if (m.message or "").strip().replace(" ", "") == DB_CAP:
+                best = m
+                break
+        if not best:
+            log.info("TG 上没有索引快照，使用本地库")
+            return False
+        fd, tmp = tempfile.mkstemp(prefix="tgnd_db_dl_", suffix=".xz")
+        os.close(fd)
+        try:
+            await self.client.download_media(best, file=tmp)
+            self.backend.restore(tmp)
+            self.snap_msg_id = best.id
+            log.info("已从 TG 载入索引快照 (msg %d)", best.id)
+            return True
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
