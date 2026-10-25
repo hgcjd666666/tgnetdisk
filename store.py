@@ -1050,7 +1050,7 @@ class Store:
                 if self._cap(m2) == mine:
                     self.snap_msg_id = m.id
                     self._holding = True
-                    log.info("锁 msg %d 空闲 → 占用  ← %s", m.id, self._who())
+                    log.info("锁 msg %d 空闲 → 占用", m.id)
                     return
             if nonblock:
                 raise LockBusy("索引写锁被另一个节点持有")
@@ -1069,7 +1069,6 @@ class Store:
             return
         try:
             await self.client.edit_message(self.chat, self.snap_msg_id, text=LOCK_IDLE)
-            log.info("锁 msg %d 已释放  ← %s", self.snap_msg_id, self._who())
         except Exception as e:
             log.warning("释放锁失败: %s", e)
         self._holding = False
