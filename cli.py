@@ -469,20 +469,20 @@ async def cmd_logs(st, args):
             except OSError:
                 await asyncio.sleep(0.5)
                 continue
-        if last:
-            try:
-                i = lines.index(last, max(0, len(lines) - 200)) + 1
-            except (ValueError, IndexError):
-                i = max(0, len(lines) - 20)      # 绕回去了，重打最后一小段
-        else:
-            i = 0
+            if last:
+                try:
+                    i = lines.index(last, max(0, len(lines) - 200)) + 1
+                except (ValueError, IndexError):
+                    i = max(0, len(lines) - 20)      # 绕回去了，重打最后一小段
+            else:
+                i = max(0, len(lines) - 20)          # 首次只看尾部，不倒历史
             for line in lines[i:]:
-                sys.stdout.write(line + "\n")
+                sys.stdout.write(line + chr(10))
             sys.stdout.flush()
             if lines:
                 last = lines[-1]
             await asyncio.sleep(0.4)
-    except KeyboardInterrupt:             # Ctrl-C 安静退出
+    except KeyboardInterrupt:                        # Ctrl-C 安静退出
         return
 
 
