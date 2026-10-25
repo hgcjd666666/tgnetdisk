@@ -30,8 +30,8 @@ from telethon.tl.types import DocumentAttributeFilename, InputFileBig
 log = logging.getLogger("store")
 
 SLICE = int(os.environ.get("SLICE_MB", "2047")) * 1024 * 1024
-PART = 512 * 1024
-WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))
+PART = int(os.environ.get("UPLOAD_PART_KB", "512")) * 1024   # 单个分块的字节数
+WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))       # 同时在传的分块数
 # 上传缓存目录：默认放脚本旁边的 cache/，不放 /tmp（服务器 /tmp 是 tmpfs，大文件会把内存吃穿）
 CACHE_DIR = os.environ.get("TGND_CACHE") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "cache")
