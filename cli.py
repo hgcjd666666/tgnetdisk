@@ -16,6 +16,7 @@
   tgnd export-sql [文件.sql]     导出索引为 SQL 文本
   tgnd import-sql <文件.sql>     从 SQL 文本重建索引
   tgnd reindex              全量扫聊天记录重建索引（正常不需要）
+  tgnd logs [文件]          实时跟随环形日志（默认用 TGND_LOG，不连 TG）
 
 环境变量（默认读 /opt/tgnd/env）:
   TG_API_ID, TG_API_HASH, TG_SESSION, TG_CHAT
@@ -452,6 +453,36 @@ async def cmd_import_sql(st, args):
     log(f"已导入：{n} 个文件、{d} 个目录")
 
 
+async def cmd_logs(st, args):
+    """实时跟随环形日志（不加锁、不连 TG）。"""
+    from logger import read_log
+    path = args[0] if args else os.environ.get("TGND_LOG", "")
+    if not path:
+        sys.exit("未设置 TGND_LOG，或直接给文件路径: tgnd logs <文件>")
+    if not os.path.exists(path):
+        sys.exit(f"文件不存在: {path}")
+    last = ""
+    while True:
+        try:
+            lines = read_log(path).splitlines()
+        except OSError:
+            await asyncio.sleep(0.5)
+            continue
+        if last:
+            try:
+                i = lines.index(last, max(0, len(lines) - 200)) + 1
+            except (ValueError, IndexError):
+                i = max(0, len(lines) - 20)      # 绕回去了，重打最后一小段
+        else:
+            i = 0
+        for line in lines[i:]:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        if lines:
+            last = lines[-1]
+        await asyncio.sleep(0.4)
+
+
 async def main():
     argv = sys.argv[1:]
     load_env()
@@ -462,6 +493,9 @@ async def main():
         log(USAGE)
         return
     cmd, args = argv[0], argv[1:]
+    if cmd in ("logs", "tail"):
+        await cmd_logs(None, args)          # 不需要 TG
+        return
     client, st, tmp = await get_store()
     try:
         if cmd in ("ls", "ll"):
