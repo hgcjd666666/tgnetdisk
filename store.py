@@ -509,7 +509,8 @@ class Store:
         self.backend = backend or make_backend()
         self.mutex = asyncio.Lock()
         self.lock = _WriteGuard(self)
-        self.dirty = False
+        self._dirty = False                # 用 setter 会写 meta，启动时别覆盖上次的标记
+        self._snap_digest = ""             # 上次推上去的快照内容摘要，相同就跳过
         self.last_id = 0
         self.snap_msg_id = 0
         self.snap_doc_id = 0
@@ -922,6 +923,12 @@ class Store:
         try:
             self.backend.dump(tmp)                 # 本地压缩，锁外做
             size = os.path.getsize(tmp)
+            with open(tmp, "rb") as fp:
+                digest = hashlib.md5(fp.read()).hexdigest()
+            if digest == self._snap_digest:
+                self.dirty = False                  # 内容没变，一次网络都不发
+                return self.snap_msg_id
+            self._snap_digest = digest
             if is_online():
                 await self.acquire()
             try:
@@ -1006,6 +1013,19 @@ class Store:
         except Exception as e:
             log.warning("读取置顶消息失败: %s", e)
             return []
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    @dirty.setter
+    def dirty(self, v: bool):
+        """dirty 落进 meta：进程重启后还能知道「上次有没有没推上去的改动」。"""
+        self._dirty = bool(v)
+        try:
+            self.backend.set_meta("dirty", "1" if v else "0")
+        except Exception:
+            pass
 
     @staticmethod
     def _who() -> str:
@@ -1230,7 +1250,17 @@ class Store:
         return True
 
     async def load(self, pid: int | None = None):
-        """从 TG 拉最新快照覆盖本地索引。"""
+        """从 TG 拉最新快照覆盖本地索引。
+
+        但如果本地库里记着「上次有改动没推上去」，先把自己推上去，否则会被旧快照覆盖。
+        """
+        if self.backend.get_meta("dirty") == "1" and not pid:
+            log.info("本地有未落库的改动，先推快照")
+            try:
+                await self.snapshot_locked()
+            except Exception as e:
+                log.warning("推本地快照失败，继续按远端加载: %s", e)
+            return False
         if pid:
             best = await self.client.get_messages(self.chat, ids=pid)
             if not best or not is_db_msg(best):
