@@ -2,7 +2,9 @@
 
     TGND_LOG=路径         日志落这个文件（定长环形，写满回头覆盖旧的）
     TGND_LOG_MAX=字节数    正文区大小，默认 1 MiB
-    TGND_PROGRESS=路径    进度行覆盖写入（只保留最新一行）
+
+不落盘的东西：进度。tty 上原地覆盖；重定向到文件时按 3 秒节流写进环形日志，
+不会无限增长（那个文件本身也封顶）。
 
 日志文件格式（第一行是 64 字节信息区，过滤掉第一行剩下的就是日志）：
     [0:16]   信息区：b"TGNDLOG" + 正文大小(4B BE) + 写入指针(4B BE) + 1B 保留
@@ -14,14 +16,15 @@
 """
 import os
 import sys
+import time
 
 MAGIC = b"TGNDLOG"
 INFO_LEN = 16                      # 信息区固定 16 字节（8 magic + 4 size + 4 pos）
 HDR_LEN = INFO_LEN + 1             # 信息区 + 一个 \n 行分隔
 
 _LOG = os.environ.get("TGND_LOG", "")
-_PROG = os.environ.get("TGND_PROGRESS", "")
 _tty = sys.stdout.isatty()
+_prog_ts = 0.0
 
 
 class RingLog:
@@ -82,11 +85,10 @@ _ring_tried = False
 _MAX = int(os.environ.get("TGND_LOG_MAX") or (1 << 20))
 
 
-def configure(log_file: str = "", log_max: int = 0, progress_file: str = ""):
-    """进程入口统一调一次：决定日志落哪、多大、进度写哪。"""
-    global _LOG, _PROG, _MAX, _ring, _ring_tried
+def configure(log_file: str = "", log_max: int = 0):
+    """进程入口统一调一次：决定日志落哪、多大。"""
+    global _LOG, _MAX, _ring, _ring_tried
     _LOG = log_file or _LOG
-    _PROG = progress_file or _PROG
     if log_max:
         _MAX = int(log_max)
     _ring = None
@@ -117,16 +119,16 @@ def log(msg="", flush=True):
 
 
 def progress(msg):
-    """进度：tty 原地覆盖；同时覆盖写 TGND_PROGRESS（永远只有一行）。"""
+    """进度：tty 原地覆盖；非 tty（nohup/重定向）3 秒节流写进环形日志。"""
+    global _prog_ts
     if _tty:
         sys.stdout.write("\r\033[K" + msg)
         sys.stdout.flush()
-    if _PROG:
-        try:
-            with open(_PROG, "w", encoding="utf-8") as fp:
-                fp.write(msg + "\n")
-        except OSError:
-            pass
+        return
+    now = time.time()
+    if now - _prog_ts >= 3:
+        _prog_ts = now
+        log(msg)
 
 
 def done():

@@ -457,7 +457,7 @@ async def main():
     load_env()
     configure(log_file=os.environ.get("TGND_LOG", ""),
               log_max=int(os.environ.get("TGND_LOG_MAX") or 0),
-              progress_file=os.environ.get("TGND_PROGRESS", ""))
+)
     if not argv or argv[0] in ("-h", "--help", "help"):
         log(USAGE)
         return
