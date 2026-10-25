@@ -456,11 +456,17 @@ async def cmd_import_sql(st, args):
 async def cmd_logs(st, args):
     """实时跟随环形日志（不加锁、不连 TG）。"""
     from logger import read_log
-    path = args[0] if args else os.environ.get("TGND_LOG", "")
+    path = args[0] if args and not args[0].startswith("-") else os.environ.get("TGND_LOG", "")
     if not path:
         sys.exit("未设置 TGND_LOG，或直接给文件路径: tgnd logs <文件>")
     if not os.path.exists(path):
         sys.exit(f"文件不存在: {path}")
+    if args and args[0] in ("--clear", "-c"):     # tgnd logs --clear
+        from logger import RingLog
+        ring = RingLog(path, int(os.environ.get("TGND_LOG_MAX") or (1 << 20)))
+        ring.reset()
+        log(f"已清空环形缓冲 {path}")
+        return
     last = ""
     try:
         while True:

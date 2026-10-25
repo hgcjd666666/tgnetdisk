@@ -64,6 +64,16 @@ class RingLog:
         self.fp.write(b"\0" * self.body)
         self.fp.flush()
 
+    def reset(self, keep_pos: bool = True):
+        """清空环形缓冲：正文全填 0，指针默认保持原位（别的进程还在写，挪了会错位）。"""
+        pos = self.pos if keep_pos else 0
+        self.fp.seek(0)
+        self.fp.write(self._hdr(pos))
+        self.fp.write(b"\0" * self.body)
+        self.fp.flush()
+        if not keep_pos:
+            self.pos = 0
+
     def write(self, line: str):
         data = (line.rstrip("\n") + "\n").encode("utf-8", "replace")
         if len(data) > self.body:
