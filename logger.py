@@ -163,6 +163,13 @@ def progress(msg):
         log(msg, ring_only=True)
 
 
+def endline():
+    """进度收尾换行（避免后面的日志接在进度行尾巴上）。"""
+    if _tty:
+        sys.stdout.write(chr(10))
+        sys.stdout.flush()
+
+
 def read_log(path: str) -> str:
     """按时间顺序读出环形日志（第一行文件头会被跳过）。"""
     with open(path, "rb") as fp:
