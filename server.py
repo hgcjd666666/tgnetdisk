@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import logging
+import hashlib
 import os
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from urllib.parse import quote, unquote, urlsplit
 from aiohttp import web
 from telethon import TelegramClient
 
-from store import LockBusy, make_session, is_path_session, Store, norm, parent_of, base_of
+from store import cache_file, LockBusy, make_session, is_path_session, Store, norm, parent_of, base_of
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dav")
@@ -183,7 +184,9 @@ async def dav_put(request, store):
     e = store.get(path)
     if e and e.is_dir:
         return web.Response(status=409, text="is a collection")
-    fd, tmp = tempfile.mkstemp(prefix="tgnd_up_", dir="/tmp")
+    # 落到磁盘上的缓存目录，而不是 /tmp（tmpfs，等于内存）
+    tmp = cache_file(hashlib.sha256(path.encode()).hexdigest()[:16] + ".part")
+    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
     try:
         with os.fdopen(fd, "wb") as f:
             async for chunk in request.content.iter_chunked(1 << 20):

@@ -31,6 +31,16 @@ log = logging.getLogger("store")
 SLICE = int(os.environ.get("SLICE_MB", "2047")) * 1024 * 1024
 PART = 512 * 1024
 WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))
+# 上传缓存目录：默认放脚本旁边的 cache/，不放 /tmp（服务器 /tmp 是 tmpfs，大文件会把内存吃穿）
+CACHE_DIR = os.environ.get("TGND_CACHE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cache")
+
+
+def cache_file(name: str) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, name)
+
+
 DB_PATH = os.environ.get("TGND_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tgnd.db"))
 BACKEND = os.environ.get("TGND_BACKEND", "sqlite")
 DB_NAME = "tgnd.db.xz"
