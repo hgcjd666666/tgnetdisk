@@ -152,10 +152,11 @@ def read_log(path: str) -> str:
     except Exception:
         return raw[HDR_LEN:].decode("utf-8", "replace")
     seq = body[p:] + body[:p]
-    cut = seq.find(b"\n")                 # 指针可能落在旧行中间，丢掉半截的首行
-    if cut >= 0:
-        seq = seq[cut + 1:]
-    return seq.decode("utf-8", "replace").lstrip("\0")
+    if p and body[p - 1:p] != b"\n":       # 指针落在行中间才丢那半截行
+        cut = seq.find(b"\n")
+        if cut >= 0:
+            seq = seq[cut + 1:]
+    return seq.decode("utf-8", "replace").lstrip("\0").rstrip("\0")
 
 
 if __name__ == "__main__":
