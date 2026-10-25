@@ -19,6 +19,7 @@ import random
 import shutil
 import sqlite3
 import tempfile
+import traceback
 import time
 
 from telethon import TelegramClient
@@ -995,6 +996,15 @@ class Store:
             log.warning("读取置顶消息失败: %s", e)
             return []
 
+    @staticmethod
+    def _who() -> str:
+        """抢锁/放锁的调用来源，方便定位到底是谁在频繁动锁。"""
+        frames = traceback.extract_stack()[:-2]
+        for fr in reversed(frames):
+            if not fr.filename.endswith("store.py"):
+                return f"{os.path.basename(fr.filename)}:{fr.lineno} {fr.name}"
+        return "store"
+
     def _lock_text(self) -> str:
         """锁状态写在快照消息的 caption 里：空闲 lock:null，锁定 lock:<hash>。单机模式留空。"""
         if not is_online():
@@ -1040,7 +1050,7 @@ class Store:
                 if self._cap(m2) == mine:
                     self.snap_msg_id = m.id
                     self._holding = True
-                    log.info("锁 msg %d 空闲 → 占用", m.id)
+                    log.info("锁 msg %d 空闲 → 占用  ← %s", m.id, self._who())
                     return
             if nonblock:
                 raise LockBusy("索引写锁被另一个节点持有")
@@ -1059,6 +1069,7 @@ class Store:
             return
         try:
             await self.client.edit_message(self.chat, self.snap_msg_id, text=LOCK_IDLE)
+            log.info("锁 msg %d 已释放  ← %s", self.snap_msg_id, self._who())
         except Exception as e:
             log.warning("释放锁失败: %s", e)
         self._holding = False
