@@ -464,31 +464,40 @@ def make_backend(name: str | None = None, **kw) -> Backend:
 
 # ---------- 业务层 ----------
 class _WriteGuard:
-    """把 `async with self.lock:` 升级成「抢分布式锁 + 互斥 + 收尾上传快照」。"""
+    """`async with self.lock:` 的入口：抢分布式锁 + 本地互斥 + 租约续期。
 
-    def __init__(self, store):
+    WebDAV 连着写几个文件时，只抢一次锁；空闲满 lease 秒后由 _lease_watch
+    统一落库并放锁。这样不会每写一次就 edit 两次 TG。
+    """
+
+    def __init__(self, store, lease: float = 3.0):
         self.s = store
+        self.lease = lease
 
     async def __aenter__(self):
-        if not self.s.fast:
-            await self.s.acquire()
-        await self.s.mutex.acquire()
-        return self
+        s = self.s
+        await s.mutex.acquire()
+        try:
+            if not s.fast and is_online():
+                await s.ensure_fresh()
+                if not s._holding:
+                    await s.acquire()
+                if self.lease > 0:
+                    s._lease = self.lease
+                    s._touch()
+                    if s._lease_task is None or s._lease_task.done():
+                        s._lease_task = asyncio.create_task(s._lease_watch())
+            s._in_guard = True
+            return self
+        except Exception:
+            s.mutex.release()
+            raise
 
     async def __aexit__(self, *exc):
-        try:
-            if not self.s.fast and self.s.dirty:
-                try:
-                    await self.s.snapshot()
-                except Exception as e:
-                    log.warning("快照上传失败: %s", e)
-        finally:
-            self.s.mutex.release()
-            if not self.s.fast:
-                try:
-                    await self.s.release()
-                except Exception as e:
-                    log.warning("释放锁失败: %s", e)
+        s = self.s
+        s._in_guard = False
+        s._touch()                    # 续租约：真正落库留给 _lease_watch
+        s.mutex.release()
 
 
 class Store:

@@ -377,6 +377,10 @@ async def ensure_chat(client, cfg_path="/opt/tgnd/chat.json", title="tgnd") -> i
 
 
 async def main():
+    # WEBDAV=0：只跑 CLI，不起 HTTP 服务（连同 Telegram 连接都不必建立）
+    if os.environ.get("WEBDAV", "1").strip().lower() in ("0", "false", "no", "off"):
+        log.info("WEBDAV=0，跳过 WebDAV 启动（只用命令行）")
+        return
     if not (API_ID and API_HASH):
         sys.exit("缺 TG_API_ID / TG_API_HASH")
     sess = make_session(SESSION)
