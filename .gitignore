@@ -2,6 +2,7 @@
 !store.py
 !server.py
 !cli.py
+!logger.py
 !tests.py
 !hashdir.py
 !.gitignore
