@@ -329,6 +329,12 @@ class SqliteBackend(Backend):
             self.db.execute("ALTER TABLE files ADD COLUMN status INTEGER DEFAULT 0")
         if "expect" not in cols:
             self.db.execute("ALTER TABLE files ADD COLUMN expect INTEGER DEFAULT 0")
+        if "name" in cols and "hash" in cols:
+            # 老库还留着已废弃的 name 列，启动时顺手扔掉（SQLite 3.35+）
+            try:
+                self.db.execute("ALTER TABLE files DROP COLUMN name")
+            except Exception:
+                pass
         if "md5" in cols and "hash" not in cols:
             self.db.execute("ALTER TABLE files RENAME COLUMN md5 TO hash")
         # 索引放在迁移之后建：旧库先改列名，否则 CREATE INDEX 会报 no such column
