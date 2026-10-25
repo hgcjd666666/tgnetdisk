@@ -13,6 +13,8 @@ import hashlib
 import io
 import json
 import logging
+
+from logger import progress
 import lzma
 import os
 import random
@@ -216,7 +218,7 @@ async def upload_parallel(client, src, workers=None, part=PART):
             await client(SaveBigFilePartRequest(fid, i, n, data))
         done += 1
         if done % step == 0 or done == n:
-            log.info("  %d/%d part (%.1f%%, %.0f MB)", done, n, 100.0 * done / n, size / 1048576)
+            progress(f"{done}/{n} part ({100.0 * done / n:.1f}%, {size / 1048576:.0f} MB)")
 
     try:
         await asyncio.gather(*[one(i) for i in range(n)])
