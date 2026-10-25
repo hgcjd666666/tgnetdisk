@@ -101,8 +101,8 @@ class LoggingBridge(logging.Handler):
             if record.exc_info:
                 msg = f"{msg} {self.formatException(record.exc_info).splitlines()[-1]}"
             prefix = {"WARNING": "警告 ", "ERROR": "错误 ", "CRITICAL": "严重 "}.get(record.levelname, "")
-            # 环形收全部；精简日志文件只收 WARNING 及以上
-            _emit(prefix + msg, ring_only=record.levelno < logging.WARNING)
+            # 统一走 log()：终端 + 环形全收；追加文件只收 WARNING 及以上
+            log(prefix + msg, ring_only=record.levelno < logging.WARNING)
         except Exception:
             pass
 
@@ -210,9 +210,10 @@ def read_log(path: str) -> str:
     except Exception:
         return raw[HDR_LEN:].decode("utf-8", "replace")
     seq = body[p:] + body[:p]
-    cut = seq.find(b"\n")                 # 绕回去时开头几乎是半截行，按行边界对齐（多丢一行旧的，无所谓）
-    if cut >= 0:
-        seq = seq[cut + 1:]
+    if body[p:].strip(b"\0"):          # 指针后面还有旧数据 = 已经绕圈了，开头必是半行
+        cut = seq.find(b"\n")
+        if cut >= 0:
+            seq = seq[cut + 1:]
     return seq.decode("utf-8", "replace").lstrip("\0").rstrip("\0")
 
 
