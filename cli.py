@@ -28,6 +28,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+from logger import log, progress, done
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -126,14 +127,14 @@ def cmd_ls(st, args, long=False):
     if e is None:
         sys.exit(f"不存在: {path}")
     if not e.is_dir:
-        print(f"{e.name}\t{human(e.size)}")
+        log(f"{e.name}\t{human(e.size)}")
         return
     for c in st.children(path):
         if long:
             name = c.name + ("/" if c.is_dir else "")
-            print(f"{human(c.size) if not c.is_dir else '-':>8}\t{name}")
+            log(f"{human(c.size) if not c.is_dir else '-':>8}\t{name}")
         else:
-            print(c.name + ("/" if c.is_dir else ""))
+            log(c.name + ("/" if c.is_dir else ""))
 
 
 def parse_size(v: str) -> int:
@@ -199,7 +200,7 @@ async def cmd_put(st, args):
         sys.exit("没有可上传的文件")
     total = len(jobs)
     if total > 1 or rest[:-1] != [jobs[0][0]]:
-        print(f"共 {total} 个文件待处理")
+        log(f"共 {total} 个文件待处理")
 
     ok = skipped = failed = 0
     for idx, (f, dst) in enumerate(jobs, 1):
@@ -226,28 +227,28 @@ async def cmd_put(st, args):
                     except OSError:
                         pass
                 ok += 1
-                print(f"{tag} OK   {dst}  ({human(e.size)}, {len(e.slices)} 片)")
+                log(f"{tag} OK   {dst}  ({human(e.size)}, {len(e.slices)} 片)")
             elif dry:
                 await st.ensure_fresh()
                 old = st.backend.get(dst)
                 same = (old and not old.is_dir and old.status == 0
                         and old.size == os.path.getsize(f) and old.hash == digest_of(f))
-                print(f"{tag} {'SKIP' if same else 'NEW '} {dst}  ({human(os.path.getsize(f))})")
+                log(f"{tag} {'SKIP' if same else 'NEW '} {dst}  ({human(os.path.getsize(f))})")
                 skipped += 1 if same else 0
                 ok += 0 if same else 1
             else:
                 e = await st.put_file(dst, f, slice_size=slice_size, skip_same=skip)
                 if e.skipped:
                     skipped += 1
-                    print(f"{tag} SKIP {dst}  (已存在)")
+                    log(f"{tag} SKIP {dst}  (已存在)")
                 else:
                     ok += 1
-                    print(f"{tag} OK   {dst}  ({human(e.size)}, {len(e.slices)} 片)")
+                    log(f"{tag} OK   {dst}  ({human(e.size)}, {len(e.slices)} 片)")
         except Exception as ex:
             failed += 1
-            print(f"{tag} FAIL {dst}: {type(ex).__name__}: {ex}")
+            log(f"{tag} FAIL {dst}: {type(ex).__name__}: {ex}")
     if total > 1:
-        print(f"\n完成：上传 {ok}，跳过 {skipped}，失败 {failed}，共 {total}")
+        log(f"\n完成：上传 {ok}，跳过 {skipped}，失败 {failed}，共 {total}")
 
 
 async def _snapshot_loop(st, interval: float = 60.0):
@@ -261,7 +262,7 @@ async def _snapshot_loop(st, interval: float = 60.0):
         except LockBusy:
             pass                                   # 别的节点正在写，下一轮再试
         except Exception as ex:
-            print(f"  周期落库失败: {type(ex).__name__}: {ex}", flush=True)
+            log(f"  周期落库失败: {type(ex).__name__}: {ex}", flush=True)
 
 
 async def cmd_pushdir(st, args):
@@ -295,11 +296,11 @@ async def cmd_pushdir(st, args):
         before = len(jobs)
         jobs = [(f, d) for f, d in jobs
                 if not any(fnmatch.fnmatch(d, pat) or pat.strip("/") in d for pat in excludes)]
-        print(f"排除规则 {excludes}：{before} → {len(jobs)} 个文件", flush=True)
+        log(f"排除规则 {excludes}：{before} → {len(jobs)} 个文件", flush=True)
     if not jobs:
         sys.exit("没有可上传的文件")
     total = sum(os.path.getsize(p) for p, _ in jobs)
-    print(f"共 {len(jobs)} 个文件，{human(total)}，租约 {lease}s", flush=True)
+    log(f"共 {len(jobs)} 个文件，{human(total)}，租约 {lease}s", flush=True)
 
     ok = skipped = failed = 0
     t0 = time.time()
@@ -308,7 +309,7 @@ async def cmd_pushdir(st, args):
     # 阶段一：先把哈希算完（纯本地，不碰 TG），再一次性持锁写入索引
     import os as _os
     HASH_THREADS = int(_os.environ.get("HASH_THREADS", "2"))
-    print(f"预计算哈希（{HASH_THREADS} 线程）…", flush=True)
+    log(f"预计算哈希（{HASH_THREADS} 线程）…", flush=True)
     import concurrent.futures as _cf
 
     def _prep(item):
@@ -322,10 +323,9 @@ async def cmd_pushdir(st, args):
         for res in ex.map(_prep, jobs):
             prepared.append(res)
             done_n += 1
-            if done_n % 20 == 0 or done_n == len(jobs):
-                print(f"  哈希 {done_n}/{len(jobs)}", flush=True)
+            progress(f"哈希 {done_n}/{len(jobs)}")
 
-    print("写入本地索引（不持锁）…", flush=True)
+    log("写入本地索引（不持锁）…", flush=True)
     for f, d, size, digest, mt in prepared:
         try:
             e = await st.register(d, f, digest=digest, size=size, mtime=mt)
@@ -333,14 +333,14 @@ async def cmd_pushdir(st, args):
                 skipped += 1
         except Exception as ex:
             failed += 1
-            print(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
+            log(f"登记失败 {d}: {type(ex).__name__}: {ex}", flush=True)
 
     # 只有「把索引推到 TG」这一步需要锁，而且一次 edit 同时落库 + 放锁
     if st.dirty:
         # 哈希算完、上传之前，先把清单落一次库：崩溃也不至于重算
-        print("上传索引快照…", flush=True)
+        log("上传索引快照…", flush=True)
         await st.snapshot_locked()
-    print(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
+    log(f"登记完成（新增 {len(jobs)-skipped-failed}，已存在 {skipped}，失败 {failed}），锁已释放", flush=True)
 
     # 阶段二：不持锁传字节；每 10 个文件短暂拿一次锁把结果落库
     def _is_pending(d):
@@ -351,31 +351,33 @@ async def cmd_pushdir(st, args):
         return e is not None and not e.is_dir and e.status == 1
 
     todo = [(f, d) for f, d in jobs if _is_pending(d)]
-    print(f"阶段二：待上传 {len(todo)} 个，开始传字节…", flush=True)
+    log(f"阶段二：待上传 {len(todo)} 个，开始传字节…", flush=True)
     for i, (f, d) in enumerate(todo, 1):
         try:
             e = await st.upload_pending(d, f)
             ok += 1
             done = time.time() - t0
-            print(f"[{i}/{len(todo)}] OK {d} ({human(e.size)}) 已用 {done/60:.1f} 分钟", flush=True)
+            done()
+            log(f"[{i}/{len(todo)}] OK {d} ({human(e.size)}) 已用 {done/60:.1f} 分钟", flush=True)
         except Exception as ex:
             failed += 1
-            print(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
+            done()
+            log(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
         if is_online() and i % 100 == 0 and st.dirty:
             try:
                 await st.snapshot_locked()      # 拿不到锁会在 acquire 里抛 LockBusy
             except LockBusy:
-                print("  (索引锁被占用，跳过本次落库)", flush=True)
+                log("  (索引锁被占用，跳过本次落库)", flush=True)
     try:
         async with st.guard(timeout=30):
             pass
     except Exception as ex:
-        print("最终落库失败:", ex, flush=True)
+        log("最终落库失败:", ex, flush=True)
 
     snap_task.cancel()
     await st.wait_released()
     dt = max(1e-6, time.time() - t0)
-    print(f"完成：上传 {ok}，跳过 {skipped}，失败 {failed}，耗时 {dt/60:.1f} 分钟", flush=True)
+    log(f"完成：上传 {ok}，跳过 {skipped}，失败 {failed}，耗时 {dt/60:.1f} 分钟", flush=True)
 
 
 async def cmd_get(st, args):
@@ -389,33 +391,33 @@ async def cmd_get(st, args):
     with open(local, "wb") as f:
         async for c in st.iter_content(remote):
             f.write(c)
-    print(f"OK {remote} -> {local} ({human(e.size)})")
+    log(f"OK {remote} -> {local} ({human(e.size)})")
 
 
 async def cmd_rm(st, args):
     for p in args:
         await st.delete(norm(p))
-        print(f"removed {p}")
+        log(f"removed {p}")
 
 
 async def cmd_mv(st, args):
     await st.move(norm(args[0]), norm(args[1]))
-    print(f"{args[0]} -> {args[1]}")
+    log(f"{args[0]} -> {args[1]}")
 
 
 async def cmd_cp(st, args):
     await st.copy(norm(args[0]), norm(args[1]))
-    print(f"copied {args[0]} -> {args[1]}")
+    log(f"copied {args[0]} -> {args[1]}")
 
 
 def cmd_stat(st, args):
     e = st.get(norm(args[0]))
     if not e:
         sys.exit("不存在")
-    print(f"path={e.path}")
-    print(f"type={'dir' if e.is_dir else 'file'}")
-    print(f"size={e.size} ({human(e.size)})")
-    print(f"slices={len(e.slices)} ids={e.slices[:5]}{'...' if len(e.slices) > 5 else ''}")
+    log(f"path={e.path}")
+    log(f"type={'dir' if e.is_dir else 'file'}")
+    log(f"size={e.size} ({human(e.size)})")
+    log(f"slices={len(e.slices)} ids={e.slices[:5]}{'...' if len(e.slices) > 5 else ''}")
 
 
 USAGE = __doc__
@@ -430,7 +432,7 @@ async def cmd_export_sql(st, args):
     con.close()
     if out:
         open(out, "w", encoding="utf-8").write(sql)
-        print(f"已导出 {out}（{len(sql)} 字节）")
+        log(f"已导出 {out}（{len(sql)} 字节）")
     else:
         sys.stdout.write(sql)
 
@@ -447,13 +449,13 @@ async def cmd_import_sql(st, args):
     n = con.execute("select count(*) from files").fetchone()[0]
     d = con.execute("select count(*) from dirs").fetchone()[0]
     con.close()
-    print(f"已导入：{n} 个文件、{d} 个目录")
+    log(f"已导入：{n} 个文件、{d} 个目录")
 
 
 async def main():
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print(USAGE)
+        log(USAGE)
         return
     cmd, args = argv[0], argv[1:]
     client, st, tmp = await get_store()
@@ -482,29 +484,29 @@ async def main():
         elif cmd == "gc":
             dry = "--dry-run" in args or "-n" in args
             orphans, missing = await st.gc(dry_run=dry)
-            print(f"{'[预览] ' if dry else ''}孤儿消息 {len(orphans)} 条，无效记录 {len(missing)} 条")
+            log(f"{'[预览] ' if dry else ''}孤儿消息 {len(orphans)} 条，无效记录 {len(missing)} 条")
             for p in missing[:20]:
-                print("  无效记录:", p)
+                log("  无效记录:", p)
         elif cmd == "reindex":
             n = await st.sync(full=True)
-            print(f"已扫描 {n} 条消息重建索引")
+            log(f"已扫描 {n} 条消息重建索引")
         elif cmd in ("stat", "info"):
             cmd_stat(st, args)
         else:
-            print(USAGE)
+            log(USAGE)
     finally:
         try:
             if st.dirty:
                 await st.snapshot()
         except Exception as e:
-            print("快照上传失败:", e)
+            log("快照上传失败:", e)
         await client.disconnect()
         cleanup(tmp)
 
 
 async def est_mkdir(st, p):
     await st.mkdir(norm(p))
-    print(f"mkdir {p}")
+    log(f"mkdir {p}")
 
 
 if __name__ == "__main__":
