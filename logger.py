@@ -134,36 +134,33 @@ def _append(msg: str):
         pass
 
 
-def log(msg="", flush=True):
-    """普通事件：终端 + 环形日志 + 可选追加日志。"""
-    print(msg, flush=flush)
+def _emit(msg: str, ring_only: bool = False):
+    """写日志文件：环形永远写，普通追加文件看 ring_only。"""
+    line = f"{_ts()} {msg}"
     ring = _get_ring()
     if ring:
         try:
-            ring.write(f"{_ts()} {msg}")
+            ring.write(line)
         except Exception:
             pass
-    _append(f"{_ts()} {msg}")
+    if not ring_only:
+        _append(line)
+
+
+def log(msg="", flush=True, ring_only=False):
+    """统一出口：终端 + 环形日志；ring_only=True 表示只写环形、不进普通日志。"""
+    print(msg, flush=flush)
+    _emit(msg, ring_only)
 
 
 def progress(msg):
-    """进度：tty 原地覆盖 + 写进环形日志（详细），不进普通追加日志。"""
+    """进度：tty 原地覆盖，日志只进环形（ring_only），免得刷爆普通日志。"""
     if _tty:
-        sys.stdout.write("\r\033[K" + msg)
+        sys.stdout.write(chr(13) + chr(27) + "[K" + msg)
         sys.stdout.flush()
-    ring = _get_ring()
-    if ring:
-        try:
-            ring.write(f"{_ts()} {msg}")
-        except Exception:
-            pass
-
-
-def endline():
-    """进度收尾换行（避免后面的日志接在进度行尾巴上）。"""
-    if _tty:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        _emit(msg, True)
+    else:
+        log(msg, ring_only=True)
 
 
 def read_log(path: str) -> str:
