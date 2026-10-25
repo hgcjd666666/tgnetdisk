@@ -3,13 +3,15 @@
     TGND_LOG=路径         日志落这个文件（定长环形，写满回头覆盖旧的）
     TGND_LOG_MAX=字节数    正文区大小，默认 1 MiB
 
-不落盘的东西：进度。tty 上原地覆盖；重定向到文件时按 3 秒节流写进环形日志，
-不会无限增长（那个文件本身也封顶）。
+进度不进日志：它只活在终端上（\r 原地覆盖），重定向时自动静默，
+免得高频进度把环形日志里真正有用的记录冲掉。
 
 日志文件格式（第一行是 64 字节信息区，过滤掉第一行剩下的就是日志）：
-    [0:16]   信息区：b"TGNDLOG" + 正文大小(4B BE) + 写入指针(4B BE) + 1B 保留
-    [16]     b"\n" 行分隔
-    [17:]    正文区，固定长度，指针处是下一次写入位置
+    [0:7]    b"TGNDLOG"
+    [7:11]   正文大小 (BE uint32)
+    [11:15]  写入指针 (BE uint32)
+    [15]     b"\n"
+    [16:]    正文区，固定长度，指针处是下一次写入位置
 
 写满后从正文区头部继续覆盖，所以可能有一处断行（接受的代价）。
 读的时候从指针位置绕一圈就是时间顺序。
@@ -19,7 +21,7 @@ import sys
 import time
 
 MAGIC = b"TGNDLOG"
-INFO_LEN = 16                      # 信息区固定 16 字节（8 magic + 4 size + 4 pos）
+INFO_LEN = 15                      # 7 magic + 4 size + 4 pos
 HDR_LEN = INFO_LEN + 1             # 信息区 + 一个 \n 行分隔
 
 _LOG = os.environ.get("TGND_LOG", "")
@@ -40,8 +42,8 @@ class RingLog:
             try:
                 if raw[:7] != MAGIC:
                     raise ValueError("magic")
-                self.body = int.from_bytes(raw[8:12], "big") or self.body
-                self.pos = int.from_bytes(raw[12:16], "big") % self.body
+                self.body = int.from_bytes(raw[7:11], "big") or self.body
+                self.pos = int.from_bytes(raw[11:15], "big") % self.body
             except Exception:
                 self.pos = 0
             if os.path.getsize(path) != HDR_LEN + self.body:
@@ -119,16 +121,10 @@ def log(msg="", flush=True):
 
 
 def progress(msg):
-    """进度：tty 原地覆盖；非 tty（nohup/重定向）3 秒节流写进环形日志。"""
-    global _prog_ts
+    """进度：只在 tty 上原地覆盖，不进日志、不落盘。"""
     if _tty:
         sys.stdout.write("\r\033[K" + msg)
         sys.stdout.flush()
-        return
-    now = time.time()
-    if now - _prog_ts >= 3:
-        _prog_ts = now
-        log(msg)
 
 
 def done():
@@ -145,17 +141,16 @@ def read_log(path: str) -> str:
     if not raw.startswith(MAGIC) or len(raw) < HDR_LEN:
         return raw.decode("utf-8", "replace")
     try:
-        sz = int.from_bytes(raw[8:12], "big")
-        p = int.from_bytes(raw[12:16], "big")
+        sz = int.from_bytes(raw[7:11], "big")
+        p = int.from_bytes(raw[11:15], "big")
         body = raw[HDR_LEN:][:sz]
         p %= max(1, len(body))
     except Exception:
         return raw[HDR_LEN:].decode("utf-8", "replace")
     seq = body[p:] + body[:p]
-    if p and body[p - 1:p] != b"\n":       # 指针落在行中间才丢那半截行
-        cut = seq.find(b"\n")
-        if cut >= 0:
-            seq = seq[cut + 1:]
+    cut = seq.find(b"\n")                 # 绕回去时开头几乎是半截行，按行边界对齐（多丢一行旧的，无所谓）
+    if cut >= 0:
+        seq = seq[cut + 1:]
     return seq.decode("utf-8", "replace").lstrip("\0").rstrip("\0")
 
 
