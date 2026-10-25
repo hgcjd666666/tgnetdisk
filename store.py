@@ -636,7 +636,7 @@ class Store:
         if digest is None:
             digest = digest_of(local_path)
         mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
-        async with self.lock:
+        async with self.mutex:
             old = self.backend.get(p)
             if old and not old.is_dir and old.status == 0 and old.hash == digest and old.size == size:
                 old.skipped = True
@@ -690,7 +690,7 @@ class Store:
                     await send(SliceReader(f, pos, length), n)
                     pos += length
                     n += 1
-        async with self.lock:
+        async with self.mutex:
             self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts), tag)
             self.dirty = True
         return self.backend.get(p)
