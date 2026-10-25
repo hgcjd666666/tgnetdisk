@@ -1,10 +1,9 @@
 """统一输出层 + 定长环形日志文件。
 
-    TGND_LOG=路径         日志落这个文件（定长环形，写满回头覆盖旧的）
-    TGND_LOG_MAX=字节数    正文区大小，默认 1 MiB
-
-进度不进日志：它只活在终端上（\r 原地覆盖），重定向时自动静默，
-免得高频进度把环形日志里真正有用的记录冲掉。
+    TGND_LOG=路径          环形日志（定长，写满覆盖旧的）。什么都往里写，
+                          包括高频进度——反正有上限，不会把磁盘吃光。
+    TGND_LOG_MAX=字节数     环形正文区大小，默认 1 MiB
+    TGND_LOG_APPEND=路径    普通追加日志，只收 log() 的低频事件（不含进度）。
 
 日志文件格式（第一行是 64 字节信息区，过滤掉第一行剩下的就是日志）：
     [0:7]    b"TGNDLOG"
@@ -25,8 +24,8 @@ INFO_LEN = 15                      # 7 magic + 4 size + 4 pos
 HDR_LEN = INFO_LEN + 1             # 信息区 + 一个 \n 行分隔
 
 _LOG = os.environ.get("TGND_LOG", "")
+_APPEND = os.environ.get("TGND_LOG_APPEND", "")
 _tty = sys.stdout.isatty()
-_prog_ts = 0.0
 
 
 class RingLog:
@@ -87,10 +86,11 @@ _ring_tried = False
 _MAX = int(os.environ.get("TGND_LOG_MAX") or (1 << 20))
 
 
-def configure(log_file: str = "", log_max: int = 0):
-    """进程入口统一调一次：决定日志落哪、多大。"""
-    global _LOG, _MAX, _ring, _ring_tried
+def configure(log_file: str = "", log_max: int = 0, append_file: str = ""):
+    """进程入口统一调一次：环形日志落哪、多大；普通日志落哪。"""
+    global _LOG, _APPEND, _MAX, _ring, _ring_tried
     _LOG = log_file or _LOG
+    _APPEND = append_file or _APPEND
     if log_max:
         _MAX = int(log_max)
     _ring = None
@@ -109,8 +109,18 @@ def _get_ring():
     return _ring
 
 
+def _append(msg: str):
+    if not _APPEND:
+        return
+    try:
+        with open(_APPEND, "a", encoding="utf-8") as fp:
+            fp.write(str(msg) + "\n")
+    except OSError:
+        pass
+
+
 def log(msg="", flush=True):
-    """普通消息：一行一条，同时写环形日志文件。"""
+    """普通事件：终端 + 环形日志 + 可选追加日志。"""
     print(msg, flush=flush)
     ring = _get_ring()
     if ring:
@@ -118,13 +128,20 @@ def log(msg="", flush=True):
             ring.write(str(msg))
         except Exception:
             pass
+    _append(msg)
 
 
 def progress(msg):
-    """进度：只在 tty 上原地覆盖，不进日志、不落盘。"""
+    """进度：tty 原地覆盖 + 写进环形日志（详细），不进普通追加日志。"""
     if _tty:
         sys.stdout.write("\r\033[K" + msg)
         sys.stdout.flush()
+    ring = _get_ring()
+    if ring:
+        try:
+            ring.write(str(msg))
+        except Exception:
+            pass
 
 
 def done():
