@@ -23,7 +23,6 @@ from telethon import TelegramClient
 
 from store import cache_file, LockBusy, make_session, is_path_session, Store, norm, parent_of, base_of
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("dav")
 
 API_ID = int(os.environ.get("TG_API_ID", "0"))

@@ -37,7 +37,6 @@ from store import (Store, LockBusy, norm, base_of, make_session,
                    is_path_session, digest_of, is_online, DB_PATH)  # noqa: E402
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
 
 def load_env():

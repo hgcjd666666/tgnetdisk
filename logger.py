@@ -15,6 +15,7 @@
 写满后从正文区头部继续覆盖，所以可能有一处断行（接受的代价）。
 读的时候从指针位置绕一圈就是时间顺序。
 """
+import logging
 import os
 import sys
 import time
@@ -91,6 +92,30 @@ class RingLog:
         self.fp.flush()
 
 
+class LoggingBridge(logging.Handler):
+    """接管标准 logging：所有 log.info/warning/... 都流进统一出口（环形 + 追加）。"""
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+            if record.exc_info:
+                msg = f"{msg} {self.formatException(record.exc_info).splitlines()[-1]}"
+            prefix = {"WARNING": "警告 ", "ERROR": "错误 ", "CRITICAL": "严重 "}.get(record.levelname, "")
+            # 环形收全部；精简日志文件只收 WARNING 及以上
+            _emit(prefix + msg, ring_only=record.levelno < logging.WARNING)
+        except Exception:
+            pass
+
+
+def install_logging(level=logging.INFO):
+    """把 root logger 的输出整体接到我们的环形日志上（不再走 stderr）。"""
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(LoggingBridge())
+    root.setLevel(level)
+
+
 _ring: RingLog | None = None
 _ring_tried = False
 _MAX = int(os.environ.get("TGND_LOG_MAX") or (1 << 20))
@@ -105,6 +130,7 @@ def configure(log_file: str = "", log_max: int = 0, append_file: str = ""):
         _MAX = int(log_max)
     _ring = None
     _ring_tried = False
+    install_logging()
 
 
 def _get_ring():
