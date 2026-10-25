@@ -154,8 +154,8 @@ def progress(msg):
             pass
 
 
-def done():
-    """进度收尾换行。"""
+def endline():
+    """进度收尾换行（避免后面的日志接在进度行尾巴上）。"""
     if _tty:
         sys.stdout.write("\n")
         sys.stdout.flush()

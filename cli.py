@@ -29,7 +29,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from logger import configure, done, log, progress
+from logger import configure, endline, log, progress
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -357,12 +357,12 @@ async def cmd_pushdir(st, args):
         try:
             e = await st.upload_pending(d, f)
             ok += 1
-            done = time.time() - t0
-            done()
-            log(f"[{i}/{len(todo)}] OK {d} ({human(e.size)}) 已用 {done/60:.1f} 分钟", flush=True)
+            elapsed = time.time() - t0
+            endline()
+            log(f"[{i}/{len(todo)}] OK {d} ({human(e.size)}) 已用 {elapsed/60:.1f} 分钟", flush=True)
         except Exception as ex:
             failed += 1
-            done()
+            endline()
             log(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
         if is_online() and i % 100 == 0 and st.dirty:
             try:
