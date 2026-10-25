@@ -4,9 +4,10 @@
     TGND_LOG_MAX=字节数    正文区大小，默认 1 MiB
     TGND_PROGRESS=路径    进度行覆盖写入（只保留最新一行）
 
-日志文件格式（第一行是文件头，过滤掉它剩下的就是日志）：
-    TGNDLOG:<正文区大小,8位hex>:<当前写入指针,8位hex>\n
-    <正文区，固定长度，指针处是下一次写入位置>
+日志文件格式（第一行是 64 字节信息区，过滤掉第一行剩下的就是日志）：
+    [0:64]   信息区：b"TGNDLOG" + 正文大小(4B BE) + 写入指针(4B BE) + 48B 保留
+    [64]     b"\n" 行分隔
+    [65:]    正文区，固定长度，指针处是下一次写入位置
 
 写满后从正文区头部继续覆盖，所以可能有一处断行（接受的代价）。
 读的时候从指针位置绕一圈就是时间顺序。
@@ -14,8 +15,9 @@
 import os
 import sys
 
-MAGIC = "TGNDLOG"
-HDR_LEN = 26                       # b"TGNDLOG:" + 8 + b":" + 8 + b"\n"
+MAGIC = b"TGNDLOG"
+INFO_LEN = 64                      # 信息区固定 64 字节（8 magic + 4 size + 4 pos + 48 保留）
+HDR_LEN = INFO_LEN + 1             # 信息区 + 一个 \n 行分隔
 
 _LOG = os.environ.get("TGND_LOG", "")
 _PROG = os.environ.get("TGND_PROGRESS", "")
@@ -33,9 +35,10 @@ class RingLog:
             self.fp.seek(0)
             raw = self.fp.read(HDR_LEN)
             try:
-                _, sz, pos = raw.decode("ascii").strip().split(":")
-                self.body = int(sz, 16) or self.body
-                self.pos = int(pos, 16) % self.body
+                if raw[:7] != MAGIC:
+                    raise ValueError("magic")
+                self.body = int.from_bytes(raw[7:11], "big") or self.body
+                self.pos = int.from_bytes(raw[11:15], "big") % self.body
             except Exception:
                 self.pos = 0
             if os.path.getsize(path) != HDR_LEN + self.body:
@@ -46,7 +49,9 @@ class RingLog:
             self._init_file()
 
     def _hdr(self, pos: int) -> bytes:
-        return b"TGNDLOG:%08x:%08x\n" % (self.body, pos)
+        """64 字节信息区 + \n：magic | 正文大小 | 写入指针 | 48 字节预留。"""
+        return (MAGIC + self.body.to_bytes(4, "big") + pos.to_bytes(4, "big")
+                + b"\0" * 48 + b"\n")
 
     def _init_file(self):
         self.pos = 0
@@ -123,16 +128,20 @@ def read_log(path: str) -> str:
     """按时间顺序读出环形日志（第一行文件头会被跳过）。"""
     with open(path, "rb") as fp:
         raw = fp.read()
-    nl = raw.find(b"\n")
-    if nl < 0 or not raw.startswith(MAGIC.encode()):
+    if not raw.startswith(MAGIC) or len(raw) < HDR_LEN:
         return raw.decode("utf-8", "replace")
     try:
-        _, sz, pos = raw[:nl].decode("ascii").strip().split(":")
-        body = raw[nl + 1:][: int(sz, 16)]
-        p = int(pos, 16) % max(1, len(body))
+        sz = int.from_bytes(raw[7:11], "big")
+        p = int.from_bytes(raw[11:15], "big")
+        body = raw[HDR_LEN:][:sz]
+        p %= max(1, len(body))
     except Exception:
-        return raw[nl + 1:].decode("utf-8", "replace")
-    return (body[p:] + body[:p]).decode("utf-8", "replace").lstrip("\0")
+        return raw[HDR_LEN:].decode("utf-8", "replace")
+    seq = body[p:] + body[:p]
+    cut = seq.find(b"\n")                 # 指针可能落在旧行中间，丢掉半截的首行
+    if cut >= 0:
+        seq = seq[cut + 1:]
+    return seq.decode("utf-8", "replace").lstrip("\0")
 
 
 if __name__ == "__main__":
