@@ -312,7 +312,6 @@ class SqliteBackend(Backend):
                 path TEXT PRIMARY KEY, hash TEXT NOT NULL, size INTEGER DEFAULT 0,
                 mtime INTEGER DEFAULT 0, parts TEXT DEFAULT '{}', name TEXT DEFAULT '');
             CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY, mtime INTEGER DEFAULT 0);
-            CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);
             CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
         """)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(files)")}
@@ -324,6 +323,8 @@ class SqliteBackend(Backend):
             self.db.execute("ALTER TABLE files ADD COLUMN name TEXT DEFAULT ''")
         if "md5" in cols and "hash" not in cols:
             self.db.execute("ALTER TABLE files RENAME COLUMN md5 TO hash")
+        # 索引放在迁移之后建：旧库先改列名，否则 CREATE INDEX 会报 no such column
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash)")
         self.db.commit()
 
     def get(self, path):
