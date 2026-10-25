@@ -462,12 +462,13 @@ async def cmd_logs(st, args):
     if not os.path.exists(path):
         sys.exit(f"文件不存在: {path}")
     last = ""
-    while True:
-        try:
-            lines = read_log(path).splitlines()
-        except OSError:
-            await asyncio.sleep(0.5)
-            continue
+    try:
+        while True:
+            try:
+                lines = read_log(path).splitlines()
+            except OSError:
+                await asyncio.sleep(0.5)
+                continue
         if last:
             try:
                 i = lines.index(last, max(0, len(lines) - 200)) + 1
@@ -475,12 +476,14 @@ async def cmd_logs(st, args):
                 i = max(0, len(lines) - 20)      # 绕回去了，重打最后一小段
         else:
             i = 0
-        for line in lines[i:]:
-            sys.stdout.write(line + "\n")
-        sys.stdout.flush()
-        if lines:
-            last = lines[-1]
-        await asyncio.sleep(0.4)
+            for line in lines[i:]:
+                sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+            if lines:
+                last = lines[-1]
+            await asyncio.sleep(0.4)
+    except KeyboardInterrupt:             # Ctrl-C 安静退出
+        return
 
 
 async def main():
@@ -490,7 +493,7 @@ async def main():
               log_max=int(os.environ.get("TGND_LOG_MAX") or 0),
 )
     if not argv or argv[0] in ("-h", "--help", "help"):
-        log(USAGE)
+        print(USAGE)                       # 用法不进日志，免得环形里堆一堆 USAGE
         return
     cmd, args = argv[0], argv[1:]
     if cmd in ("logs", "tail"):
