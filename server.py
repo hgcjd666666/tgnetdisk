@@ -377,6 +377,9 @@ async def ensure_chat(client, cfg_path="/opt/tgnd/chat.json", title="tgnd") -> i
 
 
 async def main():
+    logger.configure(log_file=os.environ.get("TGND_LOG", ""),
+                     log_max=int(os.environ.get("TGND_LOG_MAX") or 0),
+                     progress_file=os.environ.get("TGND_PROGRESS", ""))
     # WEBDAV=0：只跑 CLI，不起 HTTP 服务（连同 Telegram 连接都不必建立）
     if os.environ.get("WEBDAV", "1").strip().lower() in ("0", "false", "no", "off"):
         log.info("WEBDAV=0，跳过 WebDAV 启动（只用命令行）")

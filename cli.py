@@ -28,7 +28,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from logger import log, progress, done
+from logger import configure, done, log, progress
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -454,6 +454,10 @@ async def cmd_import_sql(st, args):
 
 async def main():
     argv = sys.argv[1:]
+    load_env()
+    configure(log_file=os.environ.get("TGND_LOG", ""),
+              log_max=int(os.environ.get("TGND_LOG_MAX") or 0),
+              progress_file=os.environ.get("TGND_PROGRESS", ""))
     if not argv or argv[0] in ("-h", "--help", "help"):
         log(USAGE)
         return

@@ -5,9 +5,9 @@
     TGND_PROGRESS=路径    进度行覆盖写入（只保留最新一行）
 
 日志文件格式（第一行是 64 字节信息区，过滤掉第一行剩下的就是日志）：
-    [0:64]   信息区：b"TGNDLOG" + 正文大小(4B BE) + 写入指针(4B BE) + 48B 保留
-    [64]     b"\n" 行分隔
-    [65:]    正文区，固定长度，指针处是下一次写入位置
+    [0:16]   信息区：b"TGNDLOG" + 正文大小(4B BE) + 写入指针(4B BE) + 1B 保留
+    [16]     b"\n" 行分隔
+    [17:]    正文区，固定长度，指针处是下一次写入位置
 
 写满后从正文区头部继续覆盖，所以可能有一处断行（接受的代价）。
 读的时候从指针位置绕一圈就是时间顺序。
@@ -16,7 +16,7 @@ import os
 import sys
 
 MAGIC = b"TGNDLOG"
-INFO_LEN = 64                      # 信息区固定 64 字节（8 magic + 4 size + 4 pos + 48 保留）
+INFO_LEN = 16                      # 信息区固定 16 字节（8 magic + 4 size + 4 pos）
 HDR_LEN = INFO_LEN + 1             # 信息区 + 一个 \n 行分隔
 
 _LOG = os.environ.get("TGND_LOG", "")
@@ -37,8 +37,8 @@ class RingLog:
             try:
                 if raw[:7] != MAGIC:
                     raise ValueError("magic")
-                self.body = int.from_bytes(raw[7:11], "big") or self.body
-                self.pos = int.from_bytes(raw[11:15], "big") % self.body
+                self.body = int.from_bytes(raw[8:12], "big") or self.body
+                self.pos = int.from_bytes(raw[12:16], "big") % self.body
             except Exception:
                 self.pos = 0
             if os.path.getsize(path) != HDR_LEN + self.body:
@@ -51,7 +51,7 @@ class RingLog:
     def _hdr(self, pos: int) -> bytes:
         """64 字节信息区 + \n：magic | 正文大小 | 写入指针 | 48 字节预留。"""
         return (MAGIC + self.body.to_bytes(4, "big") + pos.to_bytes(4, "big")
-                + b"\0" * 48 + b"\n")
+                + b"\n")
 
     def _init_file(self):
         self.pos = 0
@@ -79,6 +79,18 @@ class RingLog:
 
 _ring: RingLog | None = None
 _ring_tried = False
+_MAX = int(os.environ.get("TGND_LOG_MAX") or (1 << 20))
+
+
+def configure(log_file: str = "", log_max: int = 0, progress_file: str = ""):
+    """进程入口统一调一次：决定日志落哪、多大、进度写哪。"""
+    global _LOG, _PROG, _MAX, _ring, _ring_tried
+    _LOG = log_file or _LOG
+    _PROG = progress_file or _PROG
+    if log_max:
+        _MAX = int(log_max)
+    _ring = None
+    _ring_tried = False
 
 
 def _get_ring():
@@ -87,7 +99,7 @@ def _get_ring():
         _ring_tried = True
         if _LOG:
             try:
-                _ring = RingLog(_LOG, int(os.environ.get("TGND_LOG_MAX", str(1 << 20))))
+                _ring = RingLog(_LOG, _MAX)
             except Exception:
                 _ring = None
     return _ring
@@ -131,8 +143,8 @@ def read_log(path: str) -> str:
     if not raw.startswith(MAGIC) or len(raw) < HDR_LEN:
         return raw.decode("utf-8", "replace")
     try:
-        sz = int.from_bytes(raw[7:11], "big")
-        p = int.from_bytes(raw[11:15], "big")
+        sz = int.from_bytes(raw[8:12], "big")
+        p = int.from_bytes(raw[12:16], "big")
         body = raw[HDR_LEN:][:sz]
         p %= max(1, len(body))
     except Exception:
