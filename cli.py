@@ -250,6 +250,20 @@ async def cmd_put(st, args):
         print(f"\n完成：上传 {ok}，跳过 {skipped}，失败 {failed}，共 {total}")
 
 
+async def _snapshot_loop(st, interval: float = 60.0):
+    """后台每分钟把索引推到 TG 一次：本地写是实时的，TG 只做低频落盘。"""
+    while True:
+        await asyncio.sleep(interval)
+        if not st.dirty:
+            continue
+        try:
+            await st.snapshot_locked()
+        except LockBusy:
+            pass                                   # 别的节点正在写，下一轮再试
+        except Exception as ex:
+            print(f"  周期落库失败: {type(ex).__name__}: {ex}", flush=True)
+
+
 async def cmd_pushdir(st, args):
     """批量把本地目录/文件推到远端，全程持锁（空闲 3 秒才落库放锁）。
 
@@ -289,6 +303,7 @@ async def cmd_pushdir(st, args):
 
     ok = skipped = failed = 0
     t0 = time.time()
+    snap_task = asyncio.create_task(_snapshot_loop(st, float(os.environ.get("SNAPSHOT_SEC", "60"))))
 
     # 阶段一：先把哈希算完（纯本地，不碰 TG），再一次性持锁写入索引
     import os as _os
@@ -357,6 +372,7 @@ async def cmd_pushdir(st, args):
     except Exception as ex:
         print("最终落库失败:", ex, flush=True)
 
+    snap_task.cancel()
     await st.wait_released()
     dt = max(1e-6, time.time() - t0)
     print(f"完成：上传 {ok}，跳过 {skipped}，失败 {failed}，耗时 {dt/60:.1f} 分钟", flush=True)
