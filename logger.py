@@ -119,6 +119,11 @@ def _get_ring():
     return _ring
 
 
+def _ts() -> str:
+    """环形/追加日志的行首时间戳。"""
+    return time.strftime("%H:%M:%S")
+
+
 def _append(msg: str):
     if not _APPEND:
         return
@@ -135,10 +140,10 @@ def log(msg="", flush=True):
     ring = _get_ring()
     if ring:
         try:
-            ring.write(str(msg))
+            ring.write(f"{_ts()} {msg}")
         except Exception:
             pass
-    _append(msg)
+    _append(f"{_ts()} {msg}")
 
 
 def progress(msg):
@@ -149,7 +154,7 @@ def progress(msg):
     ring = _get_ring()
     if ring:
         try:
-            ring.write(str(msg))
+            ring.write(f"{_ts()} {msg}")
         except Exception:
             pass
 
