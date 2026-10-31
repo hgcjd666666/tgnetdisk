@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from store import Store, SqliteBackend, make_session  # noqa: E402
+from store import Store, SqliteBackend, make_session, is_db_msg, LOCK_IDLE, LOCK_PREFIX, LockBusy  # noqa: E402
 
 RESULTS = []
 
@@ -37,6 +37,7 @@ class FakeClient:
         self._msgs = {}
         self._blobs = {}
         self._uploads = {}          # file_id -> {part: bytes}  模拟 upload.saveBigFilePart
+        self._pinned_ids = []       # 模拟置顶：只有置顶过的消息才会出现在 pinned 过滤里
 
     def _alloc(self):
         self._id += 1
@@ -70,7 +71,8 @@ class FakeClient:
         self._blobs[mid] = data
         return m
 
-    async def edit_message(self, chat, msg, file=None, caption=None, attributes=None, **kw):
+    async def edit_message(self, chat, msg, file=None, caption=None, text=None,
+                           attributes=None, **kw):
         mid = msg if isinstance(msg, int) else msg.id
         m = self._msgs[mid]
         if file is not None:
@@ -78,15 +80,21 @@ class FakeClient:
             m.document.size = len(data)
             m.document.attributes = [SimpleNamespace(file_name=name)]
             self._blobs[mid] = data
-        if caption is not None:
-            m.message = caption
+        # 真实 telethon：改文字用 text=，caption= 只在发文件的调用里出现。
+        # 锁状态就是靠 edit_message(text=...) 写的，这里必须认 text，否则永远改不动 caption。
+        cap = text if text is not None else caption
+        if cap is not None:
+            m.message = cap
         return m
 
-    async def get_messages(self, chat, ids=None, limit=None, **kw):
+    async def get_messages(self, chat, ids=None, limit=None, filter=None, **kw):
         if ids is not None:
             if isinstance(ids, (list, tuple)):
                 return [self._msgs[i] for i in ids if i in self._msgs]
             return self._msgs.get(ids)
+        if filter is not None and "Pinned" in type(filter).__name__:
+            msgs = [self._msgs[i] for i in self._pinned_ids if i in self._msgs]
+            return msgs[:limit] if limit else msgs
         return [self._msgs[i] for i in sorted(self._msgs, reverse=True)[:limit or 1]]
 
     async def iter_messages(self, chat, limit=None, min_id=0, reverse=False, **kw):
@@ -104,6 +112,8 @@ class FakeClient:
         for i in ids:
             self._msgs.pop(i, None)
             self._blobs.pop(i, None)
+            if i in self._pinned_ids:
+                self._pinned_ids.remove(i)
 
     async def connect(self):
         pass
@@ -114,8 +124,9 @@ class FakeClient:
     async def get_entity(self, x):
         return x
 
-    async def pin_message(self, *a, **kw):
-        pass
+    async def pin_message(self, chat, msg, notify=False, **kw):
+        mid = msg if isinstance(msg, int) else msg.id
+        self._pinned_ids = [mid]
 
     async def is_user_authorized(self):
         return True
@@ -124,12 +135,22 @@ class FakeClient:
         if type(req).__name__ == "SaveBigFilePartRequest":
             self._uploads.setdefault(req.file_id, {})[req.file_part] = req.bytes
             return True
-        return SimpleNamespace(full_chat=SimpleNamespace(pinned_msg_id=None))
+        return SimpleNamespace(full_chat=SimpleNamespace(
+            pinned_msg_id=self._pinned_ids[-1] if self._pinned_ids else None))
 
     async def iter_download(self, m, **kw):
         data = self._blobs.get(m.id, b"")
         for i in range(0, len(data), 512 * 1024):
             yield data[i:i + 512 * 1024]
+
+    async def download_media(self, m, file=None, **kw):
+        data = self._blobs.get(m if isinstance(m, int) else m.id, b"")
+        if hasattr(file, "write"):
+            file.write(data)
+            return file
+        with open(file, "wb") as f:
+            f.write(data)
+        return file
 
 
 def rec(name, ok, detail=""):
@@ -277,12 +298,63 @@ async def main():
         after = st.get(f"{D}/one")
         assert (before is None) == (after is None)
 
+    # ---- 分布式锁（快照 caption 即锁）：只有 --full 才走真实锁路径 ----
+
+    async def t_lock_bootstrap():
+        if st.fast:
+            print("SKIP  锁用例需要 --full（默认为 fast 模式，跳过分布式锁）")
+            return
+        # 空频道：没有快照消息时 acquire 要自己建一条空快照再占锁，
+        # 且不能因 acquire → snapshot → acquire 递归而卡死。
+        c2 = FakeClient()
+        st2 = Store(c2, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+        await st2.acquire(timeout=10)
+        assert st2._holding, "acquire 返回了但没标记持有"
+        snap = await st2._snap_msg()
+        assert snap is not None, "抢锁后读不到快照消息"
+        assert st2._cap(snap) == LOCK_PREFIX + st2.token, \
+            f"caption 不是自己的 token: {st2._cap(snap)!r}"
+        db_msgs = [m for m in c2._msgs.values() if is_db_msg(m)]
+        assert len(db_msgs) == 1, f"建了 {len(db_msgs)} 条快照消息，应只建 1 条"
+        await st2.release()
+        assert st2._cap(await st2._snap_msg()) == LOCK_IDLE, "release 后 caption 不是 lock:null"
+
+    async def t_lock_reacquire():
+        if st.fast:
+            return
+        await st.acquire(timeout=10)
+        assert st._holding
+        await st.acquire(timeout=10)         # 已持有：幂等，不能再抢一次
+        assert st._holding
+        await st.release()
+        assert not st._holding
+
+    async def t_lock_busy():
+        if st.fast:
+            return
+        # 另一个节点已经持锁时，nonblock 应立即抛 LockBusy 而不是傻等
+        other = Store(client, chat, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+        other.token = "0" * 32               # 模拟另一台机器的 token
+        await st.acquire(timeout=10)
+        try:
+            await other.acquire(timeout=2, nonblock=True)
+            raise AssertionError("锁被别人持有时 nonblock 没抛 LockBusy")
+        except LockBusy:
+            pass
+        finally:
+            await st.release()
+        await other.acquire(timeout=10)      # 放锁后应能抢到
+        assert other._holding
+        await other.release()
+
     for name, fn in [
         ("空文件", t_empty), ("1字节", t_one_byte), ("中文+空格", t_unicode),
         ("特殊字符", t_special), ("深目录", t_deep), ("多分片7片", t_multislice),
         ("秒传共享分片", t_dedup), ("同名覆盖", t_overwrite), ("cp+mv", t_copy_move),
         ("删除文件", t_delete), ("递归删目录", t_rmdir), ("mkdir+空目录", t_mkdir),
         ("gc 预览", t_gc), ("reindex 全量", t_reindex),
+        ("锁-空频道自建快照", t_lock_bootstrap), ("锁-重复acquire幂等", t_lock_reacquire),
+        ("锁-双节点互斥", t_lock_busy),
     ]:
         await case(name, fn)
 
@@ -292,6 +364,12 @@ async def main():
             await st.delete(D)
     except Exception as e:
         print("清理失败:", e)
+
+    if not st.fast:
+        try:
+            await st.wait_released(10)
+        except Exception:
+            pass
 
     await client.disconnect()
     ok = sum(1 for _, o, _ in RESULTS if o)

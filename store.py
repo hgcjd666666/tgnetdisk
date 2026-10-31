@@ -975,6 +975,15 @@ class Store:
         log.info("扫描 %d 条消息，%d 个 hash，快照 %d 条", n, len(parts_by_hash), snap_cnt)
         return n
 
+    def _remember_snap_doc(self, m):
+        """记下快照消息的 document.id：ensure_fresh 靠它判断远端快照有没有换过。
+
+        推完快照不更新它，下次写操作就会把自己的快照当成「别人更新的」再下载一遍。
+        """
+        doc_id = getattr(getattr(m, "document", None), "id", 0)
+        if doc_id:
+            self.snap_doc_id = doc_id
+
     async def _push_snapshot(self, tmp: str, caption: str):
         """把压缩好的快照推上去：能就地替换置顶那条就替换，否则新发一条并置顶。
 
@@ -982,9 +991,10 @@ class Store:
         """
         if self.snap_msg_id:
             try:
-                await self.client.edit_message(
+                m = await self.client.edit_message(
                     self.chat, self.snap_msg_id, file=tmp, force_document=True,
                     attributes=[DocumentAttributeFilename(DB_NAME)], text=caption)
+                self._remember_snap_doc(m)
                 return self.snap_msg_id, True
             except Exception as e:
                 log.warning("就地替换失败，改为新发一条: %s", e)
@@ -993,6 +1003,7 @@ class Store:
             attributes=[DocumentAttributeFilename(DB_NAME)])
         old = self.snap_msg_id
         self.snap_msg_id = msg.id
+        self._remember_snap_doc(msg)
         if old and old != msg.id:
             await self._del_ids([old])
         try:
@@ -1001,12 +1012,17 @@ class Store:
             log.warning("置顶失败: %s", e)
         return msg, False
 
-    async def snapshot(self, final: bool = False):
+    async def snapshot(self, final: bool = False, grab_lock: bool = False):
         """把索引压成快照传到 TG，置顶并删掉旧的。
 
         final=True 时顺便把 caption 改回 lock:null 并清持有标记——
         一次 edit 同时完成「落库 + 释放锁」，少一次 TG 写。
+
+        grab_lock=True 才先抢锁。acquire() 内部建快照时必须传 False，
+        否则 acquire → snapshot → acquire 互相递归，空频道上直接卡死。
         """
+        if grab_lock and is_online() and not self._holding:
+            await self.acquire()
         cap = (LOCK_IDLE if is_online() else "") if final else self._lock_text()
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
         os.close(fd)
@@ -1135,7 +1151,17 @@ class Store:
         return (LOCK_PREFIX + self.token) if self._holding else LOCK_IDLE
 
     async def _snap_msg(self):
-        """置顶的那条快照消息（锁状态就在它的 caption 上）。"""
+        """置顶的那条快照消息（锁状态就在它的 caption 上）。
+
+        先按自己记下的 id 直读：刚推完快照时它一定可读，不必等置顶过滤器刷新。
+        """
+        if self.snap_msg_id:
+            try:
+                m = await self.client.get_messages(self.chat, ids=self.snap_msg_id)
+                if m and is_db_msg(m):
+                    return m
+            except Exception as e:
+                log.warning("按 id 读取快照消息失败: %s", e)
         for m in await self._pinned():
             if is_db_msg(m):
                 return m
@@ -1156,11 +1182,21 @@ class Store:
             return
         mine = LOCK_PREFIX + self.token
         end = time.time() + timeout
+        bootstrapped = False
         while True:
             m = await self._snap_msg()
             if m is None:
-                await self.snapshot()          # 没有快照就先建一条（此时无人持锁）
-                continue
+                # 锁就挂在快照消息上：没有快照 = 没人持锁，先发一条空快照。
+                # 这里只能调 grab_lock=False（acquire 里再抢锁就是递归死锁）。
+                if not bootstrapped:
+                    bootstrapped = True
+                    log.info("频道里没有快照消息，先建一条再抢锁")
+                    await self.snapshot(grab_lock=False)
+                    await asyncio.sleep(0.5)   # 给 TG 一点时间让新消息可读
+                    continue
+                m = await self._find_snapshot()    # 置顶读不到时全量扫一次兜底
+                if m is None:
+                    raise RuntimeError("频道里没有可用的索引快照，无法加锁（先 sync 一次）")
             cur = self._cap(m)
             if cur == mine:                     # 已经是自己持有的，别再 edit（会报未修改）
                 self.snap_msg_id = m.id
