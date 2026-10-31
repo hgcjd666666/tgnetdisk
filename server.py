@@ -36,8 +36,8 @@ DAV_USER = os.environ.get("DAV_USER", "admin")
 DAV_PASS = os.environ.get("DAV_PASS", "")
 READONLY = os.environ.get("DAV_READONLY", "0") == "1"
 
-ALLOW = "OPTIONS, HEAD, GET, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY, LOCK, UNLOCK"
-DAV_CLASS = "1, 2"
+ALLOW = "OPTIONS, HEAD, GET, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY"
+DAV_CLASS = "1"            # 只宣告 Class 1：锁（Class 2）不实现，别假装支持
 
 
 # ---------------- 工具 ----------------
@@ -302,35 +302,6 @@ async def dav_copy(request, store):
     return web.Response(status=201)
 
 
-_LOCK_TOKENS: dict[str, str] = {}
-
-
-async def dav_lock(request, store):
-    path = norm(request.path)
-    token = _LOCK_TOKENS.get(path) or f"opaquelocktoken:{uuid.uuid4()}"
-    _LOCK_TOKENS[path] = token
-    e = store.get(path)
-    timeout = request.headers.get("Timeout", "Second-3600")
-    body = f"""<?xml version="1.0" encoding="utf-8"?>
-<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>
-<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>
-<D:depth>infinity</D:depth>
-<D:timeout>{xesc(timeout)}</D:timeout>
-<D:locktoken><D:href>{token}</D:href></D:locktoken>
-</D:activelock></D:lockdiscovery></D:prop>"""
-    return web.Response(status=200, body=body.encode(), content_type="application/xml",
-                        headers={"Lock-Token": f"<{token}>"})
-
-
-async def dav_unlock(request, store):
-    path = norm(request.path)
-    tok = request.headers.get("Lock-Token", "").strip("<>")
-    if _LOCK_TOKENS.get(path) == tok:
-        _LOCK_TOKENS.pop(path, None)
-        return web.Response(status=204)
-    return web.Response(status=409)
-
-
 async def dav_proppatch(request, store):
     return web.Response(status=207, body=b'<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"/>',
                         content_type="application/xml")
@@ -359,10 +330,6 @@ async def handle(request, store):
             return await dav_move(request, store)
         if m == "COPY":
             return await dav_copy(request, store)
-        if m == "LOCK":
-            return await dav_lock(request, store)
-        if m == "UNLOCK":
-            return await dav_unlock(request, store)
         if m == "PROPPATCH":
             return await dav_proppatch(request, store)
     except LockBusy:

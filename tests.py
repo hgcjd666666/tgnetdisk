@@ -496,6 +496,10 @@ async def main():
                 assert st3.get("/dav/a.txt") is not None, "MOVE 到自身把文件弄丢了"
                 r = await cli.request("PROPFIND", "/dav", headers={"Depth": "1"})
                 assert r.status == 207 and "a.txt" in await r.text(), "PROPFIND 没列出文件"
+                r = await cli.request("OPTIONS", "/dav")
+                assert r.headers.get("DAV") == "1", f"DAV 头应为 1，实际 {r.headers.get('DAV')}"
+                r = await cli.request("LOCK", "/dav/a.txt")
+                assert r.status == 405, f"LOCK 应 405（不实现锁），实际 {r.status}"
                 await cli.put("/p/q/f.txt", data=b"q")
                 r = await cli.request("MOVE", "/p/q", headers={
                     "Destination": str(cli.make_url("/p")), "Overwrite": "T"})
