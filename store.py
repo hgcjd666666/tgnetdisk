@@ -866,6 +866,18 @@ class Store:
             if expect and len(got) >= expect:
                 self.backend.set_file(path, hash, size, mtime, got, 0, expect)
                 log.info("补记完成的上传: %s (%d 片)", path, len(got))
+        if full:
+            # 扫到分片、但索引里没有任何条目认领的 hash → 收进 /lost+found（仿 ext4），别让数据凭空消失。
+            # 注意：必须在 pending 补记之后做，否则上传中的记录会被误判成无主。
+            known = {e.hash for e in self.backend.all_entries().values()
+                     if not e.is_dir and e.hash}
+            orphan = {h: p for h, p in parts_by_hash.items() if h and h not in known and p}
+            if orphan:
+                now = int(time.time())
+                self.backend.set_dir("/lost+found", now)
+                for h, parts in orphan.items():
+                    self.backend.set_file(f"/lost+found/{h}", h, 0, now, parts, 0, len(parts))
+                log.info("无主分片归入 /lost+found：%d 个", len(orphan))
         if snaps:
             self.snap_msg_id = max(s.id for s in snaps)
         log.info("扫描 %d 条消息，%d 个 hash，快照 %d 条", n, len(parts_by_hash), len(snaps))
