@@ -21,6 +21,7 @@ from urllib.parse import quote, unquote, urlsplit
 from aiohttp import web
 from telethon import TelegramClient
 
+import logger
 from store import cache_file, LockBusy, make_session, is_path_session, Store, norm, parent_of, base_of
 
 log = logging.getLogger("dav")
