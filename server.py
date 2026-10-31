@@ -198,7 +198,7 @@ async def dav_put(request, store):
             mtime = None
         if mtime is not None and mtime <= 0:
             mtime = None
-        existed = path in store.entries
+        existed = store.get(path) is not None
         await store.put_file(path, tmp, mtime)
         return web.Response(status=204 if existed else 201)
     finally:
@@ -214,7 +214,7 @@ async def dav_delete(request, store):
     path = norm(request.path)
     if path == "/":
         return web.Response(status=403, text="cannot delete root")
-    if path not in store.entries:
+    if store.get(path) is None:
         return web.Response(status=404)
     await store.delete(path)
     return web.Response(status=204)
@@ -224,7 +224,7 @@ async def dav_mkcol(request, store):
     if READONLY:
         return web.Response(status=403)
     path = norm(request.path)
-    if path in store.entries:
+    if store.get(path) is not None:
         return web.Response(status=405, text="exists")
     await store.mkdir(path)
     return web.Response(status=201)
@@ -244,10 +244,10 @@ async def dav_move(request, store):
     dst = _dest_path(request)
     if not dst:
         return web.Response(status=400, text="no destination")
-    if src not in store.entries:
+    if store.get(src) is None:
         return web.Response(status=404)
     if request.headers.get("Overwrite", "T") == "T":
-        if dst not in store.entries:
+        if store.get(dst) is None:
             await store.move(src, dst)
             return web.Response(status=201)
         await store.delete(dst)
@@ -264,9 +264,9 @@ async def dav_copy(request, store):
     dst = _dest_path(request)
     if not dst:
         return web.Response(status=400)
-    if src not in store.entries:
+    if store.get(src) is None:
         return web.Response(status=404)
-    if dst in store.entries:
+    if store.get(dst) is not None:
         await store.delete(dst)
     await store.copy(src, dst)
     return web.Response(status=201)
