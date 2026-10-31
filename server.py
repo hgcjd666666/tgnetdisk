@@ -380,7 +380,7 @@ async def handle(request, store):
             if t is None or t.done():
                 try:
                     if is_online():
-                        await store.snapshot_locked()
+                        await store.snapshot_locked(nonblock=True)   # 别在锁上等满 60 秒
                     else:
                         await store.snapshot()
                 except LockBusy:
@@ -455,7 +455,7 @@ async def main():
                 try:
                     # 同样必须抢锁：裸 snapshot() 会改掉别的节点持有的 caption
                     if is_online():
-                        await store.snapshot_locked()
+                        await store.snapshot_locked(nonblock=True)
                     else:
                         await store.snapshot()
                 except LockBusy:

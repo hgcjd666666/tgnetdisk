@@ -664,6 +664,8 @@ class Store:
         async with self.lock:
             cur = self.backend.get(p)
             if cur and not _force:
+                if not cur.is_dir:
+                    raise FileExistsError(f"同名文件已存在: {p}")
                 return cur
             await self._ensure_parents(p)
             self.backend.set_dir(p, int(time.time()))
