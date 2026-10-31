@@ -869,15 +869,29 @@ class Store:
         if full:
             # 扫到分片、但索引里没有任何条目认领的 hash → 收进 /lost+found（仿 ext4），别让数据凭空消失。
             # 注意：必须在 pending 补记之后做，否则上传中的记录会被误判成无主。
-            known = {e.hash for e in self.backend.all_entries().values()
-                     if not e.is_dir and e.hash}
-            orphan = {h: p for h, p in parts_by_hash.items() if h and h not in known and p}
+            # 认领关系按 (hash, 消息 id) 判定：同一 hash 可能有多批消息（重传过），
+            # 只看 hash 会把「hash 已认领、但这批消息 id 没被引用」的漏掉。
+            claimed = set()
+            for e in self.backend.all_entries().values():
+                if e.is_dir or not e.hash:
+                    continue
+                for v in e.parts.values():
+                    mid = v[0] if isinstance(v, (tuple, list)) else v
+                    claimed.add((e.hash, int(mid)))
+            orphan = {}
+            for h, parts in parts_by_hash.items():
+                if not h:
+                    continue
+                left = {idx: mid for idx, mid in parts.items() if (h, mid) not in claimed}
+                if left:
+                    orphan[h] = left
             if orphan:
                 now = int(time.time())
                 self.backend.set_dir("/lost+found", now)
                 for h, parts in orphan.items():
                     self.backend.set_file(f"/lost+found/{h}", h, 0, now, parts, 0, len(parts))
-                log.info("无主分片归入 /lost+found：%d 个", len(orphan))
+                log.info("无主消息归入 /lost+found：%d 个 hash，%d 片",
+                         len(orphan), sum(len(v) for v in orphan.values()))
         if snaps:
             self.snap_msg_id = max(s.id for s in snaps)
         log.info("扫描 %d 条消息，%d 个 hash，快照 %d 条", n, len(parts_by_hash), len(snaps))
