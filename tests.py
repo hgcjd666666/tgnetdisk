@@ -509,11 +509,60 @@ async def main():
                 assert st3.get("/dav/a.txt") is not None, "MOVE 到自身把文件弄丢了"
                 r = await cli.request("PROPFIND", "/dav", headers={"Depth": "1"})
                 assert r.status == 207 and "a.txt" in await r.text(), "PROPFIND 没列出文件"
+                await cli.put("/p/q/f.txt", data=b"q")
+                r = await cli.request("MOVE", "/p/q", headers={
+                    "Destination": str(cli.make_url("/p")), "Overwrite": "T"})
+                assert r.status == 409, f"MOVE 到祖先目录应 409，实际 {r.status}"
+                assert st3.get("/p/q/f.txt") is not None, "MOVE 到祖先把源子树删了"
         finally:
             if old is None:
                 os.environ.pop("ONLINE", None)
             else:
                 os.environ["ONLINE"] = old
+
+    async def t_move_ancestor():
+        await put_bytes(st, b"v", f"{D}/anc/sub/f")
+        for dst in (f"{D}/anc", f"{D}/anc/sub/..", "/"):
+            try:
+                await st.move(f"{D}/anc/sub", dst)
+                raise AssertionError(f"move 到祖先 {dst} 应被拒绝")
+            except OSError:
+                pass
+        assert st.get(f"{D}/anc/sub/f") is not None, "move 被拒绝但数据没了"
+        await st.delete(f"{D}/anc")
+
+    async def t_manual_named_snapshot():
+        if "--real" in sys.argv:
+            print("SKIP  同名快照用例只跑内存版")
+            return
+        await client.send_file(1, b"not-a-db",
+                               attributes=[SimpleNamespace(file_name="tgnd.db.xz")])
+        await st.sync(full=True)
+        p = "/lost+found/tgnd.db.xz"
+        assert st.get(p) is not None, "手动上传的同名文件被当成快照丢掉了"
+        await st.delete(p)
+
+    async def t_foreign_part_msg():
+        if "--real" in sys.argv:
+            print("SKIP  外来分片用例只跑内存版")
+            return
+        body = rand(2000)
+        await put_bytes(st, body, f"{D}/real")
+        e = st.get(f"{D}/real")
+        await client.send_file(1, b"junk",
+                               attributes=[SimpleNamespace(file_name=e.hash + ".0")])
+        await st.sync(full=True)
+        assert await get_bytes(st, f"{D}/real") == body, "同名外来消息覆盖了真实记录"
+        await st.delete(f"{D}/real")
+
+    async def t_ring_long_line():
+        import logger as lg
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "ring.log")
+        r = lg.RingLog(p, 256)
+        r.write("Z" * 400)                      # 单行比整个正文还长
+        txt = lg.read_log(p)
+        assert "Z" * 200 in txt, f"超长行被整条切掉了: {txt!r}"
 
     # ---- 分布式锁（快照 caption 即锁）：只有 --full 才走真实锁路径 ----
 
@@ -576,7 +625,9 @@ async def main():
         (".. 路径规范化", t_norm_dotdot), ("覆盖失败保留旧文件", t_overwrite_fail_keeps_old),
         ("父路径是文件", t_parent_is_file), ("append 记录总大小", t_append_total_size),
         ("13 片顺序", t_many_slices), ("lost+found 不参与秒传", t_lostfound_not_dedup_source),
-        ("引用计数按消息 id", t_refcount_dedup),
+        ("引用计数按消息 id", t_refcount_dedup), ("move 到祖先被拒", t_move_ancestor),
+        ("同名 tgnd.db.xz 不丢", t_manual_named_snapshot),
+        ("同名 hash.0 不覆盖", t_foreign_part_msg), ("环形超长行", t_ring_long_line),
         ("锁-空频道自建快照", t_lock_bootstrap), ("锁-重复acquire幂等", t_lock_reacquire),
         ("锁-双节点互斥", t_lock_busy),
     ]:

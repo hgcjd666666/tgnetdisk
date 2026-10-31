@@ -259,6 +259,10 @@ async def dav_move(request, store):
         return web.Response(status=400, text="no destination")
     if dst == src:
         return web.Response(status=204)          # 移到自己：什么都不用做
+    # 目标是自己祖先（含根）时，下面会先 delete(dst)——那会把源子树一起删掉。
+    # 必须在删除之前拦下来。
+    if dst == "/" or src.startswith(dst.rstrip("/") + "/"):
+        return web.Response(status=409, text="destination is an ancestor of source")
     if store.get(src) is None:
         return web.Response(status=404)
     ow = request.headers.get("Overwrite", "T").strip().upper()
@@ -282,6 +286,8 @@ async def dav_copy(request, store):
         return web.Response(status=400)
     if dst == src:
         return web.Response(status=403, text="copy onto itself")
+    if dst == "/" or src.startswith(dst.rstrip("/") + "/"):
+        return web.Response(status=409, text="destination is an ancestor of source")
     if store.get(src) is None:
         return web.Response(status=404)
     ow = request.headers.get("Overwrite", "T").strip().upper()

@@ -918,6 +918,9 @@ class Store:
         if d.startswith(s.rstrip("/") + "/"):
             # 移到自己的子树里：先写新路径再删旧路径，会把刚写的全删光
             raise OSError(f"不能把 {s} 移动到它自己的子目录 {d} 下")
+        if d == "/" or s.startswith(d.rstrip("/") + "/"):
+            # 目标是自己的祖先（含根）：WebDAV 层会先删目标再移动，整棵源子树跟着没了
+            raise OSError(f"不能把 {s} 移动到它的祖先目录 {d}")
         await self.ensure_fresh()
         if not self.backend.get(s):
             raise FileNotFoundError(s)
@@ -941,6 +944,8 @@ class Store:
             return
         if d.startswith(s.rstrip("/") + "/"):
             raise OSError(f"不能把 {s} 复制到它自己的子目录 {d} 下")
+        if d == "/" or s.startswith(d.rstrip("/") + "/"):
+            raise OSError(f"不能把 {s} 复制到它的祖先目录 {d}")
         await self.ensure_fresh()
         if not self.backend.get(s):
             raise FileNotFoundError(s)
@@ -1074,14 +1079,24 @@ class Store:
         snap_max, snap_cnt = 0, 0
         n = 0
         last = 0 if full else int(self.backend.get_meta("last_id", "0") or 0)
+        try:
+            pinned_id = await self._pinned_id()
+        except Exception:
+            pinned_id = None
         kw = {"reverse": True}
         if last:
             kw["min_id"] = last
         async for m in self.client.iter_messages(self.chat, limit=None, **kw):
             n += 1
             if is_db_msg(m):
-                snap_cnt += 1
-                snap_max = max(snap_max, m.id)
+                # 只有置顶的那条（或我们记下的 snap_msg_id）才是真快照。
+                # 手动上传一个碰巧叫 tgnd.db.xz 的文件不能被当成快照丢掉。
+                if (pinned_id is not None and m.id == pinned_id) or m.id == self.snap_msg_id:
+                    snap_cnt += 1
+                    snap_max = max(snap_max, m.id)
+                else:
+                    fname = doc_file_name(m)
+                    manual[m.id] = (fname, getattr(m.document, "size", 0))
                 continue
             nm = parse_name(m)
             if not nm:
@@ -1100,11 +1115,19 @@ class Store:
                 last = m.id
         for hash, parts in parts_by_hash.items():
             for opath, osize, oparts in self.backend.find_by_hash(hash):
-                if oparts != parts:
-                    e = self.backend.get(opath)
-                    # mtime 用原记录的：改成 now 会让 WebDAV 客户端以为文件被修改过而重传
-                    self.backend.set_file(opath, hash, osize,
-                                          e.mtime if e else int(time.time()), parts, 0, 0)
+                if oparts == parts:
+                    continue
+                # 正常 sync（消息被补或被删）必然与已有 parts 有交集；完全不重合
+                # 说明频道里混进了同名的外来消息（比如手动上传的文件恰好叫 hash.0），
+                # 拿它覆盖记录会把真实文件的内容换掉。
+                if oparts and not (set(part_ids(oparts)) & set(parts.values())):
+                    log.warning("hash %s 扫到的分片与索引记录完全不重合，跳过覆盖（疑似同名外来消息）",
+                                hash[:8])
+                    continue
+                e = self.backend.get(opath)
+                # mtime 用原记录的：改成 now 会让 WebDAV 客户端以为文件被修改过而重传
+                self.backend.set_file(opath, hash, osize,
+                                      e.mtime if e else int(time.time()), parts, 0, 0)
         self.backend.set_meta("last_id", last)
         for path, hash, expect, size, mtime in (self.backend.pending() if full else []):
             got = parts_by_hash.get(hash, {})
@@ -1594,8 +1617,14 @@ class Store:
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_dl_", suffix=".xz")
         os.close(fd)
         try:
-            await self.client.download_media(best, file=tmp)
-            self.backend.restore(tmp)
+            try:
+                await self.client.download_media(best, file=tmp)
+                self.backend.restore(tmp)
+            except Exception as e:
+                # 可能是同名的「手动上传」文件，或者快照本身损坏；restore 里已校验过，
+                # 失败时本地库保持不变，这里只告警不崩。
+                log.warning("快照载入失败（跳过，继续用本地库）: %s", e)
+                return False
             self.snap_msg_id = best.id
             self.snap_doc_id = getattr(getattr(best, "document", None), "id", 0)
             log.info("已从 TG 载入索引快照 (msg %d)", best.id)

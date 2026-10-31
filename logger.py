@@ -84,7 +84,9 @@ class RingLog:
     def write(self, line: str):
         data = (line.rstrip("\n") + "\n").encode("utf-8", "replace")
         if len(data) > self.body:
-            data = data[-self.body:]
+            # 只留尾部，并在前面补一个换行：正文里这一行就没有行首了，
+            # 否则 read_log 切掉「半行」时会把唯一的内容整条切空。
+            data = b"\n" + data[-(self.body - 1):]
         with self._lock:
             off = self.pos
             first = min(len(data), self.body - off)
