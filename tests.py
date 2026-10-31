@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from store import (Store, SqliteBackend, make_session, is_db_msg, norm,
+from store import (Store, SqliteBackend, make_session, is_db_msg, norm, digest_of,
                    LOCK_IDLE, LOCK_PREFIX, LockBusy)  # noqa: E402
 
 RESULTS = []
@@ -431,6 +431,50 @@ async def main():
         assert out == b"0123456789XY", f"append 内容不对: {out!r}"
         await st.delete(f"{D}/ap")
 
+    async def t_many_slices():
+        data = rand(12 * 1024 + 7)          # 13 片，跨过 "10" 的字符串排序坑
+        await put_bytes(st, data, f"{D}/many", slice_size=1024)
+        e = st.get(f"{D}/many")
+        assert len(e.parts) == 13, f"分片数 {len(e.parts)} != 13"
+        assert sorted(e.parts) == list(range(13)), f"parts 的 key 不是 int: {sorted(e.parts)[:5]}"
+        assert await get_bytes(st, f"{D}/many") == data, "多分片下载内容顺序错乱"
+        await st.delete(f"{D}/many")
+
+    async def t_lostfound_not_dedup_source():
+        body = rand(3000)
+        fd, tmp = tempfile.mkstemp()
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+        dig = digest_of(tmp)
+        os.unlink(tmp)
+        # 模拟「上传中断的残片被 reindex 收进 /lost+found」
+        m = await client.send_file(1, body,
+                                   attributes=[SimpleNamespace(file_name=dig + ".0")])
+        st.backend.set_dir("/lost+found", 1)
+        p_lf = "/lost+found/" + dig
+        st.backend.set_file(p_lf, dig, len(body), 1, {0: m.id}, 0, 1)
+        await put_bytes(st, body, f"{D}/after-rescue")
+        e = st.get(f"{D}/after-rescue")
+        assert e.size == len(body), f"秒传用了 lost+found 残片，记录 size={e.size}"
+        assert e.parts != {0: m.id}, "还是秒传命中了 lost+found 的残片"
+        assert await get_bytes(st, f"{D}/after-rescue") == body
+        await st.delete(p_lf)
+        assert m.id not in client._msgs, "残片消息没被清掉（引用计数按 hash 太粗）"
+        assert await get_bytes(st, f"{D}/after-rescue") == body, "删 lost+found 影响了真实文件"
+        await st.delete(f"{D}/after-rescue")
+
+    async def t_refcount_dedup():
+        data = rand(4000)
+        await put_bytes(st, data, f"{D}/rc1")
+        await put_bytes(st, data, f"{D}/rc2")
+        a, b = st.get(f"{D}/rc1"), st.get(f"{D}/rc2")
+        assert a.parts == b.parts, "秒传没共享分片"
+        mids = set(a.parts.values())
+        await st.delete(f"{D}/rc2")
+        assert all(mid in client._msgs for mid in mids), "删一个引用就把共享消息删了"
+        await st.delete(f"{D}/rc1")
+        assert all(mid not in client._msgs for mid in mids), "最后一个引用删了消息还留着"
+
     async def t_dav_basic():
         if "--real" in sys.argv:
             print("SKIP  WebDAV 用例只跑内存版")
@@ -531,6 +575,8 @@ async def main():
         ("缺分片必须报错", t_missing_slice), ("WebDAV 语义", t_dav_basic),
         (".. 路径规范化", t_norm_dotdot), ("覆盖失败保留旧文件", t_overwrite_fail_keeps_old),
         ("父路径是文件", t_parent_is_file), ("append 记录总大小", t_append_total_size),
+        ("13 片顺序", t_many_slices), ("lost+found 不参与秒传", t_lostfound_not_dedup_source),
+        ("引用计数按消息 id", t_refcount_dedup),
         ("锁-空频道自建快照", t_lock_bootstrap), ("锁-重复acquire幂等", t_lock_reacquire),
         ("锁-双节点互斥", t_lock_busy),
     ]:

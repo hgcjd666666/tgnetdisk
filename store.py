@@ -119,6 +119,26 @@ def part_ids(parts: dict) -> list:
     return [part_id(v) for _, v in sorted((parts or {}).items())]
 
 
+def load_parts(s: str) -> dict:
+    """从 JSON 还原 parts。key 在 JSON 里只能是字符串，必须转回 int——
+    否则 sorted(parts) 会按 "0","1","10","2" 排序，10 片以上的文件下载顺序直接错乱。"""
+    try:
+        d = json.loads(s or "{}")
+    except Exception:
+        return {}
+    try:
+        return {int(k): v for k, v in d.items()}
+    except (TypeError, ValueError):
+        return {}
+
+
+def dump_parts(parts: dict) -> str:
+    """序列化 parts（key 统一成 int 再交给 json）。"""
+    if not parts:
+        return "{}"
+    return json.dumps({int(k): v for k, v in parts.items()})
+
+
 def is_path_session(val: str) -> bool:
     return val.startswith("/") or val.startswith("./") or val.endswith(".session") or "/" in val
 
@@ -401,7 +421,7 @@ class SqliteBackend(Backend):
         r = self.db.execute(
             "select path,hash,size,mtime,parts,status,expect from files where path=?", (p,)).fetchone()
         if r:
-            return Entry(r[0], False, r[3], r[1], r[2], json.loads(r[4] or "{}"), r[5], r[6])
+            return Entry(r[0], False, r[3], r[1], r[2], load_parts(r[4]), r[5], r[6])
         r = self.db.execute("select path,mtime from dirs where path=?", (p,)).fetchone()
         if r:
             return Entry(r[0], True, r[1])
@@ -426,7 +446,7 @@ class SqliteBackend(Backend):
             rest = row[0][len(pre):]
             if rest and "/" not in rest:
                 out.append(Entry(row[0], False, row[3], row[1], row[2],
-                                 json.loads(row[4] or "{}"), row[5], row[6]))
+                                 load_parts(row[4]), row[5], row[6]))
         out.sort(key=lambda x: (not x.is_dir, x.name.lower()))
         return out
 
@@ -436,14 +456,14 @@ class SqliteBackend(Backend):
             out[p] = Entry(p, True, m)
         for p, hash, size, mtime, parts, st, ex in self.db.execute(
                 "select path,hash,size,mtime,parts,status,expect from files"):
-            out[p] = Entry(p, False, mtime, hash, size, json.loads(parts or "{}"), st, ex)
+            out[p] = Entry(p, False, mtime, hash, size, load_parts(parts), st, ex)
         return out
 
     def set_file(self, path, hash, size, mtime, parts, status=0, expect=0):
         self.db.execute(
             "insert or replace into files(path,hash,size,mtime,parts,status,expect)"
             " values(?,?,?,?,?,?,?)",
-            (norm(path), hash, size, mtime, json.dumps(parts), status, expect))
+            (norm(path), hash, size, mtime, dump_parts(parts), status, expect))
         self.db.commit()
 
     def pending(self):
@@ -484,7 +504,7 @@ class SqliteBackend(Backend):
         self.db.commit()
 
     def find_by_hash(self, hash):
-        return [(r[0], r[1], json.loads(r[2] or "{}")) for r in self.db.execute(
+        return [(r[0], r[1], load_parts(r[2])) for r in self.db.execute(
             "select path,size,parts from files where hash=?", (hash,))]
 
     def paths_under(self, prefix):
@@ -739,12 +759,13 @@ class Store:
 
             if digest and not append:
                 for opath, osize, oparts in self.backend.find_by_hash(digest):
-                    if oparts:
-                        self.backend.set_file(p, digest, osize, mt, oparts, 0, 0)
-                        self.dirty = True
-                        log.info("秒传命中 %s (hash %s) ← %s", p, digest[:8], opath)
-                        await self._release_hash(old)
-                        return self.backend.get(p)
+                    if not self._dedup_source_ok(opath, osize, oparts):
+                        continue
+                    self.backend.set_file(p, digest, osize, mt, oparts, 0, 0)
+                    self.dirty = True
+                    log.info("秒传命中 %s (hash %s) ← %s", p, digest[:8], opath)
+                    await self._release_hash(old)
+                    return self.backend.get(p)
 
             parts = {}
             if append and old and not old.is_dir:
@@ -799,10 +820,11 @@ class Store:
                 self._replaced[p] = old
             if digest:
                 for opath, osize, oparts in self.backend.find_by_hash(digest):
-                    if oparts:
-                        self.backend.set_file(p, digest, osize, mt, dict(oparts), 0, 0)
-                        self.dirty = True
-                        return self.backend.get(p)
+                    if not self._dedup_source_ok(opath, osize, oparts):
+                        continue
+                    self.backend.set_file(p, digest, osize, mt, dict(oparts), 0, 0)
+                    self.dirty = True
+                    return self.backend.get(p)
             nparts = max(1, (size + SLICE - 1) // SLICE) if size else 0
             self.backend.set_file(p, digest, size, mt, {}, 1, nparts)
             self.dirty = True
@@ -830,15 +852,38 @@ class Store:
             await self._release_hash(old)
         return self.backend.get(p)
 
+    @staticmethod
+    def _dedup_source_ok(opath: str, osize: int, parts: dict) -> bool:
+        """能不能拿这条记录当秒传源。
+
+        /lost+found 里的是 reindex 捡回来的残片（size 记 0、分片可能不全），
+        拿它秒传会造出缺片的记录；上传中的记录（status=1）parts 也还没提交。
+        """
+        if not parts or not osize or osize <= 0:
+            return False
+        if norm(opath).startswith("/lost+found/"):
+            return False
+        return True
+
     async def _release_hash(self, e):
-        """条目 e 的内容已经不被任何路径引用时，删掉它在 TG 上的分片消息。"""
+        """删掉条目 e 的分片消息——只删「没有任何其他条目引用」的那些 id。
+
+        引用计数按消息 id 而不是按 hash：同一 hash 可能有重传的多个批次，
+        粗粒度按 hash 会让旧批次残片永远删不掉（重传用的已经是新消息）。
+        """
         if not e or e.is_dir or not e.parts:
             return
-        left = [x for x in self.backend.find_by_hash(e.hash) if x[2]]
-        if left:
+        mine = part_ids(e.parts)
+        if not mine:
             return
-        await self._del_ids(part_ids(e.parts))
-        log.info("删除 %s 的 %d 个分片消息", e.path, len(e.parts))
+        referenced = set()
+        for _, _, oparts in self.backend.find_by_hash(e.hash):
+            referenced.update(part_ids(oparts))
+        doomed = [mid for mid in mine if mid not in referenced]
+        if not doomed:
+            return
+        await self._del_ids(doomed)
+        log.info("删除 %s 的 %d 个分片消息", e.path, len(doomed))
 
     async def _drop(self, path: str, hard=True):
         """删记录；hard 时若该 hash 没有别的路径引用，连 TG 消息一起删。"""
@@ -1024,6 +1069,7 @@ class Store:
     async def sync(self, full: bool = True):
         """扫描 TG 消息，补全 hash → 分片映射，并记录最新快照消息。"""
         parts_by_hash = {}
+        size_by_hash = {}                 # 每个 hash 扫到的分片总字节数，收编 lost+found 时用
         manual = {}
         snap_max, snap_cnt = 0, 0
         n = 0
@@ -1046,6 +1092,8 @@ class Store:
                 continue
             hash, idx = nm
             parts_by_hash.setdefault(hash, {})[idx] = m.id
+            size_by_hash[hash] = size_by_hash.get(hash, 0) + int(
+                getattr(getattr(m, "document", None), "size", 0) or 0)
             if m.id > self.last_id:
                 self.last_id = m.id
             if m.id > last:
@@ -1096,7 +1144,9 @@ class Store:
                 now = int(time.time())
                 self.backend.set_dir("/lost+found", now)
                 for h, parts in orphan.items():
-                    self.backend.set_file(f"/lost+found/{h}", h, 0, now, parts, 0, len(parts))
+                    # size 用扫到的分片总字节：记 0 的话下载时没法校验完整性
+                    self.backend.set_file(f"/lost+found/{h}", h, size_by_hash.get(h, 0),
+                                          now, parts, 0, len(parts))
                 log.info("无主消息归入 /lost+found：%d 个 hash，%d 片",
                          len(orphan), sum(len(v) for v in orphan.values()))
         if snap_max:
