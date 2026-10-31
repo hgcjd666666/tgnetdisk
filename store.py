@@ -1036,40 +1036,6 @@ class Store:
             except Exception as e:
                 log.warning("删除消息失败: %s", e)
 
-    # ---------- 清理 ----------
-    async def gc(self, dry_run: bool = True):
-        """只读体检：报告 TG 上暂时没人引用的分片消息 + 索引里指向已不存在消息的记录。
-
-        不再删除任何东西。无主消息由 sync() 统一收进 /lost+found 兜底，
-        在这里删等于把「上传中断、但还能救」的数据直接抹掉；索引记录指向的消息
-        已经没了，留着这条记录反而能看出丢过什么，删掉只会掩盖问题。
-        dry_run 参数仅为兼容旧调用保留，永远只读。
-        """
-        async with self.mutex:
-            live = {}
-            async for m in self.client.iter_messages(self.chat):
-                nm = parse_name(m)
-                if nm:
-                    live[m.id] = nm
-                    continue
-                # 手动上传（原文件名）的消息也是存在的消息：值记 None 表示「不是分片」。
-                fname = doc_file_name(m)
-                if fname and not is_db_msg(m):
-                    live[m.id] = None
-            used, missing = set(), []
-            for e in self.backend.all_entries().values():
-                if e.is_dir or not e.parts:
-                    continue
-                mids = {part_id(v) for v in e.parts.values()}
-                used |= mids
-                if any(mid not in live for mid in mids):
-                    missing.append(e.path)
-            # 孤儿只可能是「hash.序号」命名的分片消息，手动上传的不算
-            orphans = sorted(mid for mid, nm in live.items() if nm and mid not in used)
-            log.info("TG 文件消息 %d，被引用 %d，孤儿 %d，无效记录 %d（只读，不删除）",
-                     len(live), len(used), len(orphans), len(missing))
-            return orphans, missing
-
     # ---------- 同步 / 快照 ----------
     async def sync(self, full: bool = True):
         """扫描 TG 消息，补全 hash → 分片映射，并记录最新快照消息。"""

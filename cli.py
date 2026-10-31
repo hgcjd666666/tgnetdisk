@@ -12,7 +12,6 @@
   tgnd mv <源> <目标>
   tgnd cp <源> <目标>
   tgnd stat <路径>
-  tgnd gc                   只读体检：报告没人引用的消息/失效记录（不删除，无主消息由 reindex 归入 /lost+found）
   tgnd export-sql [文件.sql]     导出索引为 SQL 文本
   tgnd import-sql <文件.sql>     从 SQL 文本重建索引
   tgnd reindex              全量扫聊天记录重建索引（正常不需要）
@@ -572,14 +571,6 @@ async def main():
             await cmd_export_sql(st, args)
         elif cmd == "import-sql":
             await cmd_import_sql(st, args)
-        elif cmd == "gc":
-            # 只读体检：孤儿消息交给 sync 收进 /lost+found，这里不做任何删除
-            orphans, missing = await st.gc()
-            log(f"孤儿消息 {len(orphans)} 条，无效记录 {len(missing)} 条（只读，不删除）")
-            if orphans:
-                log("  无主消息用 `tgnd reindex` 归入 /lost+found")
-            for p in missing[:20]:
-                log("  无效记录:", p)
         elif cmd == "reindex":
             n = await st.sync(full=True)
             log(f"已扫描 {n} 条消息重建索引")
