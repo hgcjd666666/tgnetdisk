@@ -132,6 +132,18 @@ def parse_lock(msg):
         return "", 0.0
 
 
+def doc_file_name(msg):
+    """取消息里文件的原始文件名（手动上传的那些没按 hash 命名）。"""
+    doc = getattr(msg, "document", None)
+    if doc is None:
+        return ""
+    for a in doc.attributes:
+        fn = getattr(a, "file_name", None)
+        if fn:
+            return fn
+    return ""
+
+
 def parse_name(msg):
     """文件名 "<hash>.<序号>" → (hash, 序号)。"""
     doc = getattr(msg, "document", None)
@@ -776,16 +788,31 @@ class Store:
             self.dirty = True
 
     # ---------- 读取内容 ----------
-    async def iter_content(self, path: str):
+    async def iter_content(self, path: str, verify: bool = True):
+        """按分片顺序流式吐出内容；verify=True 时边下边算 hash，结束时跟索引比对。"""
         e = self.backend.get(path)
         if not e or e.is_dir or e.status == 1:
             raise FileNotFoundError(path)
+        h = hashlib.shake_128()
+        got = 0
         for k in sorted(e.parts):
-            m = await self.client.get_messages(self.chat, ids=e.parts[k])
+            v = e.parts[k]
+            mid = v[0] if isinstance(v, (tuple, list)) else v
+            m = await self.client.get_messages(self.chat, ids=mid)
             if not m or not getattr(m, "document", None):
+                log.warning("分片缺失: %s idx=%s msg=%s", path, k, mid)
                 continue
             async for piece in self.client.iter_download(m):
+                h.update(piece)
+                got += len(piece)
                 yield piece
+        if verify and e.hash:
+            d = h.hexdigest(16)
+            if d != e.hash:
+                log.warning("下载校验不一致: %s 期望 %s 实际 %s（%d 字节 / 记录 %s 字节）",
+                            path, e.hash, d, got, e.size)
+            elif e.size and got != e.size:
+                log.warning("下载大小不符: %s 实际 %d / 记录 %d", path, got, e.size)
 
     async def download_to_temp(self, path: str) -> str:
         fd, tmp = tempfile.mkstemp(prefix="tgnd_dl_")
@@ -836,6 +863,7 @@ class Store:
     async def sync(self, full: bool = True):
         """扫描 TG 消息，补全 hash → 分片映射，并记录最新快照消息。"""
         parts_by_hash = {}
+        manual = {}
         snaps = []
         n = 0
         last = 0 if full else int(self.backend.get_meta("last_id", "0") or 0)
@@ -849,6 +877,10 @@ class Store:
                 continue
             nm = parse_name(m)
             if not nm:
+                fname = doc_file_name(m)
+                # 索引快照、锁文件是我们自己的，不算手动上传
+                if fname and not fname.startswith("tgnd.") and not is_db_msg(m):
+                    manual[m.id] = (fname, getattr(m.document, "size", 0))
                 continue
             hash, idx = nm
             parts_by_hash.setdefault(hash, {})[idx] = m.id
@@ -885,6 +917,17 @@ class Store:
                 left = {idx: mid for idx, mid in parts.items() if (h, mid) not in claimed}
                 if left:
                     orphan[h] = left
+            if manual:
+                now = int(time.time())
+                self.backend.set_dir("/lost+found", now)
+                for mid, (fname, msize) in manual.items():
+                    p = f"/lost+found/{fname}"
+                    k = 1
+                    while self.backend.get(p):
+                        p = f"/lost+found/{fname}.{k}"
+                        k += 1
+                    self.backend.set_file(p, "", msize, now, {0: mid}, 0, 1)
+                log.info("手动上传的消息归入 /lost+found：%d 个", len(manual))
             if orphan:
                 now = int(time.time())
                 self.backend.set_dir("/lost+found", now)
