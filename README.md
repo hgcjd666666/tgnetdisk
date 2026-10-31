@@ -89,9 +89,8 @@ python cli.py pushdir -x cache -x '*.tmp' /data/music /backup/music   # 排除
 ### 维护
 
 ```bash
-python cli.py reindex        # 重新扫 TG 重建索引（索引丢了/换机器时用）
-python cli.py gc --dry-run   # 看有哪些文件消息没人引用
-python cli.py gc             # 真删掉
+python cli.py reindex        # 重新扫 TG 重建索引（索引丢了/换机器时用），无主消息会归入 /lost+found
+python cli.py gc             # 只读体检：报告没人引用的消息和失效记录，不删任何东西
 ```
 
 ## WebDAV

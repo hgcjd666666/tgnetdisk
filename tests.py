@@ -290,8 +290,13 @@ async def main():
         assert st.children(f"{D}/mdir") == []
 
     async def t_gc():
-        orphans, missing = await st.gc(dry_run=True)
-        assert missing == [] or all(isinstance(x, str) for x in missing)
+        # gc 是只读体检：无论怎么调都不许删消息/删记录
+        before_msgs = dict(client._msgs)
+        before = {e.path for e in st.backend.all_entries().values()}
+        orphans, missing = await st.gc()
+        assert isinstance(orphans, list) and isinstance(missing, list)
+        assert set(client._msgs) == set(before_msgs), "gc 删掉了 TG 消息"
+        assert {e.path for e in st.backend.all_entries().values()} == before, "gc 改了索引"
 
     async def t_reindex():
         before = st.get(f"{D}/one")
@@ -326,14 +331,14 @@ async def main():
 
     async def t_gc_manual():
         if "--real" in sys.argv:
-            print("SKIP  gc 删除用例只跑内存版（真频道上不敢删）")
+            print("SKIP  手动上传用例只跑内存版（会往真频道发消息）")
             return
         m = await client.send_file(1, b"manual-bytes",
                                    attributes=[SimpleNamespace(file_name="manual-photo.jpg")])
         await st.sync(full=True)
         p = "/lost+found/manual-photo.jpg"
         assert st.get(p) is not None, "手动上传没归入 /lost+found"
-        _, missing = await st.gc(dry_run=False)
+        _, missing = await st.gc()
         assert st.get(p) is not None, f"gc 把手动上传的记录当 missing 删了: {missing}"
         assert m.id in client._msgs, "gc 删掉了手动上传的 TG 消息"
         await st.delete(p)
@@ -520,7 +525,7 @@ async def main():
         ("特殊字符", t_special), ("深目录", t_deep), ("多分片7片", t_multislice),
         ("秒传共享分片", t_dedup), ("同名覆盖", t_overwrite), ("cp+mv", t_copy_move),
         ("删除文件", t_delete), ("递归删目录", t_rmdir), ("mkdir+空目录", t_mkdir),
-        ("gc 预览", t_gc), ("reindex 全量", t_reindex),
+        ("gc 只读体检", t_gc), ("reindex 全量", t_reindex),
         ("emoji 路径", t_emoji_path), ("move 自覆盖保护", t_move_guard),
         ("gc 不删手动上传", t_gc_manual), ("历史分片格式", t_part_list_format),
         ("缺分片必须报错", t_missing_slice), ("WebDAV 语义", t_dav_basic),
