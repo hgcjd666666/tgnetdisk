@@ -233,9 +233,11 @@ def read_log(path: str) -> str:
     except Exception:
         return raw[HDR_LEN:].decode("utf-8", "replace")
     seq = body[p:] + body[:p]
-    # p == 0 说明最后一次写正好停在正文末尾：此时 body[p:] 全是按顺序的新数据，
-    # 不能当成「绕圈后只剩半行」而把第一条完整日志切掉。
-    if p and body[p:].strip(b"\0"):    # 指针后面还有旧数据 = 已经绕圈了，开头必是半行
+    # 指针后面还有旧数据 = 已经绕圈了，开头只可能是跨尾写入的后半截。
+    # p == 0 时同样无法区分「0 处是某次写入的完整行首」还是「绕尾续写的半行」，
+    # 所以一律切掉第一行：代价是最坏情况下丢一条完整日志，
+    # 换来的是输出永远不会从半行开始（环形日志的设计取舍，别当 bug 改）。
+    if body[p:].strip(b"\0"):
         cut = seq.find(b"\n")
         if cut >= 0:
             seq = seq[cut + 1:]
