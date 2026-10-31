@@ -296,6 +296,16 @@ class Backend(abc.ABC):
     def set_dir(self, path: str, mtime: int): ...
 
     @abc.abstractmethod
+    def existing_dirs(self, paths: list) -> set:
+        """给一批目录路径，返回其中已存在的那些。"""
+        ...
+
+    @abc.abstractmethod
+    def add_dirs(self, paths: list, mtime: int):
+        """批量创建目录（幂等）。"""
+        ...
+
+    @abc.abstractmethod
     def remove(self, path: str): ...
 
     @abc.abstractmethod
@@ -417,6 +427,20 @@ class SqliteBackend(Backend):
         self.db.execute("insert into meta(k,v) values(?,?) "
                         "on conflict(k) do update set v=?", (k, str(v), str(v)))
         self.db.commit()
+
+    def existing_dirs(self, paths):
+        if not paths:
+            return set()
+        q = ",".join("?" * len(paths))
+        return {r[0] for r in self.db.execute(
+            f"select path from dirs where path in ({q})", list(paths))}
+
+    def add_dirs(self, paths, mtime):
+        if not paths:
+            return
+        self.db.executemany(
+            "insert or replace into dirs(path,mtime) values(?,?)",
+            [(norm(p), mtime) for p in paths])
 
     def set_dir(self, path, mtime):
         self.db.execute("insert or replace into dirs(path,mtime) values(?,?)", (norm(path), mtime))
@@ -557,14 +581,18 @@ class Store:
 
     # ---------- 写入 ----------
     async def _ensure_parents(self, p: str):
+        """把 p 的各级父目录补进索引。一次查全链，缺的一次插完。"""
         par = parent_of(p)
         chain = []
         while par and par != "/":
             chain.append(par)
             par = parent_of(par)
-        for d in reversed(chain):
-            if not self.backend.get(d):
-                self.backend.set_dir(d, int(time.time()))
+        if not chain:
+            return
+        have = self.backend.existing_dirs(chain)
+        missing = [d for d in reversed(chain) if d not in have]
+        if missing:
+            self.backend.add_dirs(missing, int(time.time()))
 
     async def mkdir(self, path: str, _force=False):
         p = norm(path)
@@ -870,7 +898,7 @@ class Store:
         """扫描 TG 消息，补全 hash → 分片映射，并记录最新快照消息。"""
         parts_by_hash = {}
         manual = {}
-        snaps = []
+        snap_max, snap_cnt = 0, 0
         n = 0
         last = 0 if full else int(self.backend.get_meta("last_id", "0") or 0)
         kw = {"reverse": True}
@@ -879,7 +907,8 @@ class Store:
         async for m in self.client.iter_messages(self.chat, limit=None, **kw):
             n += 1
             if is_db_msg(m):
-                snaps.append(m)
+                snap_cnt += 1
+                snap_max = max(snap_max, m.id)
                 continue
             nm = parse_name(m)
             if not nm:
@@ -941,10 +970,36 @@ class Store:
                     self.backend.set_file(f"/lost+found/{h}", h, 0, now, parts, 0, len(parts))
                 log.info("无主消息归入 /lost+found：%d 个 hash，%d 片",
                          len(orphan), sum(len(v) for v in orphan.values()))
-        if snaps:
-            self.snap_msg_id = max(s.id for s in snaps)
-        log.info("扫描 %d 条消息，%d 个 hash，快照 %d 条", n, len(parts_by_hash), len(snaps))
+        if snap_max:
+            self.snap_msg_id = snap_max
+        log.info("扫描 %d 条消息，%d 个 hash，快照 %d 条", n, len(parts_by_hash), snap_cnt)
         return n
+
+    async def _push_snapshot(self, tmp: str, caption: str):
+        """把压缩好的快照推上去：能就地替换置顶那条就替换，否则新发一条并置顶。
+
+        返回 (msg, replaced)：msg 是消息对象或已有消息 id，replaced 表示是否原地替换。
+        """
+        if self.snap_msg_id:
+            try:
+                await self.client.edit_message(
+                    self.chat, self.snap_msg_id, file=tmp, force_document=True,
+                    attributes=[DocumentAttributeFilename(DB_NAME)], text=caption)
+                return self.snap_msg_id, True
+            except Exception as e:
+                log.warning("就地替换失败，改为新发一条: %s", e)
+        msg = await self.client.send_file(
+            self.chat, tmp, force_document=True, caption=caption,
+            attributes=[DocumentAttributeFilename(DB_NAME)])
+        old = self.snap_msg_id
+        self.snap_msg_id = msg.id
+        if old and old != msg.id:
+            await self._del_ids([old])
+        try:
+            await self.client.pin_message(self.chat, msg, notify=False)
+        except Exception as e:
+            log.warning("置顶失败: %s", e)
+        return msg, False
 
     async def snapshot(self, final: bool = False):
         """把索引压成快照传到 TG，置顶并删掉旧的。
@@ -958,34 +1013,14 @@ class Store:
         try:
             self.backend.dump(tmp)
             size = os.path.getsize(tmp)
-            if self.snap_msg_id:
-                try:
-                    await self.client.edit_message(
-                        self.chat, self.snap_msg_id, file=tmp, force_document=True,
-                        attributes=[DocumentAttributeFilename(DB_NAME)],
-                        text=cap)
-                    if final:
-                        self._holding = False
-                    self.dirty = False
-                    log.info("索引快照已就地替换 (msg %d, %d 字节)", self.snap_msg_id, size)
-                    return None
-                except Exception as e:
-                    log.warning("就地替换失败，改为新发一条: %s", e)
-            msg = await self.client.send_file(
-                self.chat, tmp, force_document=True, caption=cap,
-                attributes=[DocumentAttributeFilename(DB_NAME)])
+            msg, replaced = await self._push_snapshot(tmp, cap)
             if final:
                 self._holding = False
-            old = self.snap_msg_id
-            self.snap_msg_id = msg.id
-            if old and old != msg.id:
-                await self._del_ids([old])
-            try:
-                await self.client.pin_message(self.chat, msg, notify=False)
-            except Exception as e:
-                log.warning("置顶失败: %s", e)
             self.dirty = False
-            log.info("索引快照已上传 (msg %d, %d 字节)", msg.id, os.path.getsize(tmp))
+            if replaced:
+                log.info("索引快照已就地替换 (msg %s, %d 字节)", msg, size)
+                return None
+            log.info("索引快照已上传 (msg %d, %d 字节)", msg.id, size)
             return msg
         finally:
             try:
@@ -1009,32 +1044,12 @@ class Store:
             if is_online():
                 await self.acquire()
             try:
-                if self.snap_msg_id:
-                    try:
-                        await self.client.edit_message(
-                            self.chat, self.snap_msg_id, file=tmp, force_document=True,
-                            attributes=[DocumentAttributeFilename(DB_NAME)], text=LOCK_IDLE)
-                        self._holding = False
-                        self.dirty = False
-                        log.info("快照已就地替换并放锁 (msg %d, %d 字节)", self.snap_msg_id, size)
-                        return self.snap_msg_id
-                    except Exception as e:
-                        log.warning("就地替换失败，改为新发一条: %s", e)
-                msg = await self.client.send_file(
-                    self.chat, tmp, force_document=True, caption=LOCK_IDLE,
-                    attributes=[DocumentAttributeFilename(DB_NAME)])
-                old = self.snap_msg_id
-                self.snap_msg_id = msg.id
-                if old and old != msg.id:
-                    await self._del_ids([old])
-                try:
-                    await self.client.pin_message(self.chat, msg, notify=False)
-                except Exception as e:
-                    log.warning("置顶失败: %s", e)
+                msg, replaced = await self._push_snapshot(tmp, LOCK_IDLE)
                 self._holding = False
                 self.dirty = False
-                log.info("索引快照已上传并放锁 (msg %d, %d 字节)", msg.id, size)
-                return msg.id
+                mid = msg if replaced else msg.id
+                log.info("快照已%s并放锁 (msg %s, %d 字节)", "就地替换" if replaced else "上传", mid, size)
+                return mid
             finally:
                 if is_online() and self._holding:
                     await self.release()
