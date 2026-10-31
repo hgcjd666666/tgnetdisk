@@ -369,18 +369,23 @@ class SqliteBackend(Backend):
         return None
 
     def children(self, path):
+        """列直接子项。用 path 上的范围扫描而不是全表 LIKE，列表页不再随库增长变慢。"""
         p = norm(path)
-        prefix = p.rstrip("/") + "/"
-        names = [x[0] for x in self.db.execute("select path from dirs")] + \
-                [x[0] for x in self.db.execute("select path from files")]
+        pre = (p.rstrip("/") or "") + "/"
+        hi = pre + "\uffff"
         out = []
-        for k in names:
-            if k == p or not k.startswith(prefix):
-                continue
-            if "/" not in k[len(prefix):]:
-                e = self.get(k)
-                if e:
-                    out.append(e)
+        for k, m in self.db.execute(
+                "select path,mtime from dirs where path>=? and path<?", (pre, hi)):
+            rest = k[len(pre):]
+            if rest and "/" not in rest:
+                out.append(Entry(k, True, m))
+        for row in self.db.execute(
+                "select path,hash,size,mtime,parts,status,expect from files"
+                " where path>=? and path<?", (pre, hi)):
+            rest = row[0][len(pre):]
+            if rest and "/" not in rest:
+                out.append(Entry(row[0], False, row[3], row[1], row[2],
+                                 json.loads(row[4] or "{}"), row[5], row[6]))
         out.sort(key=lambda x: (not x.is_dir, x.name.lower()))
         return out
 
@@ -430,8 +435,11 @@ class SqliteBackend(Backend):
     def paths_under(self, prefix):
         prefix = norm(prefix)
         pre = prefix.rstrip("/") + "/"
-        out = [x[0] for x in self.db.execute("select path from dirs where path=? or path like ?", (prefix, pre + "%"))]
-        out += [x[0] for x in self.db.execute("select path from files where path=? or path like ?", (prefix, pre + "%"))]
+        hi = pre + "\uffff"
+        out = [x[0] for x in self.db.execute(
+            "select path from dirs where path=? or (path>=? and path<?)", (prefix, pre, hi))]
+        out += [x[0] for x in self.db.execute(
+            "select path from files where path=? or (path>=? and path<?)", (prefix, pre, hi))]
         return out
 
     def dump(self, dst):
@@ -570,6 +578,40 @@ class Store:
             self.dirty = True
             return self.backend.get(p)
 
+    async def _send_slices(self, local_path: str, tag: str, base_idx: int,
+                           size: int, parts: dict, S: int) -> int:
+        """把本地文件按 S 切片发上 TG，边发边填 parts，返回发出的片数。
+
+        put_file 和 upload_pending 的字节传输完全一样，抽出来免得两处各改一遍。
+        """
+        async def send(src, idx_no):
+            attrs = [DocumentAttributeFilename(f"{tag}.{idx_no}")]
+            try:
+                ref = await upload_parallel(self.client, src)
+            except Exception as ex:
+                log.warning("并行上传失败，退回顺序: %s", ex)
+                msg = await self.client.send_file(self.chat, src, force_document=True,
+                                                  attributes=attrs)
+            else:
+                msg = await self.client.send_file(self.chat, ref, force_document=True,
+                                                  attributes=attrs)
+            parts[idx_no] = msg.id
+            self.last_id = max(self.last_id, msg.id)
+            return msg
+
+        if size <= S:
+            await send(local_path, base_idx)
+            return 1
+        n = 0
+        pos = 0
+        with open(local_path, "rb") as f:
+            while pos < size:
+                length = min(S, size - pos)
+                await send(SliceReader(f, pos, length), base_idx + n)
+                pos += length
+                n += 1
+        return n
+
     async def put_file(self, path: str, local_path: str, mtime: int | None = None,
                        slice_size: int | None = None, append: bool = False,
                        start_index: int | None = None, skip_same: bool = False):
@@ -619,33 +661,7 @@ class Store:
             self.dirty = True
 
         # 阶段二：真正把字节传上 TG，这段时间不持锁
-        async def send(src, idx_no):
-            attrs = [DocumentAttributeFilename(f"{tag}.{idx_no}")]
-            try:
-                ref = await upload_parallel(self.client, src)
-            except Exception as ex:
-                log.warning("并行上传失败，退回顺序: %s", ex)
-                msg = await self.client.send_file(self.chat, src, force_document=True,
-                                                  attributes=attrs)
-            else:
-                msg = await self.client.send_file(self.chat, ref, force_document=True,
-                                                  attributes=attrs)
-            parts[idx_no] = msg.id
-            self.last_id = max(self.last_id, msg.id)
-            return msg
-
-        if size <= S and not append:
-            await send(local_path, base_idx)
-        else:
-            n = 0
-            pos = 0
-            with open(local_path, "rb") as f:
-                while pos < size:
-                    length = min(S, size - pos)
-                    await send(SliceReader(f, pos, length), base_idx + n)
-                    pos += length
-                    n += 1
-                    log.info("分片 %d 完成 (%d 字节)", base_idx + n - 1, length)
+        await self._send_slices(local_path, tag, base_idx, size, parts, S)
 
         # 阶段三：提交结果，锁只在这几百毫秒内再持一次
         async with self.lock:
@@ -691,31 +707,8 @@ class Store:
         S = SLICE
         parts: dict[int, int] = {}
 
-        async def send(src, idx_no):
-            attrs = [DocumentAttributeFilename(f"{tag}.{idx_no}")]
-            try:
-                ref = await upload_parallel(self.client, src)
-            except Exception as ex:
-                log.warning("并行上传失败，退回顺序: %s", ex)
-                msg = await self.client.send_file(self.chat, src, force_document=True, attributes=attrs)
-            else:
-                msg = await self.client.send_file(self.chat, ref, force_document=True, attributes=attrs)
-            parts[idx_no] = msg.id
-            self.last_id = max(self.last_id, msg.id)
-
-        if size == 0:
-            pass
-        elif size <= S:
-            await send(local_path, 0)
-        else:
-            n = 0
-            pos = 0
-            with open(local_path, "rb") as f:
-                while pos < size:
-                    length = min(S, size - pos)
-                    await send(SliceReader(f, pos, length), n)
-                    pos += length
-                    n += 1
+        if size:
+            await self._send_slices(local_path, tag, 0, size, parts, S)
         async with self.mutex:
             self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts))
             self.dirty = True
@@ -795,17 +788,30 @@ class Store:
             raise FileNotFoundError(path)
         h = hashlib.shake_128()
         got = 0
+        # 分片按序号排好，再按批预取消息对象：一片一次 get_messages 的话，
+        # 一个 20 片的大文件光取消息就要 20 个 RTT（到 DC4 单程 250ms）。
+        order = []
         for k in sorted(e.parts):
             v = e.parts[k]
-            mid = v[0] if isinstance(v, (tuple, list)) else v
-            m = await self.client.get_messages(self.chat, ids=mid)
-            if not m or not getattr(m, "document", None):
-                log.warning("分片缺失: %s idx=%s msg=%s", path, k, mid)
-                continue
-            async for piece in self.client.iter_download(m):
-                h.update(piece)
-                got += len(piece)
-                yield piece
+            order.append((k, v[0] if isinstance(v, (tuple, list)) else v))
+        batch = 50
+        for i in range(0, len(order), batch):
+            chunk = order[i:i + batch]
+            try:
+                msgs = await self.client.get_messages(self.chat, ids=[mid for _, mid in chunk])
+            except Exception as ex:
+                log.warning("取分片消息失败 %s: %s", path, ex)
+                msgs = []
+            by_id = {m.id: m for m in (msgs or []) if m}
+            for k, mid in chunk:
+                m = by_id.get(mid)
+                if not m or not getattr(m, "document", None):
+                    log.warning("分片缺失: %s idx=%s msg=%s", path, k, mid)
+                    continue
+                async for piece in self.client.iter_download(m):
+                    h.update(piece)
+                    got += len(piece)
+                    yield piece
         if verify and e.hash:
             d = h.hexdigest(16)
             if d != e.hash:
