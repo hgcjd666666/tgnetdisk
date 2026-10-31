@@ -9,21 +9,19 @@ import asyncio
 import base64
 import json
 import logging
-import hashlib
 import os
 import sys
-import tempfile
 import time
 import uuid
-from email.utils import formatdate, parsedate_to_datetime
+from email.utils import formatdate
 from urllib.parse import quote, unquote, urlsplit
 
 from aiohttp import web
 from telethon import TelegramClient
 
 import logger
-from store import (cache_file, LockBusy, make_session, is_path_session, is_online,
-                   Store, norm, parent_of, base_of)
+from store import (cache_file, LockBusy, make_session, is_online,
+                   Store, norm, base_of)
 
 log = logging.getLogger("dav")
 
@@ -162,6 +160,11 @@ async def dav_get(request, store):
             rows.append(f'<li><a href="{xesc(href_for(c.path, c.is_dir))}">{icon} {xesc(c.name)}</a></li>')
         html = f"<html><body><h3>{xesc(path)}</h3><ul>{''.join(rows)}</ul></body></html>"
         return web.Response(text=html, content_type="text/html; charset=utf-8")
+    if e.status == 1 or (e.expect and len(e.parts) < e.expect):
+        # 上传中或分片不全：不能在 prepare 之后才发现没数据。
+        # Content-Length 一旦发出去，客户端会一直等满超时，所以这里先拒绝。
+        return web.Response(status=503, text="file is being uploaded or incomplete",
+                            headers={"Retry-After": "3"})
     resp = web.StreamResponse(status=200, headers={
         "Content-Type": "application/octet-stream",
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote(e.name)}",
@@ -174,10 +177,10 @@ async def dav_get(request, store):
             await resp.write(chunk)
     except Exception as ex:
         log.warning("下载中断 %s: %s", path, ex)
-        # Content-Length 已发出去，中途失败时 write_eof 会再抛一次长度不符，
-        # 这里吞掉它：客户端会因为连接中断/长度不符报错，而不是静默拿到截断文件。
+        # 200 + Content-Length 已经发出去了，只能硬断连接让客户端报错；
+        # 调 write_eof 会因为长度不足再抛一次，客户端反而挂到超时。
         try:
-            await resp.write_eof()
+            resp.force_close()
         except Exception:
             pass
         return resp
@@ -192,8 +195,9 @@ async def dav_put(request, store):
     e = store.get(path)
     if e and e.is_dir:
         return web.Response(status=409, text="is a collection")
-    # 落到磁盘上的缓存目录，而不是 /tmp（tmpfs，等于内存）
-    tmp = cache_file(hashlib.sha256(path.encode()).hexdigest()[:16] + ".part")
+    # 落到磁盘上的缓存目录，而不是 /tmp（tmpfs，等于内存）。
+    # 名字必须带唯一后缀：只按路径生成的话，同路径两个并发 PUT 会写同一个文件。
+    tmp = cache_file(f"put-{os.getpid()}-{uuid.uuid4().hex[:12]}.part")
     fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -257,10 +261,11 @@ async def dav_move(request, store):
         return web.Response(status=204)          # 移到自己：什么都不用做
     if store.get(src) is None:
         return web.Response(status=404)
-    if request.headers.get("Overwrite", "T") == "T":
-        if store.get(dst) is None:
-            await store.move(src, dst)
-            return web.Response(status=201)
+    ow = request.headers.get("Overwrite", "T").strip().upper()
+    exists = store.get(dst) is not None
+    if exists and ow == "F":
+        return web.Response(status=412, text="destination exists")
+    if exists:
         await store.delete(dst)
         await store.move(src, dst)
         return web.Response(status=204)
@@ -279,8 +284,14 @@ async def dav_copy(request, store):
         return web.Response(status=403, text="copy onto itself")
     if store.get(src) is None:
         return web.Response(status=404)
-    if store.get(dst) is not None:
+    ow = request.headers.get("Overwrite", "T").strip().upper()
+    exists = store.get(dst) is not None
+    if exists and ow == "F":
+        return web.Response(status=412, text="destination exists")
+    if exists:
         await store.delete(dst)
+        await store.copy(src, dst)
+        return web.Response(status=204)
     await store.copy(src, dst)
     return web.Response(status=201)
 
@@ -353,8 +364,9 @@ async def handle(request, store):
                             headers={"Retry-After": "3"})
     except FileNotFoundError:
         return web.Response(status=404, text="not found")
-    except FileExistsError:
-        return web.Response(status=405, text="exists")
+    except FileExistsError as ex:
+        # 父路径已经是文件，或同名资源类型冲突：RFC 4918 要 409
+        return web.Response(status=409, text=str(ex) or "conflict")
     except Exception as ex:
         log.exception("处理 %s %s 失败: %s", m, request.path, ex)
         return web.Response(status=500, text=str(ex))
@@ -412,7 +424,9 @@ async def main():
         sys.exit("缺 TG_API_ID / TG_API_HASH")
     sess = make_session(SESSION)
     if isinstance(sess, str):
-        os.makedirs(os.path.dirname(sess), exist_ok=True)
+        d = os.path.dirname(sess)            # TG_SESSION=session.session 时是空串，makedirs("") 会崩
+        if d:
+            os.makedirs(d, exist_ok=True)
     client = TelegramClient(sess, API_ID, API_HASH, device_model=DEVICE,
                             system_version="Linux", app_version="tgnd")
     await client.connect()

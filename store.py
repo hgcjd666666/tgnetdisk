@@ -60,7 +60,21 @@ LOCK_TTL = 120                     # 锁超过这么久没释放就视为残留
 
 # ---------- 基础工具 ----------
 def norm(p: str) -> str:
-    return "/" + "/".join(x for x in (p or "").split("/") if x)
+    """规范化索引路径：消掉空段与 `.`/`..`。
+
+    不消解 `..` 会让 `PUT /a/../b` 在库里存成一个字面的 "/a/../b"：
+    children() 永远列不到它、DELETE /a 也删不掉它，变成谁都看不见的影子数据。
+    """
+    out = []
+    for x in (p or "").split("/"):
+        if not x or x == ".":
+            continue
+        if x == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(x)
+    return "/" + "/".join(out)
 
 
 def parent_of(p: str):
@@ -606,6 +620,8 @@ class Store:
         self._lease = 0.0            # 租约秒数（>0 表示批量模式）
         self._lease_task = None
         self._last_op = 0.0
+        self._gen = 0                 # dirty 代数：快照推送期间又写了东西就不能把 dirty 清掉
+        self._replaced = {}           # register 覆盖掉的旧条目，等 upload_pending 成功后清理
 
     @property
     def entries(self):
@@ -619,7 +635,11 @@ class Store:
 
     # ---------- 写入 ----------
     async def _ensure_parents(self, p: str):
-        """把 p 的各级父目录补进索引。一次查全链，缺的一次插完。"""
+        """把 p 的各级父目录补进索引。一次查全链，缺的一次插完。
+
+        父路径里任何一个已经是「文件」就不能再当目录用：否则同一路径同时出现在
+        files 和 dirs 两张表里，get() 优先返回文件，子树被永久遮蔽。
+        """
         par = parent_of(p)
         chain = []
         while par and par != "/":
@@ -628,6 +648,12 @@ class Store:
         if not chain:
             return
         have = self.backend.existing_dirs(chain)
+        for d in chain:
+            if d in have:
+                continue
+            e = self.backend.get(d)
+            if e is not None and not e.is_dir:
+                raise FileExistsError(f"父路径已经是文件: {d}")
         missing = [d for d in reversed(chain) if d not in have]
         if missing:
             self.backend.add_dirs(missing, int(time.time()))
@@ -680,15 +706,19 @@ class Store:
 
     async def put_file(self, path: str, local_path: str, mtime: int | None = None,
                        slice_size: int | None = None, append: bool = False,
-                       start_index: int | None = None, skip_same: bool = False):
+                       start_index: int | None = None, skip_same: bool = False,
+                       total_size: int | None = None):
         p = norm(path)
-        size = os.path.getsize(local_path)
+        blob = os.path.getsize(local_path)      # 本次要传的字节（append 时只是一块）
+        size = total_size if (append and total_size is not None) else blob
         S = slice_size or SLICE
         digest = None if append else digest_of(local_path)
         mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
         await self.ensure_fresh()
 
-        # 阶段一：只在索引里登记「上传中」，锁在这几百毫秒内就释放
+        # 阶段一：只在索引里登记「上传中」，锁在这几百毫秒内就释放。
+        # 注意：这里不删旧内容。新字节还没传上去，先删旧记录/旧消息的话，
+        # 阶段二一断网旧文件就永久没了（索引只剩 status=1 的幽灵记录）。
         async with self.lock:
             old = self.backend.get(p)
             if old and not old.is_dir and not append:
@@ -696,14 +726,13 @@ class Store:
                     old.skipped = True
                     log.info("跳过（已存在且内容相同）: %s", p)
                     return old
-                await self._drop(p)
-                old = None
             await self._ensure_parents(p)
 
-            if size == 0 and not append:
+            if blob == 0 and not append:
                 self.backend.set_file(p, digest or "", 0, mt, {}, 0, 0)
                 self.dirty = True
                 log.info("空文件只登记索引: %s", p)
+                await self._release_hash(old)
                 return self.backend.get(p)
 
             if digest and not append:
@@ -712,6 +741,7 @@ class Store:
                         self.backend.set_file(p, digest, osize, mt, oparts, 0, 0)
                         self.dirty = True
                         log.info("秒传命中 %s (hash %s) ← %s", p, digest[:8], opath)
+                        await self._release_hash(old)
                         return self.backend.get(p)
 
             parts = {}
@@ -722,17 +752,29 @@ class Store:
             base_idx = start_index if start_index is not None else (
                 (max(parts) + 1) if parts else 0)
             tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()[:32]
-            nparts = max(1, (size + S - 1) // S) if size else 0
+            nparts = max(1, (blob + S - 1) // S) if blob else 0
             self.backend.set_file(p, digest or tag, size, mt, parts, 1, nparts)
             self.dirty = True
 
         # 阶段二：真正把字节传上 TG，这段时间不持锁
-        await self._send_slices(local_path, tag, base_idx, size, parts, S)
+        try:
+            await self._send_slices(local_path, tag, base_idx, blob, parts, S)
+        except BaseException:
+            # 传一半失败：索引恢复成旧内容，旧文件仍可用（新发出去的分片消息成孤儿，交给 gc）
+            async with self.lock:
+                if old is not None and not old.is_dir:
+                    self.backend.set_file(p, old.hash, old.size, old.mtime,
+                                          old.parts, old.status, old.expect)
+                elif old is None:
+                    self.backend.remove(p)
+                self.dirty = True
+            raise
 
-        # 阶段三：提交结果，锁只在这几百毫秒内再持一次
+        # 阶段三：提交结果，锁只在这几百毫秒内再持一次；旧内容这时才真正删掉
         async with self.lock:
             self.backend.set_file(p, digest or tag, size, mt, parts, 0, nparts)
             self.dirty = True
+            await self._release_hash(old)
         return self.backend.get(p)
 
     async def register(self, path: str, local_path: str, digest: str | None = None,
@@ -750,6 +792,9 @@ class Store:
                 old.skipped = True
                 return old
             await self._ensure_parents(p)
+            if old and not old.is_dir:
+                # 字节还没传，先把旧条目留着；upload_pending 成功后再清理旧消息
+                self._replaced[p] = old
             if digest:
                 for opath, osize, oparts in self.backend.find_by_hash(digest):
                     if oparts:
@@ -778,7 +823,20 @@ class Store:
         async with self.mutex:
             self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts))
             self.dirty = True
+        old = self._replaced.pop(p, None)
+        if old is not None:
+            await self._release_hash(old)
         return self.backend.get(p)
+
+    async def _release_hash(self, e):
+        """条目 e 的内容已经不被任何路径引用时，删掉它在 TG 上的分片消息。"""
+        if not e or e.is_dir or not e.parts:
+            return
+        left = [x for x in self.backend.find_by_hash(e.hash) if x[2]]
+        if left:
+            return
+        await self._del_ids(part_ids(e.parts))
+        log.info("删除 %s 的 %d 个分片消息", e.path, len(e.parts))
 
     async def _drop(self, path: str, hard=True):
         """删记录；hard 时若该 hash 没有别的路径引用，连 TG 消息一起删。"""
@@ -786,13 +844,8 @@ class Store:
         e = self.backend.get(p)
         self.backend.remove(p)
         self.dirty = True
-        if not (hard and e and not e.is_dir and e.parts):
-            return
-        left = [x for x in self.backend.find_by_hash(e.hash) if x[2]]
-        if left:
-            return
-        await self._del_ids(part_ids(e.parts))
-        log.info("删除 %s 的 %d 个分片消息", p, len(e.parts))
+        if hard:
+            await self._release_hash(e)
 
     async def delete(self, path: str, recursive=True):
         p = norm(path)
@@ -822,6 +875,7 @@ class Store:
         if not self.backend.get(s):
             raise FileNotFoundError(s)
         async with self.lock:
+            await self._ensure_parents(d)          # 目标父目录不存在就补上，否则子树挂不上
             rows = [self.backend.get(x) for x in self.backend.paths_under(s)]
             rows = [x for x in rows if x]
             for x in rows:
@@ -844,6 +898,7 @@ class Store:
         if not self.backend.get(s):
             raise FileNotFoundError(s)
         async with self.lock:
+            await self._ensure_parents(d)
             rows = [self.backend.get(x) for x in self.backend.paths_under(s)]
             for x in rows:
                 if not x:
@@ -892,13 +947,16 @@ class Store:
             # 静默跳过会交付一个截断但「看起来成功」的文件，下载端必须知道失败。
             raise IOError(f"{path} 缺 {len(missing)} 个分片 (idx {sorted(missing)[:10]}, "
                           f"共 {len(order)} 片)，只读到 {got} 字节")
+        if e.size and got != e.size:
+            # 大小不符是硬错误：交付出去的就是残缺文件
+            raise IOError(f"{path} 下载大小不符: 实际 {got} / 记录 {e.size}")
         if verify and e.hash:
             d = h.hexdigest(16)
             if d != e.hash:
-                raise IOError(f"{path} 下载校验不一致: 期望 {e.hash} 实际 {d}"
-                              f"（{got} 字节 / 记录 {e.size} 字节）")
-            if e.size and got != e.size:
-                raise IOError(f"{path} 下载大小不符: 实际 {got} / 记录 {e.size}")
+                # 分块追加写入（put --offset/--length）的记录只有首块的 hash，
+                # 内容合法但对不上，这里只告警；真正的数据缺失由上面的分片/大小检查兜住。
+                log.warning("下载校验不一致: %s 期望 %s 实际 %s（%d 字节 / 记录 %s 字节）",
+                            path, e.hash, d, got, e.size)
 
     async def download_to_temp(self, path: str) -> str:
         # 落 CACHE_DIR 而不是 /tmp：服务器 /tmp 是 tmpfs，下载大文件会把内存吃穿
@@ -1099,12 +1157,14 @@ class Store:
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
         os.close(fd)
         try:
+            gen = self._gen
             self.backend.dump(tmp)
             size = os.path.getsize(tmp)
             msg, replaced = await self._push_snapshot(tmp, cap)
             if final:
                 self._holding = False
-            self.dirty = False
+            if self._gen == gen:          # 推送期间又写了东西就不能把 dirty 清掉
+                self.dirty = False
             if replaced:
                 log.info("索引快照已就地替换 (msg %s, %d 字节)", msg, size)
                 return None
@@ -1116,25 +1176,32 @@ class Store:
             except OSError:
                 pass
 
-    async def snapshot_locked(self):
-        """压缩快照 → 抢锁 → 一次 edit 完成「上传 + 放锁」。锁内只有一次网络写。"""
+    async def snapshot_locked(self, nonblock: bool = False):
+        """压缩快照 → 抢锁 → 一次 edit 完成「上传 + 放锁」。锁内只有一次网络写。
+
+        nonblock=True 时锁被别的节点占着就立刻抛 LockBusy（给 WebDAV 的收尾用，
+        否则每个写请求都要在锁上等满 acquire 的 timeout）。
+        """
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
         os.close(fd)
         try:
+            gen = self._gen
             self.backend.dump(tmp)                 # 本地压缩，锁外做
             size = os.path.getsize(tmp)
             with open(tmp, "rb") as fp:
                 digest = hashlib.md5(fp.read()).hexdigest()
             if digest == self._snap_digest:
-                self.dirty = False                  # 内容没变，一次网络都不发
+                if self._gen == gen:
+                    self.dirty = False              # 内容没变，一次网络都不发
                 return self.snap_msg_id
-            self._snap_digest = digest
-            if is_online():
-                await self.acquire()
+            if is_online() and not self._holding:
+                await self.acquire(nonblock=nonblock)
             try:
                 msg, replaced = await self._push_snapshot(tmp, LOCK_IDLE)
                 self._holding = False
-                self.dirty = False
+                self._snap_digest = digest          # 推成功才记：失败后同样的内容还要能重试
+                if self._gen == gen:
+                    self.dirty = False
                 mid = msg if replaced else msg.id
                 log.info("快照已%s并放锁 (msg %s, %d 字节)", "就地替换" if replaced else "上传", mid, size)
                 return mid
@@ -1202,6 +1269,8 @@ class Store:
     def dirty(self, v: bool):
         """dirty 落进 meta：进程重启后还能知道「上次有没有没推上去的改动」。"""
         self._dirty = bool(v)
+        if v:
+            self._gen += 1
         try:
             self.backend.set_meta("dirty", "1" if v else "0")
         except Exception:

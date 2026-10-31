@@ -21,7 +21,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from store import Store, SqliteBackend, make_session, is_db_msg, LOCK_IDLE, LOCK_PREFIX, LockBusy  # noqa: E402
+from store import (Store, SqliteBackend, make_session, is_db_msg, norm,
+                   LOCK_IDLE, LOCK_PREFIX, LockBusy)  # noqa: E402
 
 RESULTS = []
 
@@ -367,6 +368,64 @@ async def main():
             pass
         st.backend.remove(f"{D}/broken")
 
+    async def t_norm_dotdot():
+        assert norm("/a/../b") == "/b", "norm 没消解 .."
+        assert norm("/a/./b/") == "/a/b"
+        assert norm("/../x") == "/x"
+        await put_bytes(st, b"shadow", f"{D}/normdir/../normfile")
+        assert st.get(f"{D}/normfile") is not None, ".. 路径没被规范化，产生影子条目"
+        kids = [e.path for e in st.children(D)]
+        assert f"{D}/normfile" in kids, f"规范化后的文件不在 children 里: {kids}"
+        await st.delete(f"{D}/normfile")
+
+    async def t_overwrite_fail_keeps_old():
+        await put_bytes(st, b"old-content", f"{D}/keep")
+        orig = st._send_slices
+
+        async def boom(*a, **k):
+            raise ConnectionError("模拟断网")
+
+        st._send_slices = boom
+        try:
+            await put_bytes(st, b"new-content", f"{D}/keep")
+            raise AssertionError("断网时覆盖上传居然成功了")
+        except ConnectionError:
+            pass
+        finally:
+            st._send_slices = orig
+        e = st.get(f"{D}/keep")
+        assert e is not None and e.status == 0, f"覆盖失败后旧记录没恢复: {e}"
+        assert await get_bytes(st, f"{D}/keep") == b"old-content", "覆盖失败把旧内容弄丢了"
+        await st.delete(f"{D}/keep")
+
+    async def t_parent_is_file():
+        await put_bytes(st, b"f", f"{D}/pfile")
+        try:
+            await put_bytes(st, b"c", f"{D}/pfile/child")
+            raise AssertionError("父路径是文件时不该能登记子项")
+        except FileExistsError:
+            pass
+        p = st.get(f"{D}/pfile")
+        assert p is not None and not p.is_dir, "父文件被改成目录了"
+        assert st.get(f"{D}/pfile/child") is None, "仍然在文件下面造出了子条目"
+        await st.delete(f"{D}/pfile")
+
+    async def t_append_total_size():
+        await put_bytes(st, b"0123456789", f"{D}/ap")
+        fd, tmp = tempfile.mkstemp()
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"XY")
+        try:
+            e = await st.put_file(f"{D}/ap", tmp, append=True, start_index=1, total_size=12)
+        finally:
+            os.unlink(tmp)
+        assert e.size == 12, f"append 后记录大小应为 12，实际 {e.size}"
+        out = b""
+        async for piece in st.iter_content(f"{D}/ap", verify=False):
+            out += piece
+        assert out == b"0123456789XY", f"append 内容不对: {out!r}"
+        await st.delete(f"{D}/ap")
+
     async def t_dav_basic():
         if "--real" in sys.argv:
             print("SKIP  WebDAV 用例只跑内存版")
@@ -465,6 +524,8 @@ async def main():
         ("emoji 路径", t_emoji_path), ("move 自覆盖保护", t_move_guard),
         ("gc 不删手动上传", t_gc_manual), ("历史分片格式", t_part_list_format),
         ("缺分片必须报错", t_missing_slice), ("WebDAV 语义", t_dav_basic),
+        (".. 路径规范化", t_norm_dotdot), ("覆盖失败保留旧文件", t_overwrite_fail_keeps_old),
+        ("父路径是文件", t_parent_is_file), ("append 记录总大小", t_append_total_size),
         ("锁-空频道自建快照", t_lock_bootstrap), ("锁-重复acquire幂等", t_lock_reacquire),
         ("锁-双节点互斥", t_lock_busy),
     ]:

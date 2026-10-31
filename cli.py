@@ -208,7 +208,11 @@ async def cmd_put(st, args):
         try:
             if offset is not None or length is not None:
                 off = offset or 0
+                if slice_size and off % slice_size:
+                    sys.exit(f"--offset {off} 不是分片大小 {slice_size} 的整数倍，"
+                             f"会整片覆盖已有内容，拒绝执行")
                 fd, tmp = tempfile.mkstemp(prefix="tgnd_rng_")
+                wrote = 0
                 with open(fd, "wb") as out, open(f, "rb") as src:
                     src.seek(off)
                     left = length if length is not None else os.path.getsize(f) - off
@@ -218,9 +222,15 @@ async def cmd_put(st, args):
                             break
                         out.write(b)
                         left -= len(b)
+                        wrote += len(b)
                 try:
                     si = (off // slice_size) if slice_size else None
-                    e = await st.put_file(dst, tmp, slice_size=slice_size, append=True, start_index=si)
+                    # append 模式必须显式给最终大小：只传这一块的话记录 size 会变成块大小，
+                    # 之后 HEAD/GET 的 Content-Length 全错。
+                    old = st.backend.get(norm(dst))
+                    total_size = max(old.size if old and not old.is_dir else 0, off + wrote)
+                    e = await st.put_file(dst, tmp, slice_size=slice_size, append=True,
+                                          start_index=si, total_size=total_size)
                 finally:
                     try:
                         os.unlink(tmp)
@@ -422,22 +432,30 @@ async def cmd_get(st, args):
 
 
 async def cmd_rm(st, args):
+    if not args:
+        sys.exit("用法: tgnd rm <路径...>")
     for p in args:
         await st.delete(norm(p))
         log(f"removed {p}")
 
 
 async def cmd_mv(st, args):
+    if len(args) < 2:
+        sys.exit("用法: tgnd mv <源> <目标>")
     await st.move(norm(args[0]), norm(args[1]))
     log(f"{args[0]} -> {args[1]}")
 
 
 async def cmd_cp(st, args):
+    if len(args) < 2:
+        sys.exit("用法: tgnd cp <源> <目标>")
     await st.copy(norm(args[0]), norm(args[1]))
     log(f"copied {args[0]} -> {args[1]}")
 
 
 def cmd_stat(st, args):
+    if not args:
+        sys.exit("用法: tgnd stat <路径>")
     e = st.get(norm(args[0]))
     if not e:
         sys.exit("不存在")
