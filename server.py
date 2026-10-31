@@ -22,7 +22,8 @@ from aiohttp import web
 from telethon import TelegramClient
 
 import logger
-from store import cache_file, LockBusy, make_session, is_path_session, Store, norm, parent_of, base_of
+from store import (cache_file, LockBusy, make_session, is_path_session, is_online,
+                   Store, norm, parent_of, base_of)
 
 log = logging.getLogger("dav")
 
@@ -173,6 +174,13 @@ async def dav_get(request, store):
             await resp.write(chunk)
     except Exception as ex:
         log.warning("下载中断 %s: %s", path, ex)
+        # Content-Length 已发出去，中途失败时 write_eof 会再抛一次长度不符，
+        # 这里吞掉它：客户端会因为连接中断/长度不符报错，而不是静默拿到截断文件。
+        try:
+            await resp.write_eof()
+        except Exception:
+            pass
+        return resp
     await resp.write_eof()
     return resp
 
@@ -245,6 +253,8 @@ async def dav_move(request, store):
     dst = _dest_path(request)
     if not dst:
         return web.Response(status=400, text="no destination")
+    if dst == src:
+        return web.Response(status=204)          # 移到自己：什么都不用做
     if store.get(src) is None:
         return web.Response(status=404)
     if request.headers.get("Overwrite", "T") == "T":
@@ -265,6 +275,8 @@ async def dav_copy(request, store):
     dst = _dest_path(request)
     if not dst:
         return web.Response(status=400)
+    if dst == src:
+        return web.Response(status=403, text="copy onto itself")
     if store.get(src) is None:
         return web.Response(status=404)
     if store.get(dst) is not None:
@@ -347,12 +359,22 @@ async def handle(request, store):
         log.exception("处理 %s %s 失败: %s", m, request.path, ex)
         return web.Response(status=500, text=str(ex))
     finally:
-        # 写操作立刻把索引快照推上去，缩短两个节点互相覆盖的窗口
+        # 写操作后把索引推上去，缩短两个节点互相覆盖的窗口。
+        # 有租约任务在跑时交给它（空闲 3 秒统一落库），避免每个请求都 edit 两次；
+        # 没有租约时才自己推，且必须走 snapshot_locked（抢锁）：
+        # 裸调 snapshot() 会在不持锁的情况下改快照 caption，把别的节点的锁清掉。
         if m in ("PUT", "DELETE", "MKCOL", "MOVE", "COPY") and store.dirty:
-            try:
-                await store.snapshot()
-            except Exception as ex:
-                log.warning("写后快照失败: %s", ex)
+            t = store._lease_task
+            if t is None or t.done():
+                try:
+                    if is_online():
+                        await store.snapshot_locked()
+                    else:
+                        await store.snapshot()
+                except LockBusy:
+                    pass
+                except Exception as ex:
+                    log.warning("写后快照失败: %s", ex)
     return web.Response(status=405, text="method not allowed")
 
 
@@ -366,12 +388,14 @@ async def ensure_chat(client, cfg_path="/opt/tgnd/chat.json", title="tgnd") -> i
     async for d in client.iter_dialogs():
         if d.is_channel and (d.title or "") == title:
             cid = d.id
-            json.dump({"chat": cid}, open(cfg_path, "w"))
+            with open(cfg_path, "w") as f:
+                json.dump({"chat": cid}, f)
             return cid
     from telethon.tl.functions.channels import CreateChannelRequest
     r = await client(CreateChannelRequest(title=title, about="tgnd storage", megagroup=True))
     cid = int(f"-100{r.chats[0].id}")
-    json.dump({"chat": cid}, open(cfg_path, "w"))
+    with open(cfg_path, "w") as f:
+        json.dump({"chat": cid}, f)
     log.info("已创建存储群 %s (%s)", title, cid)
     return cid
 
@@ -414,7 +438,14 @@ async def main():
         await asyncio.sleep(30)
         try:
             if store.dirty:                 # 兜底：有未落盘的改动就补一次快照
-                await store.snapshot()
+                try:
+                    # 同样必须抢锁：裸 snapshot() 会改掉别的节点持有的 caption
+                    if is_online():
+                        await store.snapshot_locked()
+                    else:
+                        await store.snapshot()
+                except LockBusy:
+                    pass
         except Exception as e:
             log.warning("后台快照失败: %s", e)
 

@@ -298,6 +298,115 @@ async def main():
         after = st.get(f"{D}/one")
         assert (before is None) == (after is None)
 
+    # ---- 数据路径的边角：emoji、路径自覆盖、gc/manual、历史分片格式、缺分片 ----
+
+    async def t_emoji_path():
+        data = rand(2000)
+        p = f"{D}/🎵 emoji/😀 笑脸.bin"
+        await put_bytes(st, data, p)
+        assert st.get(p) is not None, "emoji 路径没登记进索引"
+        kids = [e.path for e in st.children(f"{D}/🎵 emoji")]
+        assert p in kids, f"children 漏掉 emoji 文件: {kids}"
+        assert await get_bytes(st, p) == data, "emoji 文件内容不一致"
+        await st.delete(f"{D}/🎵 emoji")
+        assert st.get(p) is None, "递归删目录没删掉 emoji 文件"
+
+    async def t_move_guard():
+        await put_bytes(st, b"v", f"{D}/mvsrc/f")
+        await st.move(f"{D}/mvsrc", f"{D}/mvsrc")        # 移到自身：应当是空操作
+        assert st.get(f"{D}/mvsrc/f") is not None, "move 到自身把数据删光了"
+        try:
+            await st.move(f"{D}/mvsrc", f"{D}/mvsrc/sub")
+            raise AssertionError("move 到自己的子目录应被拒绝")
+        except OSError:
+            pass
+        assert st.get(f"{D}/mvsrc/f") is not None, "被拒绝的 move 改了数据"
+        await st.delete(f"{D}/mvsrc")
+
+    async def t_gc_manual():
+        if "--real" in sys.argv:
+            print("SKIP  gc 删除用例只跑内存版（真频道上不敢删）")
+            return
+        m = await client.send_file(1, b"manual-bytes",
+                                   attributes=[SimpleNamespace(file_name="manual-photo.jpg")])
+        await st.sync(full=True)
+        p = "/lost+found/manual-photo.jpg"
+        assert st.get(p) is not None, "手动上传没归入 /lost+found"
+        _, missing = await st.gc(dry_run=False)
+        assert st.get(p) is not None, f"gc 把手动上传的记录当 missing 删了: {missing}"
+        assert m.id in client._msgs, "gc 删掉了手动上传的 TG 消息"
+        await st.delete(p)
+
+    async def t_part_list_format():
+        if "--real" in sys.argv:
+            print("SKIP  历史分片格式用例只跑内存版（会往索引里写伪造记录）")
+            return
+        body = b"legacy-bytes"
+        m = await client.send_file(
+            1, body, attributes=[SimpleNamespace(file_name="a" * 32 + ".0")])
+        p = f"{D}/legacy"
+        # 历史数据里 parts 的值是 [msg_id, size] 而不是 msg_id
+        st.backend.set_file(p, "a" * 32, len(body), 1, {0: [m.id, len(body)]})
+        out = b""
+        async for piece in st.iter_content(p, verify=False):
+            out += piece
+        assert out == body, f"list 格式分片读不出来: {out!r}"
+        _, missing = await st.gc(dry_run=True)
+        assert p not in missing, "list 格式被 gc 误判成 missing"
+        await st.delete(p)
+        assert m.id not in client._msgs, "list 格式删除没删掉 TG 消息"
+
+    async def t_missing_slice():
+        await put_bytes(st, b"0123456789", f"{D}/broken")
+        e = st.get(f"{D}/broken")
+        st.backend.set_file(f"{D}/broken", e.hash, e.size, e.mtime, {0: 999999}, 0, 1)
+        try:
+            await get_bytes(st, f"{D}/broken")
+            raise AssertionError("缺分片时下载没有报错（会静默交付截断文件）")
+        except IOError:
+            pass
+        st.backend.remove(f"{D}/broken")
+
+    async def t_dav_basic():
+        if "--real" in sys.argv:
+            print("SKIP  WebDAV 用例只跑内存版")
+            return
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+        import server as srv
+        c3 = FakeClient()
+        st3 = Store(c3, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+        st3.fast = True
+        app = web.Application(client_max_size=0)
+        app.router.add_route("*", "/{tail:.*}", lambda r: srv.handle(r, st3))
+        old = os.environ.get("ONLINE")
+        os.environ["ONLINE"] = "0"                   # 锁本身有独立用例，这里只验 HTTP 语义
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                r = await cli.put("/dav/a.txt", data=b"hello")
+                assert r.status == 201, f"PUT 新文件应 201，实际 {r.status}"
+                r = await cli.put("/dav/a.txt", data=b"hello2")
+                assert r.status == 204, f"PUT 覆盖应 204，实际 {r.status}"
+                r = await cli.get("/dav/a.txt")
+                body = await r.read()
+                assert r.status == 200 and body == b"hello2", f"GET 内容不对: {body!r}"
+                r = await cli.head("/dav/a.txt")
+                assert r.headers.get("Content-Length") == "6", \
+                    f"HEAD 的 Content-Length 不对: {r.headers.get('Content-Length')}"
+                r = await cli.request("MKCOL", "/dav/a.txt")
+                assert r.status == 405, f"MKCOL 已存在的路径应 405，实际 {r.status}"
+                r = await cli.request("MOVE", "/dav/a.txt",
+                                      headers={"Destination": str(cli.make_url("/dav/a.txt"))})
+                assert r.status == 204, f"MOVE 到自身应 204（空操作），实际 {r.status}"
+                assert st3.get("/dav/a.txt") is not None, "MOVE 到自身把文件弄丢了"
+                r = await cli.request("PROPFIND", "/dav", headers={"Depth": "1"})
+                assert r.status == 207 and "a.txt" in await r.text(), "PROPFIND 没列出文件"
+        finally:
+            if old is None:
+                os.environ.pop("ONLINE", None)
+            else:
+                os.environ["ONLINE"] = old
+
     # ---- 分布式锁（快照 caption 即锁）：只有 --full 才走真实锁路径 ----
 
     async def t_lock_bootstrap():
@@ -353,6 +462,9 @@ async def main():
         ("秒传共享分片", t_dedup), ("同名覆盖", t_overwrite), ("cp+mv", t_copy_move),
         ("删除文件", t_delete), ("递归删目录", t_rmdir), ("mkdir+空目录", t_mkdir),
         ("gc 预览", t_gc), ("reindex 全量", t_reindex),
+        ("emoji 路径", t_emoji_path), ("move 自覆盖保护", t_move_guard),
+        ("gc 不删手动上传", t_gc_manual), ("历史分片格式", t_part_list_format),
+        ("缺分片必须报错", t_missing_slice), ("WebDAV 语义", t_dav_basic),
         ("锁-空频道自建快照", t_lock_bootstrap), ("锁-重复acquire幂等", t_lock_reacquire),
         ("锁-双节点互斥", t_lock_busy),
     ]:

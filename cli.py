@@ -299,7 +299,12 @@ async def cmd_pushdir(st, args):
         log(f"排除规则 {excludes}：{before} → {len(jobs)} 个文件", flush=True)
     if not jobs:
         sys.exit("没有可上传的文件")
-    total = sum(os.path.getsize(p) for p, _ in jobs)
+    total = 0
+    for p, _ in jobs:
+        try:
+            total += os.path.getsize(p)
+        except OSError:
+            pass                        # 扫描完又被删掉的文件不该让整批上传崩掉
     log(f"共 {len(jobs)} 个文件，{human(total)}，租约 {lease}s", flush=True)
 
     ok = skipped = failed = 0
@@ -314,14 +319,20 @@ async def cmd_pushdir(st, args):
 
     def _prep(item):
         f, d = item
-        stt = os.stat(f)
-        return (f, d, stt.st_size, digest_of(f), int(stt.st_mtime))
+        try:
+            stt = os.stat(f)
+            return (f, d, stt.st_size, digest_of(f), int(stt.st_mtime))
+        except Exception as ex:
+            # 单个文件在扫描后消失/读不了，不能让整批上传直接崩（线程池里抛会终止整轮）
+            log(f"跳过预计算失败的 {f}: {type(ex).__name__}: {ex}", flush=True)
+            return None
 
     prepared = []
     done_n = 0
     with _cf.ThreadPoolExecutor(max_workers=HASH_THREADS) as ex:
         for res in ex.map(_prep, jobs):
-            prepared.append(res)
+            if res:
+                prepared.append(res)
             done_n += 1
             progress(f"哈希 {done_n}/{len(jobs)}")
 
@@ -375,6 +386,10 @@ async def cmd_pushdir(st, args):
         log("最终落库失败:", ex, flush=True)
 
     snap_task.cancel()
+    try:
+        await snap_task                     # 吞掉 CancelledError，别留「Task exception was never retrieved」
+    except BaseException:
+        pass
     await st.wait_released()
     dt = max(1e-6, time.time() - t0)
     log(f"完成：上传 {ok}，跳过 {skipped}，失败 {failed}，耗时 {dt/60:.1f} 分钟", flush=True)
@@ -385,12 +400,24 @@ async def cmd_get(st, args):
         sys.exit("用法: tgnd get <远端路径> [本地文件]")
     remote = norm(args[0])
     local = args[1] if len(args) > 1 else base_of(remote)
+    if os.path.isdir(local):
+        local = os.path.join(local, base_of(remote))
     e = st.get(remote)
     if e is None or e.is_dir:
         sys.exit(f"不存在或不是文件: {remote}")
-    with open(local, "wb") as f:
-        async for c in st.iter_content(remote):
-            f.write(c)
+    # 先写 .part 再替换：下载中途失败（分片缺失）不会留下半截文件冒充完整文件
+    part = local + ".part"
+    try:
+        with open(part, "wb") as f:
+            async for c in st.iter_content(remote):
+                f.write(c)
+        os.replace(part, local)
+    except BaseException:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        raise
     log(f"OK {remote} -> {local} ({human(e.size)})")
 
 
@@ -543,7 +570,9 @@ async def main():
     finally:
         try:
             if st.dirty:
-                await st.snapshot()
+                # 不能直接 snapshot()：那会不抢锁就改快照 caption，把别的节点（服务器）的锁清掉。
+                async with st.guard(timeout=10):
+                    pass
         except Exception as e:
             log("快照上传失败:", e)
         await client.disconnect()

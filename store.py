@@ -90,6 +90,21 @@ def digest_of(path: str, bufsize: int = 4 << 20) -> str:
     return h.hexdigest(16)
 
 
+def part_id(v) -> int:
+    """分片值可能是 msg_id(int)，也可能是历史遗留的 [msg_id, size]。
+
+    JSON 存进 SQLite 后 tuple 会变成 list，所以两种都要认。
+    """
+    if isinstance(v, (tuple, list)):
+        return int(v[0] or 0)
+    return int(v or 0)
+
+
+def part_ids(parts: dict) -> list:
+    """按分片序号排好的消息 id 列表。"""
+    return [part_id(v) for _, v in sorted((parts or {}).items())]
+
+
 def is_path_session(val: str) -> bool:
     return val.startswith("/") or val.startswith("./") or val.endswith(".session") or "/" in val
 
@@ -382,7 +397,9 @@ class SqliteBackend(Backend):
         """列直接子项。用 path 上的范围扫描而不是全表 LIKE，列表页不再随库增长变慢。"""
         p = norm(path)
         pre = (p.rstrip("/") or "") + "/"
-        hi = pre + "\uffff"
+        # 上界用「末位 '/' 换成 '0'」而不是 pre+"\uffff"：SQLite 按 UTF-8 字节比较，
+        # "\uffff"(EF BF BF) 小于 emoji 等 4 字节字符(F0..)，会把 /a/😀 漏在范围外。
+        hi = pre[:-1] + "0"
         out = []
         for k, m in self.db.execute(
                 "select path,mtime from dirs where path>=? and path<?", (pre, hi)):
@@ -459,7 +476,7 @@ class SqliteBackend(Backend):
     def paths_under(self, prefix):
         prefix = norm(prefix)
         pre = prefix.rstrip("/") + "/"
-        hi = pre + "\uffff"
+        hi = pre[:-1] + "0"        # 同 children()：不能用 "\uffff"，会漏掉 emoji 路径
         out = [x[0] for x in self.db.execute(
             "select path from dirs where path=? or (path>=? and path<?)", (prefix, pre, hi))]
         out += [x[0] for x in self.db.execute(
@@ -483,14 +500,35 @@ class SqliteBackend(Backend):
                 pass
 
     def restore(self, src):
-        self.db.close()
-        for suf in ("", "-wal", "-shm"):
+        """用快照替换本地库。
+
+        先把库解到临时文件并验证（quick_check + 读一次表），确认是有效索引库才替换；
+        否则一个坏快照会把本地索引直接清空，连回滚的余地都没有。
+        """
+        tmp = self.path + ".restore"
+        try:
+            with lzma.open(src, "rb") as f, open(tmp, "wb") as out:
+                shutil.copyfileobj(f, out)
+            chk = sqlite3.connect(tmp)
             try:
-                os.unlink(self.path + suf)
+                row = chk.execute("PRAGMA quick_check").fetchone()
+                if not row or row[0] != "ok":
+                    raise RuntimeError(f"快照不是有效的索引库: {row}")
+                chk.execute("select count(*) from files").fetchone()
+            finally:
+                chk.close()
+            self.db.close()
+            for suf in ("", "-wal", "-shm"):
+                try:
+                    os.unlink(self.path + suf)
+                except OSError:
+                    pass
+            os.replace(tmp, self.path)
+        finally:
+            try:
+                os.unlink(tmp)
             except OSError:
                 pass
-        with lzma.open(src, "rb") as f, open(self.path, "wb") as out:
-            shutil.copyfileobj(f, out)
         self._open()
 
     def close(self):
@@ -753,7 +791,7 @@ class Store:
         left = [x for x in self.backend.find_by_hash(e.hash) if x[2]]
         if left:
             return
-        await self._del_ids(list(e.parts.values()))
+        await self._del_ids(part_ids(e.parts))
         log.info("删除 %s 的 %d 个分片消息", p, len(e.parts))
 
     async def delete(self, path: str, recursive=True):
@@ -775,6 +813,11 @@ class Store:
 
     async def move(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
+        if s == d:
+            return
+        if d.startswith(s.rstrip("/") + "/"):
+            # 移到自己的子树里：先写新路径再删旧路径，会把刚写的全删光
+            raise OSError(f"不能把 {s} 移动到它自己的子目录 {d} 下")
         await self.ensure_fresh()
         if not self.backend.get(s):
             raise FileNotFoundError(s)
@@ -793,6 +836,10 @@ class Store:
 
     async def copy(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
+        if s == d:
+            return
+        if d.startswith(s.rstrip("/") + "/"):
+            raise OSError(f"不能把 {s} 复制到它自己的子目录 {d} 下")
         await self.ensure_fresh()
         if not self.backend.get(s):
             raise FileNotFoundError(s)
@@ -820,9 +867,9 @@ class Store:
         # 一个 20 片的大文件光取消息就要 20 个 RTT（到 DC4 单程 250ms）。
         order = []
         for k in sorted(e.parts):
-            v = e.parts[k]
-            order.append((k, v[0] if isinstance(v, (tuple, list)) else v))
+            order.append((k, part_id(e.parts[k])))
         batch = 50
+        missing = []
         for i in range(0, len(order), batch):
             chunk = order[i:i + batch]
             try:
@@ -835,25 +882,41 @@ class Store:
                 m = by_id.get(mid)
                 if not m or not getattr(m, "document", None):
                     log.warning("分片缺失: %s idx=%s msg=%s", path, k, mid)
+                    missing.append(k)
                     continue
                 async for piece in self.client.iter_download(m):
                     h.update(piece)
                     got += len(piece)
                     yield piece
+        if missing:
+            # 静默跳过会交付一个截断但「看起来成功」的文件，下载端必须知道失败。
+            raise IOError(f"{path} 缺 {len(missing)} 个分片 (idx {sorted(missing)[:10]}, "
+                          f"共 {len(order)} 片)，只读到 {got} 字节")
         if verify and e.hash:
             d = h.hexdigest(16)
             if d != e.hash:
-                log.warning("下载校验不一致: %s 期望 %s 实际 %s（%d 字节 / 记录 %s 字节）",
-                            path, e.hash, d, got, e.size)
-            elif e.size and got != e.size:
-                log.warning("下载大小不符: %s 实际 %d / 记录 %d", path, got, e.size)
+                raise IOError(f"{path} 下载校验不一致: 期望 {e.hash} 实际 {d}"
+                              f"（{got} 字节 / 记录 {e.size} 字节）")
+            if e.size and got != e.size:
+                raise IOError(f"{path} 下载大小不符: 实际 {got} / 记录 {e.size}")
 
     async def download_to_temp(self, path: str) -> str:
-        fd, tmp = tempfile.mkstemp(prefix="tgnd_dl_")
-        with os.fdopen(fd, "wb") as f:
-            async for piece in self.iter_content(path):
-                f.write(piece)
-        return tmp
+        # 落 CACHE_DIR 而不是 /tmp：服务器 /tmp 是 tmpfs，下载大文件会把内存吃穿
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="tgnd_dl_", dir=CACHE_DIR)
+        ok = False
+        try:
+            with os.fdopen(fd, "wb") as f:
+                async for piece in self.iter_content(path):
+                    f.write(piece)
+            ok = True
+            return tmp
+        finally:
+            if not ok:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
 
     async def _del_ids(self, ids):
         ids = [i for i in ids if i]
@@ -872,15 +935,22 @@ class Store:
                 nm = parse_name(m)
                 if nm:
                     live[m.id] = nm
+                    continue
+                # 手动上传（原文件名）的消息也是存在的消息：值记 None 表示「不是分片」。
+                # 不登记它们，/lost+found 里的索引记录就会被当成 missing 删掉。
+                fname = doc_file_name(m)
+                if fname and not is_db_msg(m):
+                    live[m.id] = None
             used, missing = set(), []
             for e in self.backend.all_entries().values():
                 if e.is_dir or not e.parts:
                     continue
-                for mid in e.parts.values():
-                    used.add(mid)
-                if any(mid not in live for mid in e.parts.values()):
+                mids = {part_id(v) for v in e.parts.values()}
+                used |= mids
+                if any(mid not in live for mid in mids):
                     missing.append(e.path)
-            orphans = sorted(mid for mid in live if mid not in used)
+            # 孤儿只可能是「hash.序号」命名的分片消息，手动上传的绝不能删
+            orphans = sorted(mid for mid, nm in live.items() if nm and mid not in used)
             log.info("TG 文件消息 %d，被引用 %d，孤儿 %d，无效记录 %d",
                      len(live), len(used), len(orphans), len(missing))
             if dry_run:
@@ -926,7 +996,10 @@ class Store:
         for hash, parts in parts_by_hash.items():
             for opath, osize, oparts in self.backend.find_by_hash(hash):
                 if oparts != parts:
-                    self.backend.set_file(opath, hash, osize, int(time.time()), parts, 0, 0)
+                    e = self.backend.get(opath)
+                    # mtime 用原记录的：改成 now 会让 WebDAV 客户端以为文件被修改过而重传
+                    self.backend.set_file(opath, hash, osize,
+                                          e.mtime if e else int(time.time()), parts, 0, 0)
         self.backend.set_meta("last_id", last)
         for path, hash, expect, size, mtime in (self.backend.pending() if full else []):
             got = parts_by_hash.get(hash, {})
@@ -943,8 +1016,7 @@ class Store:
                 if e.is_dir or not e.hash:
                     continue
                 for v in e.parts.values():
-                    mid = v[0] if isinstance(v, (tuple, list)) else v
-                    claimed.add((e.hash, int(mid)))
+                    claimed.add((e.hash, part_id(v)))
             orphan = {}
             for h, parts in parts_by_hash.items():
                 if not h:
@@ -1382,13 +1454,15 @@ class Store:
 
         但如果本地库里记着「上次有改动没推上去」，先把自己推上去，否则会被旧快照覆盖。
         """
-        if self.backend.get_meta("dirty") == "1" and not pid:
+        if self.backend.get_meta("dirty") == "1":
             log.info("本地有未落库的改动，先推快照")
             try:
                 await self.snapshot_locked()
+                return False        # 刚推上去的就是本地状态，不用再拿远端覆盖自己
             except Exception as e:
                 log.warning("推本地快照失败，继续按远端加载: %s", e)
-            return False
+                if not pid:
+                    return False
         if pid:
             best = await self.client.get_messages(self.chat, ids=pid)
             if not best or not is_db_msg(best):

@@ -18,6 +18,7 @@
 import logging
 import os
 import sys
+import threading
 import time
 
 MAGIC = b"TGNDLOG"
@@ -31,6 +32,10 @@ _tty = sys.stdout.isatty()
 
 class RingLog:
     """定长环形日志：文件大小恒定，新日志覆盖最旧的。"""
+
+    # 写路径是 seek→write→seek→write→回头部，跨线程不加锁会互相截断。
+    # （cli 的哈希/上传线程池和 asyncio 回调都可能调 log()）
+    _lock = threading.Lock()
 
     def __init__(self, path: str, body: int):
         self.path = path
@@ -67,29 +72,31 @@ class RingLog:
 
     def reset(self, keep_pos: bool = True):
         """清空环形缓冲：正文全填 0，指针默认保持原位（别的进程还在写，挪了会错位）。"""
-        pos = self.pos if keep_pos else 0
-        self.fp.seek(0)
-        self.fp.write(self._hdr(pos))
-        self.fp.write(b"\0" * self.body)
-        self.fp.flush()
-        if not keep_pos:
-            self.pos = 0
+        with self._lock:
+            pos = self.pos if keep_pos else 0
+            self.fp.seek(0)
+            self.fp.write(self._hdr(pos))
+            self.fp.write(b"\0" * self.body)
+            self.fp.flush()
+            if not keep_pos:
+                self.pos = 0
 
     def write(self, line: str):
         data = (line.rstrip("\n") + "\n").encode("utf-8", "replace")
         if len(data) > self.body:
             data = data[-self.body:]
-        off = self.pos
-        first = min(len(data), self.body - off)
-        self.fp.seek(HDR_LEN + off)
-        self.fp.write(data[:first])
-        if first < len(data):
-            self.fp.seek(HDR_LEN)
-            self.fp.write(data[first:])
-        self.pos = (off + len(data)) % self.body
-        self.fp.seek(0)
-        self.fp.write(self._hdr(self.pos))
-        self.fp.flush()
+        with self._lock:
+            off = self.pos
+            first = min(len(data), self.body - off)
+            self.fp.seek(HDR_LEN + off)
+            self.fp.write(data[:first])
+            if first < len(data):
+                self.fp.seek(HDR_LEN)
+                self.fp.write(data[first:])
+            self.pos = (off + len(data)) % self.body
+            self.fp.seek(0)
+            self.fp.write(self._hdr(self.pos))
+            self.fp.flush()
 
 
 class LoggingBridge(logging.Handler):
@@ -99,12 +106,19 @@ class LoggingBridge(logging.Handler):
         try:
             msg = record.getMessage()
             if record.exc_info:
-                msg = f"{msg} {self.formatException(record.exc_info).splitlines()[-1]}"
+                # logging.Handler 没有 formatException（那是 Formatter 的方法），
+                # 原来这里每遇到 exc_info 就 AttributeError，整条日志被下面的 except 吞掉。
+                tb = logging.Formatter().formatException(record.exc_info)
+                msg = f"{msg}\n{tb.rstrip()}" if tb else msg
             prefix = {"WARNING": "警告 ", "ERROR": "错误 ", "CRITICAL": "严重 "}.get(record.levelname, "")
             # 统一走 log()：终端 + 环形全收；追加文件只收 WARNING 及以上
             log(prefix + msg, ring_only=record.levelno < logging.WARNING)
-        except Exception:
-            pass
+        except Exception as e:
+            # 日志系统的异常不能把业务代码带走，但也不能完全静默
+            try:
+                sys.stderr.write(f"[logger] emit 失败: {e}\n")
+            except Exception:
+                pass
 
 
 def install_logging(level=logging.INFO):
@@ -154,9 +168,10 @@ def _append(msg: str):
     if not _APPEND:
         return
     try:
-        with open(_APPEND, "a", encoding="utf-8") as fp:
+        # errors="replace"：路径里有非法字节时不能让日志写入抛到业务代码
+        with open(_APPEND, "a", encoding="utf-8", errors="replace") as fp:
             fp.write(str(msg) + "\n")
-    except OSError:
+    except (OSError, UnicodeError):
         pass
 
 
@@ -175,7 +190,15 @@ def _emit(msg: str, ring_only: bool = False):
 
 def log(msg="", flush=True, ring_only=False):
     """统一出口：终端 + 环形日志；ring_only=True 表示只写环形、不进普通日志。"""
-    print(msg, flush=flush)
+    try:
+        print(msg, flush=flush)
+    except UnicodeError:
+        # stdout 编码装不下（文件名带非法字节的 surrogateescape）时不能让日志丢掉
+        try:
+            sys.stdout.write(str(msg).encode("utf-8", "backslashreplace").decode() + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
     _emit(msg, ring_only)
 
 
@@ -210,7 +233,9 @@ def read_log(path: str) -> str:
     except Exception:
         return raw[HDR_LEN:].decode("utf-8", "replace")
     seq = body[p:] + body[:p]
-    if body[p:].strip(b"\0"):          # 指针后面还有旧数据 = 已经绕圈了，开头必是半行
+    # p == 0 说明最后一次写正好停在正文末尾：此时 body[p:] 全是按顺序的新数据，
+    # 不能当成「绕圈后只剩半行」而把第一条完整日志切掉。
+    if p and body[p:].strip(b"\0"):    # 指针后面还有旧数据 = 已经绕圈了，开头必是半行
         cut = seq.find(b"\n")
         if cut >= 0:
             seq = seq[cut + 1:]

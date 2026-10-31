@@ -64,12 +64,20 @@ def main():
         sys.exit(f"不是目录: {root}")
 
     files = []
-    for dirpath, _, names in os.walk(root):
+    walk_errors = []
+
+    def _walk_err(err):
+        # os.walk 默认吞掉 PermissionError：不可读的子树会静默消失，
+        # 两份清单比对时被误判成「这些文件不存在」。
+        walk_errors.append(f"{getattr(err, 'filename', '')}: {err}")
+
+    for dirpath, _, names in os.walk(root, onerror=_walk_err):
         for n in names:
             p = os.path.join(dirpath, n)
             if os.path.isfile(p):
                 files.append(p)
     files.sort()
+    n_files = len(files)
 
     out = {}
     total = 0
@@ -79,8 +87,11 @@ def main():
     last_tick = 0.0
 
     def worker(p):
-        st = os.stat(p)
         rel = os.path.relpath(p, root)
+        try:
+            st = os.stat(p)                 # walk 之后文件被删/改名是常态，stat 也要兜住
+        except OSError as e:
+            return rel, {"size": 0, "error": f"{type(e).__name__}: {e}", "mtime": 0}
         try:
             h = hash_file(p, args.algo)
         except Exception as e:
@@ -96,11 +107,11 @@ def main():
             if "error" in info:
                 errors += 1
             now = time.time()
-            if not args.quiet and (now - last_tick >= 0.3 or done == len(files)):
+            if not args.quiet and n_files and (now - last_tick >= 0.3 or done == n_files):
                 last_tick = now
                 rate = total / max(1e-6, now - t0) / 1048576
-                pct = done * 100 // len(files)
-                print(f"\r{done}/{len(files)} {pct:3d}%  {total/1073741824:.2f} GB  "
+                pct = done * 100 // n_files
+                print(f"\r{done}/{n_files} {pct:3d}%  {total/1073741824:.2f} GB  "
                       f"{rate:.0f} MB/s", end="", file=sys.stderr, flush=True)
 
     if not args.quiet:
@@ -108,14 +119,22 @@ def main():
 
     doc = {"root": root, "algo": args.algo, "count": len(out), "total": total,
            "elapsed": round(time.time() - t0, 2), "files": out}
+    if walk_errors:
+        doc["walk_errors"] = walk_errors
+        errors += len(walk_errors)
     text = json.dumps(doc, ensure_ascii=False, indent=1, sort_keys=True)
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as f:
+        # 先写临时文件再替换：直接 open("w") 会在编码失败时留下 0 字节，
+        # 把上一份好清单也清掉。文件名里的非法字节用 backslashreplace 落地。
+        tmp = args.out + ".tmp"
+        with open(tmp, "w", encoding="utf-8", errors="backslashreplace") as f:
             f.write(text)
+        os.replace(tmp, args.out)
         print(f"写入 {args.out}：{len(out)} 个文件，{total/1073741824:.2f} GB，"
               f"{doc['elapsed']}s，错误 {errors} 个", file=sys.stderr)
     else:
-        print(text)
+        # stdout 编码装不下非法字节时转义输出，而不是整轮扫描白跑
+        sys.stdout.write(text.encode("utf-8", "backslashreplace").decode("utf-8") + "\n")
 
 
 if __name__ == "__main__":
