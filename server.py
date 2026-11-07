@@ -159,7 +159,7 @@ async def dav_get(request, store):
             icon = "🗀" if c.is_dir else "🗎"
             rows.append(f'<li><a href="{xesc(href_for(c.path, c.is_dir))}">{icon} {xesc(c.name)}</a></li>')
         html = f"<html><body><h3>{xesc(path)}</h3><ul>{''.join(rows)}</ul></body></html>"
-        return web.Response(text=html, content_type="text/html; charset=utf-8")
+        return web.Response(text=html, content_type="text/html", charset="utf-8")
     if e.status == 1 or (e.expect and len(e.parts) < e.expect):
         # 上传中或分片不全：不能在 prepare 之后才发现没数据。
         # Content-Length 一旦发出去，客户端会一直等满超时，所以这里先拒绝。
