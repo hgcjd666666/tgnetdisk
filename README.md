@@ -49,6 +49,7 @@ DAV_USER=admin
 DAV_PASS=改成你的密码
 SLICE_MB=2000          # 分片大小，2000 是 4000 part × 512KB 的卡线值
 TG_PROXY=              # 可选，http://127.0.0.1:7890
+CACHE_MAX_GB=0         # 本地读缓存上限（GB），0 关闭；超限按 LRU 淘汰
 ```
 
 **同一个账号在不同网络出口跑，必须各自登录一次拿独立 session**。两边共用一个 session 会让 Telegram 判定为泄漏，直接吊销整个 auth key（`AuthKeyDuplicatedError`）。
@@ -124,6 +125,14 @@ python hashdir.py /path/to/dir -o out.json -j 8 -a sha256
 ```
 
 并行算目录里所有文件的哈希，输出 `{root, algo, count, total, files:{相对路径:{size, hash, mtime}}}`，用来对比两边拷贝是否一致。可用算法：`sha256` `xxh3_128` `xxh3_64` `md5` `blake2b` `sha1` `sha512` `sha3_256`。
+
+## 本地缓存与后台上传
+
+**读缓存**（`CACHE_MAX_GB`，默认 `0` 关闭）：读过的文件按内容身份留一份在 `cache/blobs/`（`TGND_CACHE` 改目录）。缓存键 = `sha256(索引 hash | 大小 | 分片消息 id 集合)`——任何一次重新上传都会换掉分片消息 id，键随之改变，所以缓存不可能比索引旧，追加写/原地覆盖/删了重传都不需要额外失效；同内容秒传复用同一批分片，键相同照样命中。淘汰按 mtime 升序（命中即刷新）= LRU，写入前先削出空间，另有 60 秒巡检兜底。命中的条目仍校验长度，不符就丢掉重下。缓存是纯目录、零内存状态、无锁，CLI 和 server 共用同一个目录，谁都不依赖谁活着。
+
+**后台上传**：WebDAV 的 `PUT` 不再等 TG。请求体落 `cache/staging/<hash>` 后立刻返回 `201`/`204`，后台按 `UPLOAD_QUEUE_WORKERS` 路把字节送上去。上传中的文件 `GET` 直接从 staging 读回来，不用等。队列不存路径，每次都从索引里现扫 `status=1`——`MOVE` 改了路径、`DELETE` 删了条目、同名覆盖顶掉旧内容都自动跟上；重启时用 `pending()` + staging 重建队列，没人认领的 staging 会被清掉。失败按指数退避重试 6 次，之后放弃但保留本地副本，索引里仍是「上传中」。
+
+**`tgnd get` 命中缓存**：大于 `GET_LINK_MIN_MB`（默认 16MB）的用硬链接 + `chmod 444`，零拷贝且缓存条目（共 inode）变只读，改不动就不会污染；小文件直接复制。
 
 ## 已知限制
 

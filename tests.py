@@ -23,6 +23,10 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 缓存目录必须是独立的临时目录：CACHE_DIR 在 import 时就固定了，先设再导
+os.environ["TGND_CACHE"] = tempfile.mkdtemp(prefix="tgnd_test_cache_")
+
+import store as S  # noqa: E402
 from store import (Store, SqliteBackend, make_session, is_db_msg, norm, digest_of,
                    LOCK_IDLE, LOCK_PREFIX, LockBusy)  # noqa: E402
 
@@ -39,6 +43,7 @@ class FakeClient:
         self._id = 0
         self._msgs = {}
         self._blobs = {}
+        self.downloads = 0          # iter_download 被调用的次数，用来判断缓存有没有命中
         self._uploads = {}          # file_id -> {part: bytes}  模拟 upload.saveBigFilePart
         self._pinned_ids = []       # 模拟置顶：只有置顶过的消息才会出现在 pinned 过滤里
 
@@ -142,6 +147,7 @@ class FakeClient:
             pinned_msg_id=self._pinned_ids[-1] if self._pinned_ids else None))
 
     async def iter_download(self, m, **kw):
+        self.downloads += 1
         data = self._blobs.get(m.id, b"")
         for i in range(0, len(data), 512 * 1024):
             yield data[i:i + 512 * 1024]
@@ -474,8 +480,9 @@ async def main():
         c3 = FakeClient()
         st3 = Store(c3, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
         st3.fast = True
+        up3 = srv.Uploader(st3, 1)          # 不 start：PUT 只落盘入队，字节留在本地
         app = web.Application(client_max_size=0)
-        app.router.add_route("*", "/{tail:.*}", lambda r: srv.handle(r, st3))
+        app.router.add_route("*", "/{tail:.*}", lambda r: srv.handle(r, st3, up3))
         old = os.environ.get("ONLINE")
         os.environ["ONLINE"] = "0"                   # 锁本身有独立用例，这里只验 HTTP 语义
         try:
@@ -905,6 +912,313 @@ async def main():
         assert ok == "ok", f"被 kill 后库损坏: {ok}"
         assert n >= 2, f"少量写入应保留，实际 {n}"
 
+    # ---------- 本地读缓存 ----------
+    BLOBS = os.path.join(S.CACHE_DIR, "blobs")
+
+    def blobs():
+        try:
+            return sorted(n for n in os.listdir(BLOBS) if not n.startswith("."))
+        except OSError:
+            return []
+
+    def wipe_cache():
+        for n in blobs():
+            try:
+                os.unlink(os.path.join(BLOBS, n))
+            except OSError:
+                pass
+        try:
+            for n in os.listdir(BLOBS):
+                if n.startswith(".dl-"):
+                    os.unlink(os.path.join(BLOBS, n))
+        except OSError:
+            pass
+
+    def cache_env(gb):
+        if gb is None:
+            os.environ.pop("CACHE_MAX_GB", None)
+        else:
+            os.environ["CACHE_MAX_GB"] = repr(gb)
+
+    async def t_cache_default_off():
+        cache_env(None)
+        wipe_cache()
+        data = rand(40000)
+        await put_bytes(st, data, f"{D}/cache/off")
+        assert await get_bytes(st, f"{D}/cache/off") == data
+        assert blobs() == [], f"缓存默认该关闭，却落了盘: {blobs()}"
+
+    async def t_cache_hit():
+        cache_env(1)
+        wipe_cache()
+        data = rand(300000)
+        await put_bytes(st, data, f"{D}/cache/hit", slice_size=64 * 1024)
+        assert await get_bytes(st, f"{D}/cache/hit") == data
+        assert len(blobs()) == 1, f"读完没落缓存: {blobs()}"
+        n = client.downloads
+        assert await get_bytes(st, f"{D}/cache/hit") == data
+        assert client.downloads == n, "第二次读仍然走了 TG"
+        assert len(blobs()) == 1, f"命中后又多出条目: {blobs()}"
+
+    async def t_cache_oversize():
+        cache_env(0.000005)                 # ≈5KB 上限
+        wipe_cache()
+        data = rand(20000)
+        await put_bytes(st, data, f"{D}/cache/big")
+        assert await get_bytes(st, f"{D}/cache/big") == data
+        assert blobs() == [], f"比上限还大的文件不该缓存: {blobs()}"
+
+    async def t_cache_lru():
+        cache_env(0.0003)                   # ≈314KB 上限
+        wipe_cache()
+        names = ["a", "b", "c", "d"]
+        datas = {n: rand(100000) for n in names}
+        for n in names:
+            await put_bytes(st, datas[n], f"{D}/cache/lru-{n}")
+        for n in names:
+            assert await get_bytes(st, f"{D}/cache/lru-{n}") == datas[n]
+            await asyncio.sleep(0.02)       # 拉开 mtime，LRU 才有确定的顺序
+        # 3×100KB 已缓存，读第 4 个要腾 100KB，只有最旧的 a 会被删
+        kept = blobs()
+        assert len(kept) == 3, f"淘汰后应剩 3 条，实际 {len(kept)}"
+        e = st.get(f"{D}/cache/lru-a")
+        assert S.cache_key(e) not in kept, "最旧的 a 没被淘汰"
+        n = client.downloads
+        assert await get_bytes(st, f"{D}/cache/lru-d") == datas["d"]   # d 还在，直接命中
+        assert client.downloads == n
+        assert await get_bytes(st, f"{D}/cache/lru-a") == datas["a"]   # a 被淘汰，重新下
+        assert client.downloads > n
+
+    async def t_cache_invalidate_overwrite():
+        cache_env(1)
+        wipe_cache()
+        await put_bytes(st, b"v1-xxxx", f"{D}/cache/inv")
+        assert await get_bytes(st, f"{D}/cache/inv") == b"v1-xxxx"
+        assert len(blobs()) == 1
+        await put_bytes(st, b"v2-yyyy", f"{D}/cache/inv")      # 重传 → 分片 id 变了
+        n = client.downloads
+        assert await get_bytes(st, f"{D}/cache/inv") == b"v2-yyyy", "覆盖后命中了旧缓存"
+        assert client.downloads > n, "覆盖后应该重新下载，而不是命中旧内容"
+
+    async def t_cache_dedup_share():
+        cache_env(1)
+        wipe_cache()
+        data = rand(50000)
+        await put_bytes(st, data, f"{D}/cache/d1")
+        await put_bytes(st, data, f"{D}/cache/d2")             # 秒传，共用同一批分片
+        assert await get_bytes(st, f"{D}/cache/d1") == data
+        n = client.downloads
+        assert await get_bytes(st, f"{D}/cache/d2") == data
+        assert client.downloads == n, "同内容的另一个路径没命中同一份缓存"
+
+    async def t_cache_move_hit():
+        cache_env(1)
+        wipe_cache()
+        data = rand(20000)
+        await put_bytes(st, data, f"{D}/cache/m1")
+        assert await get_bytes(st, f"{D}/cache/m1") == data
+        await st.move(f"{D}/cache/m1", f"{D}/cache/m2")        # move 只改路径，不动分片
+        n = client.downloads
+        assert await get_bytes(st, f"{D}/cache/m2") == data
+        assert client.downloads == n, "move 之后没命中缓存"
+
+    async def t_cache_corrupt():
+        cache_env(1)
+        wipe_cache()
+        data = rand(80000)
+        await put_bytes(st, data, f"{D}/cache/bad")
+        assert await get_bytes(st, f"{D}/cache/bad") == data
+        b = blobs()
+        assert len(b) == 1
+        with open(os.path.join(BLOBS, b[0]), "r+b") as f:
+            f.truncate(1000)               # 模拟落盘途中被杀 / 盘坏
+        n = client.downloads
+        assert await get_bytes(st, f"{D}/cache/bad") == data, "残片没被丢弃重下"
+        assert client.downloads > n, "残片应该触发重新下载"
+        assert len(blobs()) == 1, "重下后应重新落一份"
+
+    async def t_cache_abort_no_leftover():
+        cache_env(1)
+        wipe_cache()
+        data = rand(300000)
+        await put_bytes(st, data, f"{D}/cache/abort", slice_size=64 * 1024)
+        g = st.iter_content(f"{D}/cache/abort")
+        await g.__anext__()
+        await g.aclose()                   # 客户端中途断开
+        assert blobs() == [], f"中断后不该留缓存条目: {blobs()}"
+        left = [n for n in os.listdir(BLOBS) if n.startswith(".dl-")] \
+            if os.path.isdir(BLOBS) else []
+        assert left == [], f"中断后临时文件残留: {left}"
+
+    async def t_cache_concurrent():
+        cache_env(1)
+        wipe_cache()
+        data = rand(400000)
+        await put_bytes(st, data, f"{D}/cache/par", slice_size=64 * 1024)
+        outs = await asyncio.gather(*[get_bytes(st, f"{D}/cache/par") for _ in range(6)])
+        assert all(o == data for o in outs), "并发读的内容不一致"
+        assert len(blobs()) == 1, f"并发读落下多个条目: {blobs()}"
+        await asyncio.sleep(0.01)
+        n = client.downloads
+        assert await get_bytes(st, f"{D}/cache/par") == data
+        assert client.downloads == n
+
+    async def t_cache_path_independent():
+        cache_env(1)
+        wipe_cache()
+        d1, d2 = rand(30000), rand(30000)
+        await put_bytes(st, d1, f"{D}/cache/x1")
+        await put_bytes(st, d2, f"{D}/cache/x2")
+        assert await get_bytes(st, f"{D}/cache/x1") == d1
+        assert await get_bytes(st, f"{D}/cache/x2") == d2
+        assert len(blobs()) == 2, f"两个不同内容应各占一条: {blobs()}"
+        assert await get_bytes(st, f"{D}/cache/x1") == d1     # 不会串到 x2 的缓存
+        cache_env(None)                   # 收尾还原，别影响后面的用例
+
+    # ---------- 落盘即返回 + 后台上传 ----------
+    async def make_dav(start_up=True):
+        from aiohttp import web
+        from aiohttp.test_utils import TestClient, TestServer
+        import server as srv
+        c = FakeClient()
+        s2 = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+        s2.fast = True
+        up = srv.Uploader(s2, 1)
+        app = web.Application(client_max_size=0)
+        app.router.add_route("*", "/{tail:.*}", lambda r: srv.handle(r, s2, up))
+        cli = TestClient(TestServer(app))
+        await cli.start_server()
+        if start_up:
+            up.start()
+        return cli, s2, up, c, srv
+
+    async def stop_dav(cli, up):
+        for t in up.tasks:
+            t.cancel()
+        await cli.close()
+
+    async def t_up_accept():
+        cli, s2, up, c, srv = await make_dav(start_up=False)
+        try:
+            data = rand(300000)
+            r = await cli.put("/up/a.bin", data=data)
+            assert r.status == 201, f"PUT 应 201，实际 {r.status}"
+            e = s2.get("/up/a.bin")
+            assert e.status == 1, "PUT 返回时不该已经传完（这是落盘即返回）"
+            assert os.path.exists(S.staging_path(e.hash)), "staging 里没有本地副本"
+            n = c.downloads
+            r = await cli.get("/up/a.bin")
+            assert r.status == 200, f"上传中 GET 应能读到 staging，实际 {r.status}"
+            assert await r.read() == data, "从 staging 读回的内容不对"
+            assert c.downloads == n, "上传中的 GET 不该去 TG 取"
+        finally:
+            await stop_dav(cli, up)
+
+    async def t_up_finish():
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(300000)
+            assert (await cli.put("/up/b.bin", data=data)).status == 201
+            e = s2.get("/up/b.bin")
+            dig = e.hash
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                e = s2.get("/up/b.bin")
+                if e and e.status == 0:
+                    break
+            assert e.status == 0, "后台一直没传完"
+            assert not os.path.exists(S.staging_path(dig)), "传完没清掉 staging"
+            r = await cli.get("/up/b.bin")
+            assert await r.read() == data, "传完后从 TG 读回的内容不对"
+        finally:
+            await stop_dav(cli, up)
+
+    async def t_up_delete_pending():
+        cli, s2, up, c, srv = await make_dav(start_up=False)
+        try:
+            assert (await cli.put("/up/c.bin", data=rand(50000))).status == 201
+            e = s2.get("/up/c.bin")
+            dig = e.hash
+            assert os.path.exists(S.staging_path(dig))
+            r = await cli.delete("/up/c.bin")
+            assert r.status == 204
+            assert s2.get("/up/c.bin") is None
+            assert not os.path.exists(S.staging_path(dig)), "删了文件 staging 还留着"
+            assert not any(d == dig for _p, d, *_ in s2.backend.pending()), "pending 没清"
+        finally:
+            await stop_dav(cli, up)
+
+    async def t_up_move_pending():
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(120000)
+            assert (await cli.put("/up/m1.bin", data=data)).status == 201
+            r = await cli.request("MOVE", "/up/m1.bin",
+                                  headers={"Destination": str(cli.make_url("/up/m2.bin"))})
+            # 目标是新路径 → 201 Created（RFC 4918），覆盖已有目标才是 204
+            assert r.status in (201, 204), f"MOVE 失败 {r.status}"
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                e = s2.get("/up/m2.bin")
+                if e and e.status == 0:
+                    break
+            assert e is not None and e.status == 0, "改路径后后台没跟上（队列存了旧 path）"
+            r = await cli.get("/up/m2.bin")
+            assert await r.read() == data
+        finally:
+            await stop_dav(cli, up)
+
+    async def t_up_overwrite_pending():
+        cli, s2, up, c, srv = await make_dav(start_up=False)
+        try:
+            assert (await cli.put("/up/o.bin", data=b"v1" * 20000)).status == 201
+            d1 = s2.get("/up/o.bin").hash
+            assert (await cli.put("/up/o.bin", data=b"v2" * 20000)).status == 204
+            e = s2.get("/up/o.bin")
+            assert e.hash != d1, "覆盖后记录还是旧内容"
+            assert e.status == 1
+            assert os.path.exists(S.staging_path(e.hash)), "新内容的 staging 不在"
+        finally:
+            await stop_dav(cli, up)
+
+    async def t_up_crash_recover():
+        # 索引里留着 status=1、staging 有文件 = 崩溃后重启该续传的状态
+        cli, s2, up, c, srv = await make_dav(start_up=False)
+        try:
+            data = rand(200000)
+            assert (await cli.put("/up/r.bin", data=data)).status == 201
+            e = s2.get("/up/r.bin")
+            dig = e.hash
+            up2 = srv.Uploader(s2, 1)          # 模拟新进程起来
+            up2.start()                        # start 里会从 pending 重建队列
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                e = s2.get("/up/r.bin")
+                if e and e.status == 0:
+                    break
+            assert e.status == 0, "重启后没把 pending 续上"
+            assert not os.path.exists(S.staging_path(dig))
+            assert await get_bytes(s2, "/up/r.bin") == data
+            for t in up2.tasks:
+                t.cancel()
+        finally:
+            await stop_dav(cli, up)
+
+    async def t_up_gc_orphan_staging():
+        cli, s2, up, c, srv = await make_dav(start_up=False)
+        try:
+            orphan = os.path.join(S.staging_dir(), "f" * 40)
+            with open(orphan, "wb") as f:
+                f.write(b"junk")
+            up2 = srv.Uploader(s2, 1)
+            up2.start()                        # start 会顺手清掉没人认领的 staging
+            await asyncio.sleep(0.05)
+            assert not os.path.exists(orphan), "无主 staging 没被清掉"
+            for t in up2.tasks:
+                t.cancel()
+        finally:
+            await stop_dav(cli, up)
+
     for name, fn in [
         ("空文件", t_empty), ("1字节", t_one_byte), ("中文+空格", t_unicode),
         ("特殊字符", t_special), ("深目录", t_deep), ("多分片7片", t_multislice),
@@ -937,6 +1251,24 @@ async def main():
         ("竞态-推送中写入", t_race_snapshot_while_write),
         ("竞态-mv 与 cp 并发", t_race_mv_cp),
         ("竞态-kill 后恢复", t_race_kill_recovery),
+        ("缓存-默认关闭", t_cache_default_off),
+        ("缓存-命中不碰TG", t_cache_hit),
+        ("缓存-超上限不落盘", t_cache_oversize),
+        ("缓存-LRU淘汰最旧", t_cache_lru),
+        ("缓存-覆盖重传失效", t_cache_invalidate_overwrite),
+        ("缓存-秒传共享同一份", t_cache_dedup_share),
+        ("缓存-move后仍命中", t_cache_move_hit),
+        ("缓存-残片丢弃重下", t_cache_corrupt),
+        ("缓存-断连不留残迹", t_cache_abort_no_leftover),
+        ("缓存-并发读只落一份", t_cache_concurrent),
+        ("缓存-不同内容互不串", t_cache_path_independent),
+        ("上传-PUT立刻返回", t_up_accept),
+        ("上传-后台传完清staging", t_up_finish),
+        ("上传-删掉未传完的", t_up_delete_pending),
+        ("上传-移动后仍能传完", t_up_move_pending),
+        ("上传-覆盖未传完的", t_up_overwrite_pending),
+        ("上传-崩溃后重启续传", t_up_crash_recover),
+        ("上传-清无主staging", t_up_gc_orphan_staging),
     ]:
         await case(name, fn)
 

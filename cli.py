@@ -38,6 +38,10 @@ from store import (Store, LockBusy, norm, base_of, make_session,
 
 
 
+# 大到这个尺寸才值得硬链接（拷贝一次要几秒），小文件直接复制更省心
+LINK_MIN = int(os.environ.get("GET_LINK_MIN_MB", "16") or 16) * 1024 * 1024
+
+
 def load_env():
     if os.environ.get("TG_API_ID"):
         return
@@ -421,9 +425,41 @@ async def cmd_get(st, args):
     # 先写 .part 再替换：下载中途失败（分片缺失）不会留下半截文件冒充完整文件
     part = local + ".part"
     try:
-        with open(part, "wb") as f:
-            async for c in st.iter_content(remote):
-                f.write(c)
+        hit = st.cached_path(remote)
+        done = False
+        if hit and e.size >= LINK_MIN:
+            # 大文件优先硬链接：同 inode，零拷贝；缓存条目之后被 LRU 淘汰也只是少了
+            # 一个链接，inode 还挂在我们这个路径上，数据不会跟着没。
+            # 关键是把结果设成只读——硬链接和缓存条目共 inode，可写就等于把缓存池
+            # 敞开给人改，而命中只校验长度，改了同长度内容会污染所有引用它的路径。
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            try:
+                os.link(hit, part)
+                try:
+                    os.chmod(part, 0o444)
+                except OSError:
+                    pass
+                done = True
+                log(f"命中缓存，硬链接（只读）{os.path.basename(hit)[:12]}")
+            except OSError as ex:
+                # 跨文件系统（缓存盘和目标盘不是同一个）或目标不支持硬链接
+                log(f"硬链接不可用（{ex.strerror}），改为复制")
+        if not done and hit:
+            # 小文件直接复制，省得满盘都是独占 inode 的只读文件
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            shutil.copyfile(hit, part)           # 走内核 sendfile，比逐块 read/write 快
+            done = True
+            log(f"命中缓存，复制 {os.path.basename(hit)[:12]}")
+        if not done:
+            with open(part, "wb") as f:
+                async for c in st.iter_content(remote):
+                    f.write(c)
         os.replace(part, local)
     except BaseException:
         try:

@@ -48,6 +48,197 @@ def cache_file(name: str) -> str:
     return os.path.join(CACHE_DIR, name)
 
 
+# ---------- 本地读缓存 ----------
+# CACHE_MAX_GB=0（默认）关闭。>0 时把「分片齐、大小对得上」的文件留一份在
+# cache/blobs/ 下，下次读同一份内容直接走本地盘，不再碰 TG。
+#
+# 缓存键 = sha256(索引 hash | 大小 | 分片消息 id 集合)。任何一次重新上传都会换掉
+# 分片消息 id，键随之改变，所以缓存不可能比索引旧——追加写、原地覆盖、删了重传
+# 都自动失效，不需要额外的失效逻辑；同内容秒传复用同一批分片，键相同，照样命中。
+#
+# 淘汰按 mtime 升序（命中时 os.utime 刷新）= LRU；写之前先削出空间，另加低频巡检兜底。
+# 条目单独放 blobs/ 一层，跟 cache_file() 的临时文件（上传 part、下载暂存）隔开，
+# 淘汰逻辑永远不会误删正在用的临时文件。
+CACHE_CHUNK = 1 << 20          # 读缓存时的块大小
+CACHE_SWEEP_GAP = 60           # 巡检最短间隔（秒）
+_cache_swept_at = 0.0
+
+
+def cache_limit() -> int:
+    """上限字节数，<=0 表示关闭。每次读环境变量——env 是运行期才加载的。"""
+    try:
+        gb = float(os.environ.get("CACHE_MAX_GB", "0").strip() or "0")
+    except ValueError:
+        return 0
+    return int(gb * (1024 ** 3)) if gb > 0 else 0
+
+
+def blob_dir() -> str:
+    d = os.path.join(CACHE_DIR, "blobs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cache_key(e) -> str:
+    """这条记录的内容身份；拿不到（缓存关闭 / 上传中 / 空文件）返回空串。"""
+    if cache_limit() <= 0 or not e or e.is_dir or e.status == 1:
+        return ""
+    ids = part_ids(e.parts)
+    if not ids:
+        return ""
+    raw = "%s|%d|%s" % (e.hash or "", e.size or 0, ",".join(map(str, ids)))
+    return hashlib.sha256(raw.encode()).hexdigest()[:40]
+
+
+def staging_dir() -> str:
+    """待上传文件落盘的地方。写成「落盘即返回」以后，它就是这个功能的磁盘底。"""
+    d = os.path.join(CACHE_DIR, "staging")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def staging_path(digest: str) -> str:
+    return os.path.join(staging_dir(), digest) if digest else ""
+
+
+def staging_drop(digest: str):
+    """收掉一份 staging。传完、被顶替、被删的时候调。"""
+    p = staging_path(digest)
+    if not p:
+        return
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+
+
+def _scan_dir(d: str, collect: bool):
+    items, total = [], 0
+    try:
+        it = os.scandir(d)
+    except OSError:
+        return 0, items
+    with it:
+        for de in it:
+            if de.name.startswith("."):
+                continue
+            try:
+                if not de.is_file(follow_symlinks=False):
+                    continue
+                st = de.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            total += st.st_size
+            if collect:
+                items.append((st.st_mtime, st.st_size, de.path))
+    return total, items
+
+
+def _cache_usage():
+    """本地占用 = 读缓存 + staging。返回 (总占用, 可淘汰条目)。
+
+    staging 里的文件正在等着上传，只计入占用、不进淘汰列表——不然传一半的
+    文件会被自己腾空间的逻辑删掉，那才是真丢数据。
+    """
+    live, items = _scan_dir(blob_dir(), True)
+    pend, _ = _scan_dir(os.path.join(CACHE_DIR, "staging"), False)
+    return live + pend, items
+
+
+def cache_trim(need: int = 0, keep: str = "") -> int:
+    """削到 limit 以内并预留 need 字节，由旧到新删。返回释放的字节数。"""
+    limit = cache_limit()
+    if limit <= 0:
+        return 0
+    total, items = _cache_usage()
+    if total + need <= limit:
+        return 0
+    items.sort()
+    freed = 0
+    for _, size, p in items:
+        if total + need <= limit:
+            break
+        if p == keep:
+            continue
+        try:
+            os.unlink(p)
+        except OSError:
+            continue
+        total -= size
+        freed += size
+    return freed
+
+
+def staging_ok(size: int) -> bool:
+    """这么大的文件还能不能落进 staging。
+
+    有总预算（CACHE_MAX_GB>0）时，读缓存给 staging 让路：先淘汰，淘汰完还是装不下
+    就拒绝这次上传；预算关掉时只盯磁盘，留 2G 别把机器写死。
+    """
+    limit = cache_limit()
+    if limit > 0:
+        total, _ = _cache_usage()
+        if total + size > limit:
+            cache_trim(need=size)
+            total, _ = _cache_usage()
+        return total + size <= limit
+    try:
+        st = os.statvfs(CACHE_DIR)
+    except OSError:
+        return True
+    avail = st.f_bavail * st.f_frsize
+    # 留一点余量别把盘写死；小盘（比如 tmpfs）上按 20% 算，别一律卡 2G
+    return avail >= size + min(2 << 30, int(avail * 0.2))
+
+
+def cache_sweep(gap: float = CACHE_SWEEP_GAP) -> int:
+    """低频巡检：超限就按 LRU 删。gap 秒内只真扫一次。"""
+    global _cache_swept_at
+    if cache_limit() <= 0:
+        return 0
+    now = time.monotonic()
+    if now - _cache_swept_at < gap:
+        return 0
+    _cache_swept_at = now
+    freed = cache_trim(0)
+    if freed:
+        log.info("缓存巡检释放 %.1f MB", freed / (1024.0 ** 2))
+    return freed
+
+
+def cache_commit(tmp: str, key: str, size: int) -> str:
+    """把下完整的临时文件原子落进缓存；装不下就丢掉。返回落地路径或空串。"""
+    limit = cache_limit()
+    if not key or size <= 0 or size > limit:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return ""
+    dst = os.path.join(blob_dir(), key)
+    cache_trim(need=size, keep=dst)
+    total, _ = _cache_usage()
+    if total + size > limit:      # staging 把预算吃满了，读缓存先让路
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return ""
+    try:
+        # 临时文件同目录 + rename：别的进程要么看到旧的、要么看到完整的，读不到半个文件；
+        # 正在读的进程即使条目被淘汰，已打开的 fd 也照样能读完。
+        os.replace(tmp, dst)
+    except OSError as ex:
+        log.warning("缓存落盘失败 %s: %s", key[:12], ex)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return ""
+    log.info("缓存写入 %s (%.1f MB)", key[:12], size / (1024.0 ** 2))
+    return dst
+
+
 DB_PATH = os.environ.get("TGND_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tgnd.db"))
 BACKEND = os.environ.get("TGND_BACKEND", "sqlite")
 DB_NAME = "tgnd.db.xz"
@@ -956,9 +1147,22 @@ class Store:
 
         if size:
             await self._send_slices(local_path, tag, 0, size, parts, S)
+        orphan = None
         async with self.mutex:
-            self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts))
-            self.dirty = True
+            # 字节传完可能已经过了几分钟，这中间这条记录完全可能被删掉、被同名覆盖。
+            # 不复核就提交，会把删掉的路径重新挂回索引，或者拿旧字节顶掉新内容。
+            cur = self.backend.get(p)
+            if cur is None or cur.is_dir or cur.status != 1:
+                orphan = list(parts.values())
+            elif digest and cur.hash and cur.hash != digest:
+                orphan = list(parts.values())
+            else:
+                self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts))
+                self.dirty = True
+        if orphan:
+            log.info("上传期间记录已失效，丢弃刚传的 %d 个分片: %s", len(orphan), p)
+            await self._del_ids(orphan)
+            return self.backend.get(p)
         old = self._replaced.pop(p, None)
         if old is not None:
             await self._release_hash(old)
@@ -1045,7 +1249,8 @@ class Store:
                 if x.is_dir:
                     self.backend.set_dir(newp, x.mtime)
                 else:
-                    self.backend.set_file(newp, x.hash, x.size, x.mtime, x.parts, 0, 0)
+                    self.backend.set_file(newp, x.hash, x.size, x.mtime, x.parts,
+                                        x.status, x.expect)
             for x in rows:
                 self.backend.remove(x.path)
             self.dirty = True
@@ -1071,17 +1276,85 @@ class Store:
                 if x.is_dir:
                     self.backend.set_dir(newp, x.mtime)
                 else:
-                    self.backend.set_file(newp, x.hash, x.size, x.mtime, x.parts, 0, 0)
+                    self.backend.set_file(newp, x.hash, x.size, x.mtime, x.parts,
+                                        x.status, x.expect)
             self.dirty = True
 
     # ---------- 读取内容 ----------
+    def cached_path(self, path: str) -> str:
+        """命中本地读缓存就返回它，否则空串（命中会顺手刷新 LRU）。
+
+        返回的是共享缓存池里的文件：随时可能被淘汰，别拿它当最终结果交出去，
+        只适合本进程立刻 copyfile / 打开读。
+        """
+        e = self.backend.get(path)
+        if not e or e.is_dir or e.status == 1:
+            return ""
+        key = cache_key(e)
+        if not key:
+            return ""
+        p = os.path.join(CACHE_DIR, "blobs", key)
+        try:
+            if e.size and os.path.getsize(p) != e.size:
+                return ""
+            os.utime(p, None)
+        except OSError:
+            return ""
+        return p
+
     async def iter_content(self, path: str, verify: bool = True):
-        """按分片顺序流式吐出内容；verify=True 时边下边算 hash，结束时跟索引比对。"""
+        """按分片顺序流式吐出内容；verify=True 时边下边算 hash，结束时跟索引比对。
+
+        开了本地缓存（CACHE_MAX_GB>0）多走一步：命中直接读本地盘，未命中边下边落盘。
+        """
         e = self.backend.get(path)
         if not e or e.is_dir or e.status == 1:
             raise FileNotFoundError(path)
+        cache_sweep()
+        key = cache_key(e)
+        if key:
+            cp = os.path.join(CACHE_DIR, "blobs", key)
+            try:
+                f = await asyncio.to_thread(open, cp, "rb")
+            except OSError:
+                f = None
+            if f is not None:
+                # 先比长度再吐字节：残片一旦 yield 出去就收不回来了，
+                # 客户端会拿到「坏前缀 + 重下内容」拼起来的怪东西。
+                try:
+                    fsize = await asyncio.to_thread(os.path.getsize, cp)
+                except OSError:
+                    fsize = -1
+                if e.size and fsize != e.size:
+                    log.warning("缓存条目长度不符，弃用重下: %s 本地 %d 字节 / 记录 %s",
+                                path, fsize, e.size)
+                    f.close()
+                    try:
+                        os.unlink(cp)
+                    except OSError:
+                        pass
+                else:
+                    await asyncio.to_thread(os.utime, cp, None)     # 刷新 LRU 位置
+                    try:
+                        while True:
+                            b = await asyncio.to_thread(f.read, CACHE_CHUNK)
+                            if not b:
+                                break
+                            yield b
+                    finally:
+                        f.close()
+                    return
         h = hashlib.shake_128()
         got = 0
+        tmp = None
+        fh = None
+        if key:
+            try:
+                fd, tmp = tempfile.mkstemp(prefix=".dl-", dir=blob_dir())
+                fh = os.fdopen(fd, "wb")
+            except OSError as ex:
+                log.warning("缓存临时文件创建失败: %s", ex)
+                tmp = fh = None
         # 分片按序号排好，再按批预取消息对象：一片一次 get_messages 的话，
         # 一个 20 片的大文件光取消息就要 20 个 RTT（到 DC4 单程 250ms）。
         order = []
@@ -1089,52 +1362,58 @@ class Store:
             order.append((k, part_id(e.parts[k])))
         batch = 50
         missing = []
-        for i in range(0, len(order), batch):
-            chunk = order[i:i + batch]
-            try:
-                msgs = await self.client.get_messages(self.chat, ids=[mid for _, mid in chunk])
-            except Exception as ex:
-                log.warning("取分片消息失败 %s: %s", path, ex)
-                msgs = []
-            by_id = {m.id: m for m in (msgs or []) if m}
-            for k, mid in chunk:
-                m = by_id.get(mid)
-                if not m or not getattr(m, "document", None):
-                    log.warning("分片缺失: %s idx=%s msg=%s", path, k, mid)
-                    missing.append(k)
-                    continue
-                async for piece in self.client.iter_download(m):
-                    h.update(piece)
-                    got += len(piece)
-                    yield piece
-        if missing:
-            # 静默跳过会交付一个截断但「看起来成功」的文件，下载端必须知道失败。
-            raise IOError(f"{path} 缺 {len(missing)} 个分片 (idx {sorted(missing)[:10]}, "
-                          f"共 {len(order)} 片)，只读到 {got} 字节")
-        if e.size and got != e.size:
-            # 大小不符是硬错误：交付出去的就是残缺文件
-            raise IOError(f"{path} 下载大小不符: 实际 {got} / 记录 {e.size}")
-        if verify and e.hash:
-            d = h.hexdigest(16)
-            if d != e.hash:
-                # 分块追加写入（put --offset/--length）的记录只有首块的 hash，
-                # 内容合法但对不上，这里只告警；真正的数据缺失由上面的分片/大小检查兜住。
-                log.warning("下载校验不一致: %s 期望 %s 实际 %s（%d 字节 / 记录 %s 字节）",
-                            path, e.hash, d, got, e.size)
-
-    async def download_to_temp(self, path: str) -> str:
-        # 落 CACHE_DIR 而不是 /tmp：服务器 /tmp 是 tmpfs，下载大文件会把内存吃穿
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix="tgnd_dl_", dir=CACHE_DIR)
-        ok = False
         try:
-            with os.fdopen(fd, "wb") as f:
-                async for piece in self.iter_content(path):
-                    f.write(piece)
-            ok = True
-            return tmp
+            for i in range(0, len(order), batch):
+                chunk = order[i:i + batch]
+                try:
+                    msgs = await self.client.get_messages(self.chat, ids=[mid for _, mid in chunk])
+                except Exception as ex:
+                    log.warning("取分片消息失败 %s: %s", path, ex)
+                    msgs = []
+                by_id = {m.id: m for m in (msgs or []) if m}
+                for k, mid in chunk:
+                    m = by_id.get(mid)
+                    if not m or not getattr(m, "document", None):
+                        log.warning("分片缺失: %s idx=%s msg=%s", path, k, mid)
+                        missing.append(k)
+                        continue
+                    async for piece in self.client.iter_download(m):
+                        h.update(piece)
+                        got += len(piece)
+                        if fh is not None:
+                            fh.write(piece)
+                        yield piece
+            if missing:
+                # 静默跳过会交付一个截断但「看起来成功」的文件，下载端必须知道失败。
+                raise IOError(f"{path} 缺 {len(missing)} 个分片 (idx {sorted(missing)[:10]}, "
+                              f"共 {len(order)} 片)，只读到 {got} 字节")
+            if e.size and got != e.size:
+                # 大小不符是硬错误：交付出去的就是残缺文件
+                raise IOError(f"{path} 下载大小不符: 实际 {got} / 记录 {e.size}")
+            if verify and e.hash:
+                d = h.hexdigest(16)
+                if d != e.hash:
+                    # 分块追加写入（put --offset/--length）的记录只有首块的 hash，
+                    # 内容合法但对不上，这里只告警；真正的数据缺失由上面的分片/大小检查兜住。
+                    log.warning("下载校验不一致: %s 期望 %s 实际 %s（%d 字节 / 记录 %s 字节）",
+                                path, e.hash, d, got, e.size)
+            # 分片齐、大小对，才把这份内容留在本地
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+                fh = None
+                cache_commit(tmp, key, got)
+                tmp = None
         finally:
-            if not ok:
+            # 客户端中途断开（GeneratorExit）或出错：临时文件必须清掉
+            if fh is not None:
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+            if tmp:
                 try:
                     os.unlink(tmp)
                 except OSError:
