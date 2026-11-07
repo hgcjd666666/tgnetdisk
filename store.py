@@ -518,12 +518,19 @@ class SqliteBackend(Backend):
         return out
 
     def dump(self, dst):
-        """导出快照。WAL 模式下主库文件可能不含最新数据，必须用 backup API 生成一致性副本。"""
+        """导出快照。WAL 模式下主库文件可能不含最新数据，必须用 backup API 生成一致性副本。
+
+        副本里的 meta.dirty 一律写成 0：快照代表「这份索引已经落库」的稳态。推送方
+        dump 时本地的 dirty 还没清，不抹掉的话快照里会带着 dirty=1，拉取方 load()
+        看到它会以为本地还有没推上去的改动，白白先推一次快照。
+        """
         self.db.commit()
         tmpdb = dst + ".db"
         try:
             out = sqlite3.connect(tmpdb)
             self.db.backup(out)
+            out.execute("update meta set v='0' where k='dirty'")
+            out.commit()
             out.close()
             with open(tmpdb, "rb") as src, lzma.open(dst, "wb", preset=9) as fp:
                 shutil.copyfileobj(src, fp)

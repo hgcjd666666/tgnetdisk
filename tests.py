@@ -13,7 +13,9 @@ import asyncio
 import datetime
 import hashlib
 import io
+import lzma
 import os
+import sqlite3
 import sys
 import tempfile
 import traceback
@@ -604,6 +606,28 @@ async def main():
         assert other._holding
         await other.release()
 
+    async def t_snapshot_dirty_clean():
+        # 写入后本地 dirty=1，但 dump 出来的快照副本里必须是 dirty=0
+        await put_bytes(st, rand(8), "/snap/a.bin")
+        assert st.dirty, "写入后本地 dirty 应为 1"
+        fd, xz = tempfile.mkstemp(suffix=".xz")
+        os.close(fd)
+        fd, db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            st.backend.dump(xz)
+            with lzma.open(xz) as f:
+                with open(db, "wb") as o:
+                    o.write(f.read())
+            c = sqlite3.connect(db)
+            row = c.execute("select v from meta where k='dirty'").fetchone()
+            c.close()
+            assert row == ("0",), f"快照副本里 dirty 应为 0，实际 {row}"
+            assert st.dirty, "dump 不应改动本地 dirty"
+        finally:
+            os.unlink(xz)
+            os.unlink(db)
+
     for name, fn in [
         ("空文件", t_empty), ("1字节", t_one_byte), ("中文+空格", t_unicode),
         ("特殊字符", t_special), ("深目录", t_deep), ("多分片7片", t_multislice),
@@ -621,6 +645,7 @@ async def main():
         ("同名 hash.0 不覆盖", t_foreign_part_msg), ("环形超长行", t_ring_long_line),
         ("锁-空频道自建快照", t_lock_bootstrap), ("锁-重复acquire幂等", t_lock_reacquire),
         ("锁-双节点互斥", t_lock_busy),
+        ("快照里的 dirty 恒为 0", t_snapshot_dirty_clean),
     ]:
         await case(name, fn)
 
