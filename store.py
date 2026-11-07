@@ -31,7 +31,9 @@ from telethon.tl.types import DocumentAttributeFilename, InputFileBig
 
 log = logging.getLogger("store")
 
-SLICE = int(os.environ.get("SLICE_MB", "2047")) * 1024 * 1024
+# 单个分片上限由 TG 的「4000 个 part、每 part 512KB」决定：4000*512KB = 2000MB 整。
+# 2047MB 会切成 4094 个 part，直接 FilePartsInvalidError，所以卡着线设 2000。
+SLICE = int(os.environ.get("SLICE_MB", "2000")) * 1024 * 1024
 PART = int(os.environ.get("UPLOAD_PART_KB", "512")) * 1024   # 单个分块的字节数
 WORKERS = int(os.environ.get("UPLOAD_WORKERS", "2"))       # 同时在传的分块数
 # 上传缓存目录：默认放脚本旁边的 cache/，不放 /tmp（服务器 /tmp 是 tmpfs，大文件会把内存吃穿）
@@ -1290,10 +1292,16 @@ class Store:
 
     @staticmethod
     def _make_token() -> str:
-        """锁标识：盐由 TG_SESSION 派生，再和 session 一起哈希。"""
+        """锁标识：盐由 TG_SESSION 派生，再和节点名一起哈希。
+
+        TGND_NODE 用来区分同一台机器上的入口（server / cli）：同一个 session 下
+        两者 token 必须不同，否则 acquire 会把对方持有的锁当成自己的（cur == mine
+        直接 return），两个进程同时写索引。
+        """
         sess = os.environ.get("TG_SESSION", "")
-        salt = hashlib.sha256(sess.encode()).hexdigest()[:16]
-        return hashlib.sha256((salt + sess).encode()).hexdigest()[:32]
+        node = os.environ.get("TGND_NODE", "")
+        salt = hashlib.sha256((sess + "|" + node).encode()).hexdigest()[:16]
+        return hashlib.sha256((salt + sess + node).encode()).hexdigest()[:32]
 
     async def _pinned(self, limit: int = 50):
         """只看置顶消息。全量扫聊天记录只应出现在显式 reindex 里。"""

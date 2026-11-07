@@ -178,7 +178,11 @@ async def cmd_put(st, args):
     while i < len(args):
         a = args[i]
         if a in ("--slice", "-s"):
-            slice_size = parse_size(args[i + 1]); i += 2
+            raw = args[i + 1]
+            slice_size = parse_size(raw)
+            if raw.strip().upper()[-1:] not in ("K", "M", "G", "T"):
+                slice_size *= 1024 ** 2        # 无单位按 MB，和文档/直觉一致（1900 就是 1900MB）
+            i += 2
         elif a in ("--offset", "-o"):
             offset = parse_size(args[i + 1]); i += 2
         elif a in ("--length", "-l"):
@@ -538,6 +542,7 @@ async def cmd_logs(st, args):
 async def main():
     argv = sys.argv[1:]
     load_env()
+    os.environ.setdefault("TGND_NODE", "cli")     # 和 server 用不同的锁身份
     configure(log_file=os.environ.get("TGND_LOG", ""),
               log_max=int(os.environ.get("TGND_LOG_MAX") or 0),
 )

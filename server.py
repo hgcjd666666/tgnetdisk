@@ -386,6 +386,7 @@ async def ensure_chat(client, cfg_path="/opt/tgnd/chat.json", title="tgnd") -> i
 
 
 async def main():
+    os.environ.setdefault("TGND_NODE", "server")   # 和 cli 用不同的锁身份
     logger.configure(log_file=os.environ.get("TGND_LOG", ""),
                      log_max=int(os.environ.get("TGND_LOG_MAX") or 0),
 )

@@ -47,7 +47,7 @@ TG_DEVICE=tgnd-52      # 设备名，多节点各用各的
 PORT=8090
 DAV_USER=admin
 DAV_PASS=改成你的密码
-SLICE_MB=2047          # 分片大小，2047 是 2GB 内的最大值
+SLICE_MB=2000          # 分片大小，2000 是 4000 part × 512KB 的卡线值
 TG_PROXY=              # 可选，http://127.0.0.1:7890
 ```
 
@@ -68,8 +68,8 @@ python cli.py ls /backup                       # 列目录
 python cli.py ll /backup                       # 带大小和时间
 python cli.py mkdir /backup/new
 python cli.py put 本地文件 /backup/name.bin       # 上传
-python cli.py put --slice 5 大文件 /backup/big.bin            # 指定分片大小(MB)
-python cli.py put --slice 5 --offset 1024 a.bin /backup/big.bin  # 续传：从第 1GB 起，按 5MB 切片
+python cli.py put --slice 1900 大文件 /backup/big.bin         # 指定分片大小，无单位按 MB
+python cli.py put --slice 1900 --offset 1024 a.bin /backup/big.bin  # 续传：从第 1GB 起，按 1900MB 切片
 python cli.py get /backup/big.bin ./下载名
 python cli.py rm /backup/big.bin                 # -r 递归
 python cli.py mv /backup/a /backup/b
@@ -127,7 +127,7 @@ python hashdir.py /path/to/dir -o out.json -j 8 -a sha256
 
 ## 已知限制
 
-- **单个分片 2GB**：TG 普通账号对「一个文件」的限额，靠切分片绕开，整体大小不受影响；`SLICE_MB` 别超过 2047。
+- **单个分片 2000MB**：TG 对「一个文件」的限制其实是 4000 个 part × 512KB，2000MB 正好卡线；`SLICE_MB` 超过 2047 会在 `SaveBigFilePartRequest` 上报 `FilePartsInvalidError`（2047MB = 4094 个 part）。整体文件大小不受影响，靠切分片绕开。
 - **0 字节文件**：TG 不收空文件，只登记索引，不产生消息。
 - **速度**：`send_file` 实测 380–690 KB/s（香港 → DC4），瓶颈在 TG，不在本地。
 - **共享账号别乱开**：同一个 session 在两个 IP 上同时用会被吊销 auth key。
