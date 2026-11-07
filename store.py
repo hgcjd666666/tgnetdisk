@@ -8,7 +8,7 @@
 """
 import abc
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 import hashlib
 import io
 import json
@@ -382,49 +382,76 @@ class Backend(abc.ABC):
 
 
 class SqliteBackend(Backend):
+    """SQLite 索引库。每个方法自己开连接、用完就关。
+
+    db 是单个文件，CLI 和服务可能同时活着。常驻一条连接的话，另一边
+    restore() 用 os.replace 换掉文件后，这边还攥着旧 inode，往里写的数据
+    就成了孤儿。按操作开关连接，每次打开拿到的都是当前那个文件。
+    """
+
     def __init__(self, path: str = DB_PATH):
         self.path = path
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
-        self._open()
+        with self._conn() as db:
+            self._init_db(db)
 
-    def _open(self):
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.executescript("""
+    @contextmanager
+    def _conn(self):
+        db = None
+        for _ in range(5):
+            try:
+                db = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
+                break
+            except sqlite3.OperationalError:
+                time.sleep(0.02)          # 正好撞上 restore 的 unlink/replace 窗口
+        if db is None:
+            raise RuntimeError(f"打不开索引库: {self.path}")
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            yield db
+            db.commit()
+        finally:
+            db.close()
+
+    @staticmethod
+    def _init_db(db):
+        """建表 + 老库迁移。幂等，初始化后和 restore 之后各调一次。"""
+        db.executescript("""
             CREATE TABLE IF NOT EXISTS files(
                 path TEXT PRIMARY KEY, hash TEXT NOT NULL, size INTEGER DEFAULT 0,
                 mtime INTEGER DEFAULT 0, parts TEXT DEFAULT '{}');
             CREATE TABLE IF NOT EXISTS dirs(path TEXT PRIMARY KEY, mtime INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
         """)
-        cols = {r[1] for r in self.db.execute("PRAGMA table_info(files)")}
+        cols = {r[1] for r in db.execute("PRAGMA table_info(files)")}
         if "status" not in cols:
-            self.db.execute("ALTER TABLE files ADD COLUMN status INTEGER DEFAULT 0")
+            db.execute("ALTER TABLE files ADD COLUMN status INTEGER DEFAULT 0")
         if "expect" not in cols:
-            self.db.execute("ALTER TABLE files ADD COLUMN expect INTEGER DEFAULT 0")
+            db.execute("ALTER TABLE files ADD COLUMN expect INTEGER DEFAULT 0")
         if "name" in cols and "hash" in cols:
             # 老库还留着已废弃的 name 列，启动时顺手扔掉（SQLite 3.35+）
             try:
-                self.db.execute("ALTER TABLE files DROP COLUMN name")
+                db.execute("ALTER TABLE files DROP COLUMN name")
             except Exception:
                 pass
         if "md5" in cols and "hash" not in cols:
-            self.db.execute("ALTER TABLE files RENAME COLUMN md5 TO hash")
+            db.execute("ALTER TABLE files RENAME COLUMN md5 TO hash")
         # 索引放在迁移之后建：旧库先改列名，否则 CREATE INDEX 会报 no such column
-        self.db.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash)")
-        self.db.commit()
+        db.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash)")
+        db.commit()
 
     def get(self, path):
         p = norm(path)
         if p == "/":
             return Entry("/", True, int(time.time()))
-        r = self.db.execute(
-            "select path,hash,size,mtime,parts,status,expect from files where path=?", (p,)).fetchone()
-        if r:
-            return Entry(r[0], False, r[3], r[1], r[2], load_parts(r[4]), r[5], r[6])
-        r = self.db.execute("select path,mtime from dirs where path=?", (p,)).fetchone()
+        with self._conn() as db:
+            r = db.execute(
+                "select path,hash,size,mtime,parts,status,expect from files where path=?", (p,)).fetchone()
+            if r:
+                return Entry(r[0], False, r[3], r[1], r[2], load_parts(r[4]), r[5], r[6])
+            r = db.execute("select path,mtime from dirs where path=?", (p,)).fetchone()
         if r:
             return Entry(r[0], True, r[1])
         return None
@@ -437,86 +464,94 @@ class SqliteBackend(Backend):
         # "\uffff"(EF BF BF) 小于 emoji 等 4 字节字符(F0..)，会把 /a/😀 漏在范围外。
         hi = pre[:-1] + "0"
         out = []
-        for k, m in self.db.execute(
-                "select path,mtime from dirs where path>=? and path<?", (pre, hi)):
-            rest = k[len(pre):]
-            if rest and "/" not in rest:
-                out.append(Entry(k, True, m))
-        for row in self.db.execute(
-                "select path,hash,size,mtime,parts,status,expect from files"
-                " where path>=? and path<?", (pre, hi)):
-            rest = row[0][len(pre):]
-            if rest and "/" not in rest:
-                out.append(Entry(row[0], False, row[3], row[1], row[2],
-                                 load_parts(row[4]), row[5], row[6]))
+        with self._conn() as db:
+            for k, m in db.execute(
+                    "select path,mtime from dirs where path>=? and path<?", (pre, hi)):
+                rest = k[len(pre):]
+                if rest and "/" not in rest:
+                    out.append(Entry(k, True, m))
+            for row in db.execute(
+                    "select path,hash,size,mtime,parts,status,expect from files"
+                    " where path>=? and path<?", (pre, hi)):
+                rest = row[0][len(pre):]
+                if rest and "/" not in rest:
+                    out.append(Entry(row[0], False, row[3], row[1], row[2],
+                                     load_parts(row[4]), row[5], row[6]))
         out.sort(key=lambda x: (not x.is_dir, x.name.lower()))
         return out
 
     def all_entries(self):
         out = {"/": Entry("/", True, int(time.time()))}
-        for p, m in self.db.execute("select path,mtime from dirs"):
-            out[p] = Entry(p, True, m)
-        for p, hash, size, mtime, parts, st, ex in self.db.execute(
-                "select path,hash,size,mtime,parts,status,expect from files"):
-            out[p] = Entry(p, False, mtime, hash, size, load_parts(parts), st, ex)
+        with self._conn() as db:
+            for p, m in db.execute("select path,mtime from dirs"):
+                out[p] = Entry(p, True, m)
+            for p, hash, size, mtime, parts, st, ex in db.execute(
+                    "select path,hash,size,mtime,parts,status,expect from files"):
+                out[p] = Entry(p, False, mtime, hash, size, load_parts(parts), st, ex)
         return out
 
     def set_file(self, path, hash, size, mtime, parts, status=0, expect=0):
-        self.db.execute(
-            "insert or replace into files(path,hash,size,mtime,parts,status,expect)"
-            " values(?,?,?,?,?,?,?)",
-            (norm(path), hash, size, mtime, dump_parts(parts), status, expect))
-        self.db.commit()
+        with self._conn() as db:
+            db.execute(
+                "insert or replace into files(path,hash,size,mtime,parts,status,expect)"
+                " values(?,?,?,?,?,?,?)",
+                (norm(path), hash, size, mtime, dump_parts(parts), status, expect))
 
     def pending(self):
-        return [tuple(r) for r in self.db.execute(
-            "select path,hash,expect,size,mtime from files where status=1")]
+        with self._conn() as db:
+            return [tuple(r) for r in db.execute(
+                "select path,hash,expect,size,mtime from files where status=1")]
 
     def get_meta(self, k, default=""):
-        r = self.db.execute("select v from meta where k=?", (k,)).fetchone()
+        with self._conn() as db:
+            r = db.execute("select v from meta where k=?", (k,)).fetchone()
         return r[0] if r else default
 
     def set_meta(self, k, v):
-        self.db.execute("insert into meta(k,v) values(?,?) "
-                        "on conflict(k) do update set v=?", (k, str(v), str(v)))
-        self.db.commit()
+        with self._conn() as db:
+            db.execute("insert into meta(k,v) values(?,?) "
+                       "on conflict(k) do update set v=?", (k, str(v), str(v)))
 
     def existing_dirs(self, paths):
         if not paths:
             return set()
         q = ",".join("?" * len(paths))
-        return {r[0] for r in self.db.execute(
-            f"select path from dirs where path in ({q})", list(paths))}
+        with self._conn() as db:
+            return {r[0] for r in db.execute(
+                f"select path from dirs where path in ({q})", list(paths))}
 
     def add_dirs(self, paths, mtime):
         if not paths:
             return
-        self.db.executemany(
-            "insert or replace into dirs(path,mtime) values(?,?)",
-            [(norm(p), mtime) for p in paths])
+        with self._conn() as db:
+            db.executemany(
+                "insert or replace into dirs(path,mtime) values(?,?)",
+                [(norm(p), mtime) for p in paths])
 
     def set_dir(self, path, mtime):
-        self.db.execute("insert or replace into dirs(path,mtime) values(?,?)", (norm(path), mtime))
-        self.db.commit()
+        with self._conn() as db:
+            db.execute("insert or replace into dirs(path,mtime) values(?,?)", (norm(path), mtime))
 
     def remove(self, path):
         p = norm(path)
-        self.db.execute("delete from files where path=?", (p,))
-        self.db.execute("delete from dirs where path=?", (p,))
-        self.db.commit()
+        with self._conn() as db:
+            db.execute("delete from files where path=?", (p,))
+            db.execute("delete from dirs where path=?", (p,))
 
     def find_by_hash(self, hash):
-        return [(r[0], r[1], load_parts(r[2])) for r in self.db.execute(
-            "select path,size,parts from files where hash=?", (hash,))]
+        with self._conn() as db:
+            return [(r[0], r[1], load_parts(r[2])) for r in db.execute(
+                "select path,size,parts from files where hash=?", (hash,))]
 
     def paths_under(self, prefix):
         prefix = norm(prefix)
         pre = prefix.rstrip("/") + "/"
         hi = pre[:-1] + "0"        # 同 children()：不能用 "\uffff"，会漏掉 emoji 路径
-        out = [x[0] for x in self.db.execute(
-            "select path from dirs where path=? or (path>=? and path<?)", (prefix, pre, hi))]
-        out += [x[0] for x in self.db.execute(
-            "select path from files where path=? or (path>=? and path<?)", (prefix, pre, hi))]
+        with self._conn() as db:
+            out = [x[0] for x in db.execute(
+                "select path from dirs where path=? or (path>=? and path<?)", (prefix, pre, hi))]
+            out += [x[0] for x in db.execute(
+                "select path from files where path=? or (path>=? and path<?)", (prefix, pre, hi))]
         return out
 
     def dump(self, dst):
@@ -526,14 +561,14 @@ class SqliteBackend(Backend):
         dump 时本地的 dirty 还没清，不抹掉的话快照里会带着 dirty=1，拉取方 load()
         看到它会以为本地还有没推上去的改动，白白先推一次快照。
         """
-        self.db.commit()
         tmpdb = dst + ".db"
         try:
-            out = sqlite3.connect(tmpdb)
-            self.db.backup(out)
-            out.execute("update meta set v='0' where k='dirty'")
-            out.commit()
-            out.close()
+            with self._conn() as db:
+                out = sqlite3.connect(tmpdb)
+                db.backup(out)
+                out.execute("update meta set v='0' where k='dirty'")
+                out.commit()
+                out.close()
             with open(tmpdb, "rb") as src, lzma.open(dst, "wb", preset=9) as fp:
                 shutil.copyfileobj(src, fp)
         finally:
@@ -547,6 +582,8 @@ class SqliteBackend(Backend):
 
         先把库解到临时文件并验证（quick_check + 读一次表），确认是有效索引库才替换；
         否则一个坏快照会把本地索引直接清空，连回滚的余地都没有。
+
+        替换后不必管别的进程：它们每个方法自己开连接，下次操作就会打开新文件。
         """
         tmp = self.path + ".restore"
         try:
@@ -560,7 +597,6 @@ class SqliteBackend(Backend):
                 chk.execute("select count(*) from files").fetchone()
             finally:
                 chk.close()
-            self.db.close()
             for suf in ("", "-wal", "-shm"):
                 try:
                     os.unlink(self.path + suf)
@@ -572,13 +608,12 @@ class SqliteBackend(Backend):
                 os.unlink(tmp)
             except OSError:
                 pass
-        self._open()
+        with self._conn() as db:
+            self._init_db(db)      # 旧快照可能缺列，补一次
 
     def close(self):
-        try:
-            self.db.close()
-        except Exception:
-            pass
+        """没有常驻连接，留个空实现给 Store.close() 调用。"""
+        pass
 
 
 BACKENDS = {"sqlite": SqliteBackend}
