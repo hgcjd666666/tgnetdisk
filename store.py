@@ -9,6 +9,7 @@
 import abc
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
+import functools
 import hashlib
 import io
 import json
@@ -22,6 +23,7 @@ import shutil
 import sqlite3
 import tempfile
 import traceback
+from urllib.parse import quote
 import time
 
 from telethon import TelegramClient
@@ -381,6 +383,30 @@ class Backend(abc.ABC):
         pass
 
 
+def _resilient(fn):
+    """SQLite 操作遇到别的进程 restore 换文件时的瞬时错误，重试几次。
+
+    现象是 OperationalError("disk I/O error") 或 "database is locked"：
+    restore() 会 unlink -wal/-shm 再原子替换主库，正开着的连接下一步
+    读写就会撞上。所有方法都幂等（insert or replace / delete / select），
+    整体重试一遍是安全的。
+    """
+    @functools.wraps(fn)
+    def wrap(self, *a, **kw):
+        last = None
+        for _ in range(6):
+            try:
+                return fn(self, *a, **kw)
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if "disk i/o" not in msg and "locked" not in msg:
+                    raise
+                last = e
+                time.sleep(0.02)
+        raise last
+    return wrap
+
+
 class SqliteBackend(Backend):
     """SQLite 索引库。每个方法自己开连接、用完就关。
 
@@ -394,22 +420,40 @@ class SqliteBackend(Backend):
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
-        with self._conn() as db:
+        with self._conn(create=True) as db:
             self._init_db(db)
 
     @contextmanager
-    def _conn(self):
+    def _conn(self, create=False):
+        """开一条连接，用完就关。
+
+        create=False 时用 mode=rw 打开：文件不存在直接报错，不偷偷建空库。
+        restore() 是 unlink + os.replace，中间有个文件不存在的窗口，正撞上时
+        重试等它替换完；不重试的话 connect 会建一个空库，接着查询就报
+        "no such table"。
+        """
+        mode = "rwc" if create else "rw"
+        uri = "file:" + quote(self.path) + "?mode=" + mode
         db = None
-        for _ in range(5):
+        for _ in range(20):
             try:
-                db = sqlite3.connect(self.path, check_same_thread=False, timeout=10)
+                db = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=10)
+                db.execute("PRAGMA journal_mode=WAL")
+                if not create and not db.execute(
+                        "select 1 from sqlite_master where type='table' and name='files'").fetchone():
+                    db.close()
+                    db = None
+                    time.sleep(0.02)      # 快照替换的空档，等它一下
+                    continue
                 break
             except sqlite3.OperationalError:
-                time.sleep(0.02)          # 正好撞上 restore 的 unlink/replace 窗口
+                if db is not None:
+                    db.close()
+                    db = None
+                time.sleep(0.02)
         if db is None:
             raise RuntimeError(f"打不开索引库: {self.path}")
         try:
-            db.execute("PRAGMA journal_mode=WAL")
             yield db
             db.commit()
         finally:
@@ -442,6 +486,7 @@ class SqliteBackend(Backend):
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash)")
         db.commit()
 
+    @_resilient
     def get(self, path):
         p = norm(path)
         if p == "/":
@@ -456,6 +501,7 @@ class SqliteBackend(Backend):
             return Entry(r[0], True, r[1])
         return None
 
+    @_resilient
     def children(self, path):
         """列直接子项。用 path 上的范围扫描而不是全表 LIKE，列表页不再随库增长变慢。"""
         p = norm(path)
@@ -480,6 +526,7 @@ class SqliteBackend(Backend):
         out.sort(key=lambda x: (not x.is_dir, x.name.lower()))
         return out
 
+    @_resilient
     def all_entries(self):
         out = {"/": Entry("/", True, int(time.time()))}
         with self._conn() as db:
@@ -490,6 +537,7 @@ class SqliteBackend(Backend):
                 out[p] = Entry(p, False, mtime, hash, size, load_parts(parts), st, ex)
         return out
 
+    @_resilient
     def set_file(self, path, hash, size, mtime, parts, status=0, expect=0):
         with self._conn() as db:
             db.execute(
@@ -497,21 +545,25 @@ class SqliteBackend(Backend):
                 " values(?,?,?,?,?,?,?)",
                 (norm(path), hash, size, mtime, dump_parts(parts), status, expect))
 
+    @_resilient
     def pending(self):
         with self._conn() as db:
             return [tuple(r) for r in db.execute(
                 "select path,hash,expect,size,mtime from files where status=1")]
 
+    @_resilient
     def get_meta(self, k, default=""):
         with self._conn() as db:
             r = db.execute("select v from meta where k=?", (k,)).fetchone()
         return r[0] if r else default
 
+    @_resilient
     def set_meta(self, k, v):
         with self._conn() as db:
             db.execute("insert into meta(k,v) values(?,?) "
                        "on conflict(k) do update set v=?", (k, str(v), str(v)))
 
+    @_resilient
     def existing_dirs(self, paths):
         if not paths:
             return set()
@@ -520,6 +572,7 @@ class SqliteBackend(Backend):
             return {r[0] for r in db.execute(
                 f"select path from dirs where path in ({q})", list(paths))}
 
+    @_resilient
     def add_dirs(self, paths, mtime):
         if not paths:
             return
@@ -528,21 +581,25 @@ class SqliteBackend(Backend):
                 "insert or replace into dirs(path,mtime) values(?,?)",
                 [(norm(p), mtime) for p in paths])
 
+    @_resilient
     def set_dir(self, path, mtime):
         with self._conn() as db:
             db.execute("insert or replace into dirs(path,mtime) values(?,?)", (norm(path), mtime))
 
+    @_resilient
     def remove(self, path):
         p = norm(path)
         with self._conn() as db:
             db.execute("delete from files where path=?", (p,))
             db.execute("delete from dirs where path=?", (p,))
 
+    @_resilient
     def find_by_hash(self, hash):
         with self._conn() as db:
             return [(r[0], r[1], load_parts(r[2])) for r in db.execute(
                 "select path,size,parts from files where hash=?", (hash,))]
 
+    @_resilient
     def paths_under(self, prefix):
         prefix = norm(prefix)
         pre = prefix.rstrip("/") + "/"
@@ -839,6 +896,17 @@ class Store:
 
         # 阶段三：提交结果，锁只在这几百毫秒内再持一次；旧内容这时才真正删掉
         async with self.lock:
+            if digest and not append:
+                # 并发上传同一内容：字节都传完了才进到这里，可能别的协程/进程
+                # 已经先落地。这时复用它那组分片，把自己刚传的这组消息删掉，
+                # 否则同一份内容在 TG 上会存两份。
+                for opath, osize, oparts in self.backend.find_by_hash(digest):
+                    if opath != p and self._dedup_source_ok(opath, osize, oparts):
+                        self.backend.set_file(p, digest, osize, mt, dict(oparts), 0, 0)
+                        self.dirty = True
+                        await self._release_hash(
+                            Entry(p, False, mt, digest, size, dict(parts), 0, nparts))
+                        return self.backend.get(p)
             self.backend.set_file(p, digest or tag, size, mt, parts, 0, nparts)
             self.dirty = True
             await self._release_hash(old)

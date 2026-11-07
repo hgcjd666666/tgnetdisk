@@ -628,6 +628,283 @@ async def main():
             os.unlink(xz)
             os.unlink(db)
 
+    # ---------- 竞态 ----------
+    async def t_race_backend_writers():
+        import threading
+        b = SqliteBackend(tempfile.mktemp(suffix=".db"))
+        errs = []
+        def w(i):
+            try:
+                for j in range(50):
+                    b.set_file(f"/race/{i}/{j}", f"h{i}-{j}", 100, 0, {0: i * 100 + j}, 0, 1)
+            except Exception as e:
+                errs.append(repr(e))
+        ts = [threading.Thread(target=w, args=(i,)) for i in range(8)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        n = len(b.all_entries())
+        assert not errs, f"并发写抛异常: {errs[:3]}"
+        assert n == 8 * 50 + 1, f"记录数 {n} != 401"
+
+    async def t_race_backend_same_path():
+        import threading
+        b = SqliteBackend(tempfile.mktemp(suffix=".db"))
+        errs = []
+        def w(i):
+            try:
+                for j in range(100):
+                    b.set_file("/race/same", f"v{i}-{j}", 1000 + j, 0, {0: i}, 0, 1)
+            except Exception as e:
+                errs.append(repr(e))
+        ts = [threading.Thread(target=w, args=(i,)) for i in range(8)]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        e = b.get("/race/same")
+        assert not errs, f"并发写抛异常: {errs[:3]}"
+        assert e is not None and e.hash.startswith("v") and e.size >= 1000, f"最终记录不完整: {e}"
+
+    async def t_race_restore_storm():
+        import threading, time
+        b = SqliteBackend(tempfile.mktemp(suffix=".db"))
+        b.set_file("/storm/base", "h", 1, 0, {}, 0, 0)
+        snap = tempfile.mktemp(suffix=".xz")
+        b.dump(snap)
+        stop = threading.Event()
+        errs = []
+        def restore_loop():
+            try:
+                while not stop.is_set():
+                    b.restore(snap)
+            except Exception as e:
+                errs.append(("restore", repr(e)))
+        def rw_loop():
+            try:
+                while not stop.is_set():
+                    b.get("/storm/base")
+                    b.set_file("/storm/live", "x", 1, 0, {}, 0, 0)
+                    b.all_entries()
+            except Exception as e:
+                errs.append(("rw", repr(e)))
+        t1 = threading.Thread(target=restore_loop)
+        t2 = threading.Thread(target=rw_loop)
+        t1.start(); t2.start()
+        time.sleep(1.2)
+        stop.set(); t1.join(); t2.join()
+        os.unlink(snap)
+        assert not errs, f"restore 风暴下出错: {errs[:3]}"
+
+    async def t_race_dump_while_write():
+        import threading, time
+        b = SqliteBackend(tempfile.mktemp(suffix=".db"))
+        stop = threading.Event()
+        errs = []
+        def writer():
+            i = 0
+            while not stop.is_set():
+                try:
+                    b.set_file(f"/dumprace/{i % 10}", f"h{i}", i, 0, {}, 0, 0)
+                except Exception as e:
+                    errs.append(repr(e)); return
+                i += 1
+        t = threading.Thread(target=writer)
+        t.start()
+        try:
+            for _ in range(8):
+                dst = tempfile.mktemp(suffix=".xz")
+                tmp = tempfile.mktemp(suffix=".db")
+                b.dump(dst)
+                with lzma.open(dst) as f, open(tmp, "wb") as o:
+                    o.write(f.read())
+                c = sqlite3.connect(tmp)
+                assert c.execute("PRAGMA quick_check").fetchone()[0] == "ok", "dump 出来的库校验失败"
+                c.close()
+                os.unlink(dst); os.unlink(tmp)
+        finally:
+            stop.set(); t.join()
+        assert not errs, f"并发写 dump 报错: {errs[:3]}"
+
+    async def t_race_lock_contend():
+        stores = []
+        for i in range(3):
+            o = Store(client, chat, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+            o.token = f"{i + 1:032x}"
+            stores.append(o)
+        got = []
+        async def try_acq(o):
+            try:
+                await o.acquire(timeout=2, nonblock=True)
+                got.append(o)
+            except LockBusy:
+                pass
+        await asyncio.gather(*[try_acq(o) for o in stores])
+        try:
+            assert len(got) == 1, f"3 个节点抢锁，成功数应为 1，实际 {len(got)}"
+        finally:
+            for o in got:
+                try:
+                    await o.release()
+                except Exception:
+                    pass
+
+    async def t_race_put_dedup():
+        data = rand(200000)
+        async def one(i):
+            await put_bytes(st, data, f"{D}/race/dedup{i}")
+        await asyncio.gather(*[one(i) for i in range(8)])
+        groups = set()
+        for i in range(8):
+            e = st.get(f"{D}/race/dedup{i}")
+            assert e and e.status == 0, f"第 {i} 个没完成: {e}"
+            groups.add(tuple(sorted(e.parts.items())))
+        assert len(groups) == 1, f"同一内容并发上传应只产生一组消息，实际 {len(groups)} 组"
+
+    async def t_race_delete_read():
+        await put_bytes(st, rand(1000), f"{D}/race/delread")
+        async def deleter():
+            for _ in range(20):
+                await st.delete(f"{D}/race/delread")
+                await put_bytes(st, rand(1000), f"{D}/race/delread")
+        async def reader():
+            for _ in range(50):
+                try:
+                    async for _ in st.iter_content(f"{D}/race/delread"):
+                        break
+                except Exception:
+                    pass
+        await asyncio.gather(deleter(), reader())
+
+    async def t_race_process_coexist():
+        import subprocess
+        db = tempfile.mktemp(suffix=".db")
+        here = os.path.dirname(os.path.abspath(__file__))
+        code = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from store import SqliteBackend\n"
+            "b = SqliteBackend(%r)\n"
+            "for i in range(200):\n"
+            "    b.set_file('/proc/%%d' %% i, 'h%%d' %% i, i, 0, {}, 0, 0)\n"
+            "print('child done')\n"
+        ) % (here, db)
+        p = subprocess.Popen([sys.executable, "-c", code],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        b = SqliteBackend(db)
+        for i in range(200):
+            b.set_file(f"/main/{i}", f"m{i}", i, 0, {}, 0, 0)
+        out, err = p.communicate(timeout=120)
+        assert p.returncode == 0, f"子进程失败: {err.decode()[-300:]}"
+        n = len(b.all_entries())
+        assert n == 401, f"两个进程各写 200 条，应有 401 条（含根），实际 {n}"
+
+    async def t_race_put_many_different():
+        async def one(i):
+            await put_bytes(st, rand(50000), f"{D}/race/many{i}")
+        await asyncio.gather(*[one(i) for i in range(10)])
+        for i in range(10):
+            e = st.get(f"{D}/race/many{i}")
+            assert e and e.status == 0, f"第 {i} 个未完成"
+        assert await get_bytes(st, f"{D}/race/many9") is not None
+
+    async def t_race_put_same_path():
+        data = [rand(30000) for _ in range(6)]
+        async def one(i):
+            await put_bytes(st, data[i], f"{D}/race/samepath")
+        await asyncio.gather(*[one(i) for i in range(6)])
+        e = st.get(f"{D}/race/samepath")
+        assert e and e.status == 0, f"最终记录异常: {e}"
+        got = await get_bytes(st, f"{D}/race/samepath")
+        assert len(got) == 30000, f"内容长度 {len(got)}"
+
+    async def t_race_write_read_content():
+        p = f"{D}/race/wr"
+        await put_bytes(st, rand(100000), p)
+        errs = []
+        async def writer():
+            for _ in range(10):
+                try:
+                    await put_bytes(st, rand(100000), p)
+                except Exception as e:
+                    errs.append(("w", repr(e)))
+        async def reader():
+            for _ in range(30):
+                try:
+                    async for _ in st.iter_content(p):
+                        break
+                except Exception:
+                    pass
+        await asyncio.gather(writer(), reader())
+        assert not errs, f"边写边读出错: {errs[:3]}"
+
+    async def t_race_snapshot_while_write():
+        errs = []
+        async def writer():
+            for i in range(20):
+                try:
+                    await put_bytes(st, rand(1000), f"{D}/race/snap{i}")
+                except Exception as e:
+                    errs.append(("w", repr(e)))
+                await asyncio.sleep(0)
+        async def snapper():
+            for _ in range(10):
+                try:
+                    await st.snapshot()
+                except Exception as e:
+                    errs.append(("s", repr(e)))
+                await asyncio.sleep(0)
+        await asyncio.gather(writer(), snapper())
+        assert not errs, f"推送中写入出错: {errs[:3]}"
+
+    async def t_race_mv_cp():
+        a = f"{D}/race/mv/a"
+        b = f"{D}/race/mv/b"
+        await put_bytes(st, rand(1000), a)
+        async def mover():
+            for _ in range(10):
+                try:
+                    await st.move(a, b)
+                    await st.move(b, a)
+                except Exception:
+                    pass
+        async def copier():
+            for _ in range(10):
+                try:
+                    await st.copy(a, b)
+                except Exception:
+                    pass
+                try:
+                    await st.delete(b)
+                except Exception:
+                    pass
+        await asyncio.gather(mover(), copier())
+
+    async def t_race_kill_recovery():
+        import subprocess, time
+        db = tempfile.mktemp(suffix=".db")
+        here = os.path.dirname(os.path.abspath(__file__))
+        code = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from store import SqliteBackend\n"
+            "b = SqliteBackend(%r)\n"
+            "b.set_file('/kill/first', 'h', 1, 0, {}, 0, 0)\n"
+            "print('ready', flush=True)\n"
+            "i = 0\n"
+            "while True:\n"
+            "    b.set_file('/kill/%%d' %% i, 'h', 1, 0, {}, 0, 0)\n"
+            "    i += 1\n"
+        ) % (here, db)
+        p = subprocess.Popen([sys.executable, "-c", code],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p.stdout.readline()          # 等它至少写完一条再杀，避免机器慢时杀在启动阶段
+        time.sleep(0.1)
+        p.kill()
+        p.wait()
+        b = SqliteBackend(db)
+        n = len(b.all_entries())
+        c = sqlite3.connect(db)
+        ok = c.execute("PRAGMA quick_check").fetchone()[0]
+        c.close()
+        assert ok == "ok", f"被 kill 后库损坏: {ok}"
+        assert n >= 2, f"少量写入应保留，实际 {n}"
+
     for name, fn in [
         ("空文件", t_empty), ("1字节", t_one_byte), ("中文+空格", t_unicode),
         ("特殊字符", t_special), ("深目录", t_deep), ("多分片7片", t_multislice),
@@ -646,6 +923,20 @@ async def main():
         ("锁-空频道自建快照", t_lock_bootstrap), ("锁-重复acquire幂等", t_lock_reacquire),
         ("锁-双节点互斥", t_lock_busy),
         ("快照里的 dirty 恒为 0", t_snapshot_dirty_clean),
+        ("竞态-多线程写不同路径", t_race_backend_writers),
+        ("竞态-多线程写同一路径", t_race_backend_same_path),
+        ("竞态-restore 风暴", t_race_restore_storm),
+        ("竞态-dump 与写并发", t_race_dump_while_write),
+        ("竞态-三节点抢锁", t_race_lock_contend),
+        ("竞态-并发秒传", t_race_put_dedup),
+        ("竞态-边删边读", t_race_delete_read),
+        ("竞态-双进程共存", t_race_process_coexist),
+        ("竞态-并发传不同文件", t_race_put_many_different),
+        ("竞态-并发覆盖同路径", t_race_put_same_path),
+        ("竞态-边写边读内容", t_race_write_read_content),
+        ("竞态-推送中写入", t_race_snapshot_while_write),
+        ("竞态-mv 与 cp 并发", t_race_mv_cp),
+        ("竞态-kill 后恢复", t_race_kill_recovery),
     ]:
         await case(name, fn)
 
