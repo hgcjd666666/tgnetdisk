@@ -21,7 +21,7 @@ from aiohttp import web
 from telethon import TelegramClient
 
 import logger
-from store import (cache_file, cache_key, cache_limit, first_hole, LockBusy,
+from store import (cache_file, cache_key, cache_limit, CACHE_DIR, first_hole, LockBusy,
                    make_session, is_online, partial_commit, partial_open,
                    Store, norm, base_of, staging_dir, staging_drop, staging_ok,
                    staging_path)
@@ -55,6 +55,20 @@ STREAM_CHUNK = 1 << 20
 
 def http_date(ts: float) -> str:
     return formatdate(ts or time.time(), usegmt=True)
+
+
+def fs_block_size(fd=None) -> int:
+    """文件系统块大小 = SEEK_HOLE 的判定粒度。别写死 4096。"""
+    try:
+        blk = os.statvfs(CACHE_DIR).f_frsize
+    except OSError:
+        blk = 0
+    if not blk and fd is not None:
+        try:
+            blk = os.fstat(fd).st_blksize
+        except OSError:
+            blk = 0
+    return blk or 4096
 
 
 def parse_range(value, size: int):
@@ -261,38 +275,31 @@ async def dav_get(request, store, fill=None):
             key = cache_key(e)
             pfd = partial_open(key, total) if key else None
             if pfd is not None:
-                # SEEK_HOLE 的粒度是文件系统块，不是字节。Range 边界几乎不可能
-                # 块对齐，只写半个块的话整块都会被当成已缓存，块内没写的部分
-                # 是 0，最后 hash 必然对不上。所以这里把区间对齐到块边界，
-                # 多下来的几个字节也从 TG 拉进来写掉，块粒度就等于字节精度了。
-                try:
-                    blk = os.fstat(pfd).st_blksize or 4096
-                except OSError:
-                    blk = 4096
-                ws = start - start % blk
-                we = end + 1
-                if we < total:
-                    we = min(total, we + (-we) % blk)
-                skip = start - ws
+                # SEEK_HOLE 的粒度是文件系统块，不是字节。只写半个块的话整块都会
+                # 被当成已缓存，块内没写的部分是 0，补洞会跳过它，最后 hash 对不上。
+                # 所以只把「完全落在请求范围内的完整块」写进缓存，不足一块的边缘
+                # 直接丢掉——反正客户端已经收到了，下次补齐会连着那个块一起拉。
+                blk = fs_block_size(pfd)
+                ws = (start + blk - 1) // blk * blk          # 向上对齐
+                we = (end + 1) // blk * blk                  # 向下对齐
                 left = n
-                pos = ws
-                async for chunk in store.iter_content(path, offset=ws, length=we - ws):
-                    try:
-                        os.pwrite(pfd, chunk, pos)
-                    except OSError as ex:
-                        log.warning("部分缓存写入失败 %s: %s", path, ex)
-                        try:
-                            os.close(pfd)
-                        except OSError:
-                            pass
-                        pfd = None
+                pos = start
+                async for chunk in store.iter_content(path, offset=start, length=n):
+                    if we > ws:
+                        cs, ce = pos, pos + len(chunk)
+                        a, b = max(cs, ws), min(ce, we)
+                        if b > a:
+                            try:
+                                os.pwrite(pfd, chunk[a - cs:b - cs], a)
+                            except OSError as ex:
+                                log.warning("部分缓存写入失败 %s: %s", path, ex)
+                                try:
+                                    os.close(pfd)
+                                except OSError:
+                                    pass
+                                pfd = None
                     pos += len(chunk)
-                    # 对齐多拉的部分只进缓存，不给客户端
-                    if skip:
-                        cut = min(skip, len(chunk))
-                        chunk = chunk[cut:]
-                        skip -= cut
-                    if chunk and left > 0:
+                    if left > 0:
                         if len(chunk) > left:
                             chunk = chunk[:left]
                         left -= len(chunk)

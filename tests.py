@@ -1358,15 +1358,27 @@ async def main():
             key = S.cache_key(e)
             pp = S.partial_path(key)
             assert not os.path.exists(pp), "还没读就建出了部分缓存"
-            r = await cli.get("/fill/a.bin", headers={"Range": "bytes=100000-100099"})
-            assert r.status == 206 and await r.read() == data[100000:100100]
+            blk = os.statvfs(S.CACHE_DIR).f_frsize or 4096
+            lo, hi = 2 * blk, 4 * blk                     # 两个完整块
+            r = await cli.get("/fill/a.bin", headers={"Range": f"bytes={lo}-{hi - 1}"})
+            assert r.status == 206 and await r.read() == data[lo:hi]
             assert os.path.exists(pp), "Range 请求没建部分缓存"
             fd = os.open(pp, os.O_RDONLY)
             try:
                 assert os.fstat(fd).st_size == 300000, "部分缓存长度不对"
-                assert os.pread(fd, 100, 100000) == data[100000:100100], "写到了错误偏移"
+                assert os.pread(fd, blk, lo) == data[lo:lo + blk], "写到了错误偏移"
                 assert S.first_hole(fd, 300000) == 0, "开头应该是洞"
                 assert S.first_hole(fd, 300000) is not None, "只写了一段不该判成收齐"
+            finally:
+                os.close(fd)
+            # 不足一个块的请求不写缓存（客户端照样收得到）
+            before = os.fstat(os.open(pp, os.O_RDONLY)).st_size
+            r = await cli.get("/fill/a.bin", headers={"Range": "bytes=200001-200099"})
+            assert r.status == 206 and await r.read() == data[200001:200100]
+            fd = os.open(pp, os.O_RDONLY)
+            try:
+                assert S.first_hole(fd, 300000) == 0, "不足一块的边缘不该写进缓存"
+                assert os.fstat(fd).st_size == before
             finally:
                 os.close(fd)
         finally:
