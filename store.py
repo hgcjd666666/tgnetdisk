@@ -61,6 +61,7 @@ def cache_file(name: str) -> str:
 # 淘汰逻辑永远不会误删正在用的临时文件。
 CACHE_CHUNK = 1 << 20          # 读缓存时的块大小
 CACHE_SWEEP_GAP = 60           # 巡检最短间隔（秒）
+PART_TTL = 6 * 3600            # 部分缓存多久没动就扔掉（秒）
 _cache_swept_at = 0.0
 
 
@@ -80,14 +81,149 @@ def blob_dir() -> str:
 
 
 def cache_key(e) -> str:
-    """这条记录的内容身份；拿不到（缓存关闭 / 上传中 / 空文件）返回空串。"""
+    """这条记录的内容身份：<hash>-<大小>；拿不到（缓存关闭 / 上传中 / 空文件）返回空串。
+
+    直接用 hash 当名字，肉眼能看出是哪份内容。大小必须带上：`put --offset` 追加
+    重传时 hash 会保留首块不变、大小变了，只靠 hash 会把两份内容混成一个缓存。
+    """
     if cache_limit() <= 0 or not e or e.is_dir or e.status == 1:
         return ""
-    ids = part_ids(e.parts)
-    if not ids:
+    if not part_ids(e.parts) or not e.hash:
         return ""
-    raw = "%s|%d|%s" % (e.hash or "", e.size or 0, ",".join(map(str, ids)))
-    return hashlib.sha256(raw.encode()).hexdigest()[:40]
+    return "%s-%d" % (e.hash, e.size or 0)
+
+
+# 部分缓存：Range 请求边发边填的稀疏文件，收齐校验通过才转正去掉后缀
+PART_SUFFIX = ".part"
+
+
+def partial_path(key: str) -> str:
+    return os.path.join(blob_dir(), key + PART_SUFFIX) if key else ""
+
+
+def partial_open(key: str, size: int):
+    """打开（必要时创建）部分缓存文件并保证长度是 size，返回 fd。
+
+    建出来的是稀疏文件：ftruncate 到 size，没写过的区间是洞，
+    所以「填到哪了」这件事根本不用另外存，SEEK_HOLE 问文件系统就行。
+    """
+    p = partial_path(key)
+    if not p or size <= 0:
+        return None
+    try:
+        fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o644)
+        cur = os.fstat(fd).st_size
+        if cur == size:
+            return fd
+        # 长度对不上说明这条记录的内容换过了，旧的部分文件整个作废
+        os.close(fd)
+        fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        os.ftruncate(fd, size)
+        return fd
+    except OSError as ex:
+        log.warning("部分缓存打不开 %s: %s", key[:12], ex)
+        return None
+
+
+def first_hole(fd: int, size: int):
+    """第一个还没写过的偏移；整份没有洞返回 None。
+
+    走 SEEK_DATA/SEEK_HOLE，开销只跟洞的个数有关，不跟文件大小有关。
+    """
+    off = 0
+    while off < size:
+        try:
+            d = os.lseek(fd, off, os.SEEK_DATA)
+        except OSError:
+            return off                  # 从 off 到尾巴全是洞
+        if d > off:
+            return off                  # [off, d) 是洞
+        h = os.lseek(fd, d, os.SEEK_HOLE)
+        if h >= size:
+            return None
+        off = h
+    return None
+
+
+def hash_fd(fd: int, size: int, chunk: int = CACHE_CHUNK) -> str:
+    h = hashlib.shake_128()
+    off = 0
+    while off < size:
+        b = os.pread(fd, min(chunk, size - off), off)
+        if not b:
+            break
+        h.update(b)
+        off += len(b)
+    return h.hexdigest(16)
+
+
+_LIBC = None
+
+
+def punch_zeros(fd: int, size: int, chunk: int = CACHE_CHUNK) -> int:
+    """把整块全 0 的区间挖成洞，逻辑大小不变、物理占用变小。返回挖掉的字节数。
+
+    只能在「无洞 + hash 校验通过」之后做：挖完以后 SEEK_HOLE 就分不清
+    「从没写过」和「写过全 0」了。
+    """
+    global _LIBC
+    if _LIBC is None:
+        import ctypes
+        _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
+    import ctypes
+    mode = 0x01 | 0x02                  # FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE
+    freed = 0
+    off = 0
+    while off < size:
+        b = os.pread(fd, min(chunk, size - off), off)
+        if not b:
+            break
+        if not b.strip(b"\0"):
+            r = _LIBC.fallocate(fd, mode, ctypes.c_longlong(off),
+                                ctypes.c_longlong(len(b)))
+            if r == 0:
+                freed += len(b)
+        off += len(b)
+    return freed
+
+
+def partial_commit(key: str, want_hash: str, size: int) -> bool:
+    """把收齐的部分文件转正：无洞 → 校验 hash → 打洞 → rename 去掉后缀。"""
+    p = partial_path(key)
+    if not p:
+        return False
+    try:
+        fd = os.open(p, os.O_RDWR, 0o644)
+    except OSError:
+        return False
+    try:
+        if first_hole(fd, size) is not None:
+            return False
+        if want_hash:
+            got = hash_fd(fd, size)
+            if got != want_hash:
+                # 分块追加写入的记录只有首块 hash，这种对不上就不要了
+                log.warning("部分缓存校验不过，丢弃 %s：期望 %s 实际 %s",
+                            key[:16], want_hash[:16], got[:16])
+                os.close(fd)
+                fd = None
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+                return False
+        freed = punch_zeros(fd, size)
+        if freed:
+            log.info("缓存打洞 %s：%.1f MB 变成稀疏", key[:16], freed / 1048576)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    try:
+        os.replace(p, os.path.join(CACHE_DIR, "blobs", key))
+    except OSError as ex:
+        log.warning("部分缓存转正失败 %s: %s", key[:16], ex)
+        return False
+    return True
 
 
 def staging_dir() -> str:
@@ -129,7 +265,8 @@ def _scan_dir(d: str, collect: bool):
             except OSError:
                 continue
             total += st.st_size
-            if collect:
+            # 正在填的部分文件也算占用，但不能被淘汰——删了等于把进度扔了
+            if collect and not de.name.endswith(PART_SUFFIX):
                 items.append((st.st_mtime, st.st_size, de.path))
     return total, items
 
@@ -201,9 +338,32 @@ def cache_sweep(gap: float = CACHE_SWEEP_GAP) -> int:
         return 0
     _cache_swept_at = now
     freed = cache_trim(0)
+    # 长期没人碰的部分缓存直接扔：洞还在说明补洞要么早失败了要么没人管，
+    # 留着只占地方。真要用的时候重新 Range 一遍就能再填。
+    stale = 0
+    try:
+        now_ts = time.time()
+        for de in os.scandir(blob_dir()):
+            if not de.name.endswith(PART_SUFFIX):
+                continue
+            try:
+                st = de.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if now_ts - st.st_mtime <= PART_TTL:
+                continue
+            try:
+                os.unlink(de.path)
+                stale += st.st_size
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if stale:
+        log.info("清理过期的部分缓存 %.1f MB", stale / (1024.0 ** 2))
     if freed:
         log.info("缓存巡检释放 %.1f MB", freed / (1024.0 ** 2))
-    return freed
+    return freed + stale
 
 
 def cache_commit(tmp: str, key: str, size: int) -> str:
@@ -1327,8 +1487,7 @@ class Store:
         if ranged and want == 0:
             return
         key = "" if ranged else cache_key(e)
-        if not ranged:
-            cache_sweep()
+        cache_sweep()
         if key:
             cp = os.path.join(CACHE_DIR, "blobs", key)
             try:

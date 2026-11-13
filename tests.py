@@ -1087,7 +1087,7 @@ async def main():
         cache_env(None)                   # 收尾还原，别影响后面的用例
 
     # ---------- 落盘即返回 + 后台上传 ----------
-    async def make_dav(start_up=True):
+    async def make_dav(start_up=True, start_fill=True):
         from aiohttp import web
         from aiohttp.test_utils import TestClient, TestServer
         import server as srv
@@ -1095,17 +1095,25 @@ async def main():
         s2 = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
         s2.fast = True
         up = srv.Uploader(s2, 1)
+        fill = srv.Filler(s2)
+        up.fill = fill
         app = web.Application(client_max_size=0)
-        app.router.add_route("*", "/{tail:.*}", lambda r: srv.handle(r, s2, up))
+        app.router.add_route("*", "/{tail:.*}", lambda r: srv.handle(r, s2, up, fill))
         cli = TestClient(TestServer(app))
         await cli.start_server()
         if start_up:
             up.start()
+        if start_fill:
+            fill.start()
         return cli, s2, up, c, srv
 
     async def stop_dav(cli, up):
         for t in up.tasks:
             t.cancel()
+        fill = getattr(up, "fill", None)
+        if fill is not None:
+            for t in fill.tasks:
+                t.cancel()
         await cli.close()
 
     async def t_up_accept():
@@ -1328,6 +1336,141 @@ async def main():
             cache_env(None)
             await stop_dav(cli, up)
 
+    # ---------- Range 边发边填 + 后台补洞 ----------
+    async def wait_done(pred, tries=400):
+        for _ in range(tries):
+            await asyncio.sleep(0.05)
+            if pred():
+                return True
+        return False
+
+    async def t_fill_from_range():
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_fill=False)
+        try:
+            data = rand(300000)
+            assert (await cli.put("/fill/a.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/fill/a.bin") or SimpleNamespace(status=1)).status == 0), \
+                "后台没传完"
+            e = s2.get("/fill/a.bin")
+            key = S.cache_key(e)
+            pp = S.partial_path(key)
+            assert not os.path.exists(pp), "还没读就建出了部分缓存"
+            r = await cli.get("/fill/a.bin", headers={"Range": "bytes=100000-100099"})
+            assert r.status == 206 and await r.read() == data[100000:100100]
+            assert os.path.exists(pp), "Range 请求没建部分缓存"
+            fd = os.open(pp, os.O_RDONLY)
+            try:
+                assert os.fstat(fd).st_size == 300000, "部分缓存长度不对"
+                assert os.pread(fd, 100, 100000) == data[100000:100100], "写到了错误偏移"
+                assert S.first_hole(fd, 300000) == 0, "开头应该是洞"
+                assert S.first_hole(fd, 300000) is not None, "只写了一段不该判成收齐"
+            finally:
+                os.close(fd)
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_fill_complete():
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        old_rate = srv.FILL_RATE
+        srv.FILL_RATE = 8 << 20                     # 测试里别真等限速
+        try:
+            data = rand(300000)
+            assert (await cli.put("/fill/b.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/fill/b.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/fill/b.bin")
+            key = S.cache_key(e)
+            pp, final = S.partial_path(key), os.path.join(S.CACHE_DIR, "blobs", key)
+            r = await cli.get("/fill/b.bin", headers={"Range": "bytes=0-999"})
+            assert r.status == 206
+            assert await wait_done(lambda: os.path.exists(final) and not os.path.exists(pp)), \
+                "后台没把洞补完并转正"
+            with open(final, "rb") as f:
+                assert f.read() == data, "补出来的内容和原始数据不一致"
+            assert S.hash_fd(os.open(final, os.O_RDONLY), 300000) == e.hash, "hash 对不上"
+            n = c.downloads
+            r = await cli.get("/fill/b.bin", headers={"Range": "bytes=200000-200009"})
+            assert await r.read() == data[200000:200010]
+            assert c.downloads == n, "补齐后 Range 还去 TG 取"
+        finally:
+            srv.FILL_RATE = old_rate
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_fill_punch_zeros():
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        old_rate = srv.FILL_RATE
+        srv.FILL_RATE = 64 << 20
+        try:
+            # 中间插 4MB 真正的全 0：打洞后物理占用该明显小于逻辑大小
+            data = b"X" * (2 << 20) + b"\0" * (4 << 20) + b"Y" * (2 << 20)
+            assert (await cli.put("/fill/z.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/fill/z.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/fill/z.bin")
+            key = S.cache_key(e)
+            final = os.path.join(S.CACHE_DIR, "blobs", key)
+            r = await cli.get("/fill/z.bin", headers={"Range": "bytes=0-99"})
+            assert r.status == 206
+            assert await wait_done(lambda: os.path.exists(final)), "没补齐"
+            st = os.stat(final)
+            assert st.st_size == len(data), "打洞不该改变逻辑大小"
+            assert st.st_blocks * 512 <= len(data) // 2, \
+                f"全 0 的块没被打洞（物理 {st.st_blocks*512} / 逻辑 {len(data)}）"
+            with open(final, "rb") as f:
+                assert f.read() == data, "打洞后内容变了"
+        finally:
+            srv.FILL_RATE = old_rate
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_fill_no_partial_after_full_get():
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(200000)
+            assert (await cli.put("/fill/c.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/fill/c.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/fill/c.bin")
+            key = S.cache_key(e)
+            assert await (await cli.get("/fill/c.bin")).read() == data     # 全量 → 落缓存
+            assert len(blobs()) == 1, f"全量读没落缓存: {blobs()}"
+            assert not os.path.exists(S.partial_path(key)), "全量读不该再建部分缓存"
+            r = await cli.get("/fill/c.bin", headers={"Range": "bytes=0-9"})
+            assert r.status == 206
+            assert not os.path.exists(S.partial_path(key)), "命中缓存后 Range 不该建部分缓存"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_fill_off_when_cache_off():
+        cache_env(None)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(100000)
+            assert (await cli.put("/fill/d.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/fill/d.bin") or SimpleNamespace(status=1)).status == 0)
+            r = await cli.get("/fill/d.bin", headers={"Range": "bytes=0-99"})
+            assert r.status == 206 and await r.read() == data[:100]
+            left = [n for n in os.listdir(os.path.join(S.CACHE_DIR, "blobs"))
+                    if n.endswith(".part")] if os.path.isdir(
+                        os.path.join(S.CACHE_DIR, "blobs")) else []
+            assert left == [], f"缓存关闭还建了部分缓存: {left}"
+        finally:
+            await stop_dav(cli, up)
+
     for name, fn in [
         ("空文件", t_empty), ("1字节", t_one_byte), ("中文+空格", t_unicode),
         ("特殊字符", t_special), ("深目录", t_deep), ("多分片7片", t_multislice),
@@ -1382,6 +1525,11 @@ async def main():
         ("范围-HTTP 206与416", t_range_http),
         ("范围-传完后从TG读", t_range_after_upload),
         ("范围-命中缓存seek", t_range_cache_hit),
+        ("补洞-Range 顺带落盘", t_fill_from_range),
+        ("补洞-后台补齐并转正", t_fill_complete),
+        ("补洞-全0块打成稀疏", t_fill_punch_zeros),
+        ("补洞-已有缓存不重建", t_fill_no_partial_after_full_get),
+        ("补洞-缓存关时不建", t_fill_off_when_cache_off),
     ]:
         await case(name, fn)
 

@@ -21,7 +21,8 @@ from aiohttp import web
 from telethon import TelegramClient
 
 import logger
-from store import (cache_file, LockBusy, make_session, is_online,
+from store import (cache_file, cache_key, cache_limit, first_hole, LockBusy,
+                   make_session, is_online, partial_commit, partial_open,
                    Store, norm, base_of, staging_dir, staging_drop, staging_ok,
                    staging_path)
 
@@ -37,6 +38,12 @@ PORT = int(os.environ.get("PORT", "8087"))
 DAV_USER = os.environ.get("DAV_USER", "admin")
 DAV_PASS = os.environ.get("DAV_PASS", "")
 READONLY = os.environ.get("DAV_READONLY", "0") == "1"
+
+# 正在给客户端吐字节的响应数。补洞靠它判断「现在忙不忙」，忙就降速让路。
+ACTIVE_STREAMS = 0
+FILL_CHUNK = 4 << 20                                        # 补洞一次拉多少
+FILL_RATE = int(os.environ.get("FILL_RATE_KB", "2048") or 0) * 1024
+FILL_YIELD = 8                                              # 有人在读时降到 1/8
 
 ALLOW = "OPTIONS, HEAD, GET, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY"
 DAV_CLASS = "1"            # 只宣告 Class 1：锁（Class 2）不实现，别假装支持
@@ -182,7 +189,7 @@ async def dav_head(request, store):
     })
 
 
-async def dav_get(request, store):
+async def dav_get(request, store, fill=None):
     path = norm(request.path)
     e = store.get(path)
     if e is None:
@@ -234,6 +241,9 @@ async def dav_get(request, store):
         headers["Content-Range"] = f"bytes {start}-{end}/{total}"
     resp = web.StreamResponse(status=206 if rng else 200, headers=headers)
     await resp.prepare(request)
+    global ACTIVE_STREAMS
+    ACTIVE_STREAMS += 1
+    pfd = None
     try:
         if fh is not None:
             if start:
@@ -245,14 +255,55 @@ async def dav_get(request, store):
                     break
                 left -= len(b)
                 await resp.write(b)
+        elif rng:
+            # 边发给客户端边落到部分缓存：稀疏文件，写过的区间就是已缓存，
+            # 「填到哪了」交给 SEEK_HOLE，不用另外记账。
+            key = cache_key(e)
+            pfd = partial_open(key, total) if key else None
+            if pfd is not None:
+                # SEEK_HOLE 的粒度是文件系统块，不是字节。Range 边界几乎不可能
+                # 块对齐，只写半个块的话整块都会被当成已缓存，块内没写的部分
+                # 是 0，最后 hash 必然对不上。所以这里把区间对齐到块边界，
+                # 多下来的几个字节也从 TG 拉进来写掉，块粒度就等于字节精度了。
+                try:
+                    blk = os.fstat(pfd).st_blksize or 4096
+                except OSError:
+                    blk = 4096
+                ws = start - start % blk
+                we = end + 1
+                if we < total:
+                    we = min(total, we + (-we) % blk)
+                skip = start - ws
+                left = n
+                pos = ws
+                async for chunk in store.iter_content(path, offset=ws, length=we - ws):
+                    try:
+                        os.pwrite(pfd, chunk, pos)
+                    except OSError as ex:
+                        log.warning("部分缓存写入失败 %s: %s", path, ex)
+                        try:
+                            os.close(pfd)
+                        except OSError:
+                            pass
+                        pfd = None
+                    pos += len(chunk)
+                    # 对齐多拉的部分只进缓存，不给客户端
+                    if skip:
+                        cut = min(skip, len(chunk))
+                        chunk = chunk[cut:]
+                        skip -= cut
+                    if chunk and left > 0:
+                        if len(chunk) > left:
+                            chunk = chunk[:left]
+                        left -= len(chunk)
+                        await resp.write(chunk)
+            else:
+                async for chunk in store.iter_content(path, offset=start, length=n):
+                    await resp.write(chunk)
         else:
             # 没 Range 就别传 offset/length：传了 iter_content 会当成部分读，
             # 于是不写缓存、不校验全文件 hash。
-            if rng:
-                it = store.iter_content(path, offset=start, length=n)
-            else:
-                it = store.iter_content(path)
-            async for chunk in it:
+            async for chunk in store.iter_content(path):
                 await resp.write(chunk)
     except Exception as ex:
         log.warning("下载中断 %s: %s", path, ex)
@@ -264,9 +315,18 @@ async def dav_get(request, store):
             pass
         return resp
     finally:
+        ACTIVE_STREAMS -= 1
+        if pfd is not None:
+            try:
+                os.close(pfd)
+            except OSError:
+                pass
         if fh is not None:
             fh.close()
     await resp.write_eof()
+    if rng and fh is None and fill is not None:
+        # 这一段给完了，剩下的洞交给后台按空闲带宽慢慢补
+        fill.want(path)
     return resp
 
 
@@ -417,6 +477,79 @@ async def dav_proppatch(request, store):
                         content_type="application/xml")
 
 
+class Filler:
+    """Range 请求把文件「开个头」之后，空下来把剩下的洞补齐。
+
+    进度不用另外存：partial 文件是稀疏的，SEEK_HOLE 指到哪里还没写就是进度。
+    补完 → 校验 hash → 打洞 → rename 成正式缓存条目。有客户端在读的时候降速，
+    没人的时候放开跑，这样缓存吃的是空闲带宽。
+    """
+
+    def __init__(self, store):
+        self.store = store
+        self.q = asyncio.Queue()
+        self.seen = set()
+        self.tasks = []
+
+    def start(self):
+        self.tasks.append(asyncio.create_task(self._loop(), name="tgnd-fill"))
+
+    def want(self, path: str):
+        if cache_limit() <= 0 or FILL_RATE <= 0 or path in self.seen:
+            return
+        self.seen.add(path)
+        self.q.put_nowait(path)
+
+    async def _loop(self):
+        while True:
+            path = await self.q.get()
+            try:
+                await self._one(path)
+            except Exception as ex:
+                log.warning("补洞失败 %s: %s: %s", path, type(ex).__name__, ex)
+            finally:
+                self.seen.discard(path)
+
+    async def _one(self, path: str):
+        e = self.store.get(path)
+        if not e or e.is_dir or e.status == 1 or not e.size:
+            return
+        key = cache_key(e)
+        if not key or e.size > cache_limit():
+            return
+        if self.store.cached_path(path):
+            return                                  # 已经收齐了
+        fd = partial_open(key, e.size)
+        if fd is None:
+            return
+        sent = 0
+        t0 = time.monotonic()
+        try:
+            while True:
+                hole = first_hole(fd, e.size)
+                if hole is None:
+                    break
+                n = min(FILL_CHUNK, e.size - hole)
+                pos = 0
+                async for chunk in self.store.iter_content(path, offset=hole, length=n):
+                    os.pwrite(fd, chunk, hole + pos)
+                    pos += len(chunk)
+                    sent += len(chunk)
+                if pos == 0:
+                    break                           # 拉不到数据，别在这儿转圈
+                rate = FILL_RATE // (FILL_YIELD if ACTIVE_STREAMS else 1)
+                due = sent / rate
+                spent = time.monotonic() - t0
+                while due > spent + 0.05:
+                    await asyncio.sleep(min(due - spent, 1.0))
+                    spent = time.monotonic() - t0
+        finally:
+            os.close(fd)
+        if partial_commit(key, e.hash, e.size):
+            log.info("缓存补齐 %s (%.1f MB，补了 %.1f MB)",
+                     path, e.size / 1048576, sent / 1048576)
+
+
 class Uploader:
     """落盘即返回之后的「送上传」队列。
 
@@ -546,7 +679,7 @@ class Uploader:
             staging_drop(digest)
 
 
-async def handle(request, store, up):
+async def handle(request, store, up, fill=None):
     if not is_authorized(request):
         return unauthorized()
     m = request.method.upper()
@@ -558,7 +691,7 @@ async def handle(request, store, up):
         if m == "HEAD":
             return await dav_head(request, store)
         if m == "GET":
-            return await dav_get(request, store)
+            return await dav_get(request, store, fill)
         if m == "PUT":
             return await dav_put(request, store, up)
         if m == "DELETE":
@@ -655,9 +788,11 @@ async def main():
     await store.load()
     up = Uploader(store, int(os.environ.get("UPLOAD_QUEUE_WORKERS", "1") or 1))
     up.start()
+    fill = Filler(store)
+    fill.start()
 
     app = web.Application(client_max_size=0)
-    app.router.add_route("*", "/{tail:.*}", lambda r: handle(r, store, up))
+    app.router.add_route("*", "/{tail:.*}", lambda r: handle(r, store, up, fill))
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
