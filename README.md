@@ -101,7 +101,10 @@ python cli.py reindex        # 重新扫 TG 重建索引（索引丢了/换机�
 # 命令行验证
 curl -u admin:密码 -X PROPFIND -H 'Depth: 1' http://IP:8090/
 curl -u admin:密码 -T 本地文件 http://IP:8090/远端路径
+curl -u admin:密码 -r 1000000-1000099 http://IP:8090/远端路径   # Range，回 206
 ```
+
+`Accept-Ranges: bytes`，支持单区间 `Range`：播放器拖进度条时只拉那一段，不会从头重下。多区间不实现（按整份返回 200，RFC 9110 允许）；起点越界回 416 + `Content-Range: bytes */大小`。分段偏移在 `iter_content` 里按每个分片的 `document.size` 累加定位到「哪一片 + 片内第几字节」，再对那一片 `iter_download(offset=…)`。
 
 Windows 的「映射网络驱动器」、macOS 的「连接服务器」、安卓的 Solid Explorer / RCX 都能直连。
 

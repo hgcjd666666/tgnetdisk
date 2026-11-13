@@ -43,8 +43,40 @@ DAV_CLASS = "1"            # 只宣告 Class 1：锁（Class 2）不实现，别
 
 
 # ---------------- 工具 ----------------
+STREAM_CHUNK = 1 << 20
+
+
 def http_date(ts: float) -> str:
     return formatdate(ts or time.time(), usegmt=True)
+
+
+def parse_range(value, size: int):
+    """解析单区间 Range，返回 (start, end) / None（当没给）/ "bad"（要回 416）。
+
+    多区间不支持：RFC 9110 允许服务端忽略 Range 直接回整份，这比自己做 multipart
+    简单也安全得多。播放器拖进度条用的都是单区间，够。
+    """
+    if not value or size <= 0 or not value.startswith("bytes="):
+        return None
+    spec = value[6:].strip()
+    if "," in spec:
+        return None
+    a, sep, b = spec.partition("-")
+    if not sep:
+        return None
+    try:
+        if not a:                       # bytes=-N：最后 N 字节
+            n = int(b)
+            if n <= 0:
+                return "bad"
+            return max(0, size - n), size - 1
+        start = int(a)
+        end = int(b) if b else size - 1
+    except ValueError:
+        return "bad"
+    if start < 0 or start > end or start >= size:
+        return "bad"
+    return start, min(end, size - 1)
 
 
 def xesc(s: str) -> str:
@@ -146,7 +178,7 @@ async def dav_head(request, store):
         "Content-Length": str(e.size),
         "Content-Type": "application/octet-stream",
         "Last-Modified": http_date(e.mtime),
-        "Accept-Ranges": "none",
+        "Accept-Ranges": "bytes",
     })
 
 
@@ -162,63 +194,78 @@ async def dav_get(request, store):
             rows.append(f'<li><a href="{xesc(href_for(c.path, c.is_dir))}">{icon} {xesc(c.name)}</a></li>')
         html = f"<html><body><h3>{xesc(path)}</h3><ul>{''.join(rows)}</ul></body></html>"
         return web.Response(text=html, content_type="text/html", charset="utf-8")
-    if e.status == 1 or (e.expect and len(e.parts) < e.expect):
-        # 上传中：本地 staging 有完整副本就直接从它读，不必等后台传完。
-        # 拿不到（还没落盘 / 是别的节点在传）才拒绝——Content-Length 一旦发出去，
-        # 客户端会一直等满超时，所以不能 prepare 之后才发现没数据。
-        fh = None
+
+    # 能走本地文件的两种情形：还没传完（staging）或命中读缓存。
+    # 这两条路径支持 seek，Range 直接落到底层 fd 上，不用重下前面的字节。
+    uploading = e.status == 1 or bool(e.expect and len(e.parts) < e.expect)
+    fh = None
+    if uploading:
         try:
             fh = open(staging_path(e.hash), "rb")
-            fsize = os.path.getsize(staging_path(e.hash))
         except OSError:
-            if fh is not None:
-                fh.close()
+            # Content-Length 一旦发出去客户端会等满超时，所以这里先拒绝
             return web.Response(status=503, text="file is being uploaded or incomplete",
                                 headers={"Retry-After": "3"})
-        resp = web.StreamResponse(status=200, headers={
-            "Content-Type": "application/octet-stream",
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(e.name)}",
-            "Content-Length": str(fsize),
-            "Last-Modified": http_date(e.mtime),
-            "Accept-Ranges": "none",
-        })
-        await resp.prepare(request)
-        try:
-            while True:
-                b = await asyncio.to_thread(fh.read, 1 << 20)
-                if not b:
-                    break
-                await resp.write(b)
-        except Exception as ex:
-            log.warning("staging 读取中断 %s: %s", path, ex)
+    else:
+        hit = store.cached_path(path)
+        if hit:
             try:
-                resp.force_close()
-            except Exception:
-                pass
-            return resp
-        finally:
+                fh = open(hit, "rb")
+            except OSError:
+                fh = None
+    total = os.fstat(fh.fileno()).st_size if fh is not None else e.size
+
+    rng = parse_range(request.headers.get("Range"), total)
+    if rng == "bad":
+        if fh is not None:
             fh.close()
-        await resp.write_eof()
-        return resp
-    resp = web.StreamResponse(status=200, headers={
+        return web.Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+    start, end = rng if rng else (0, total - 1)
+    n = end - start + 1 if total else 0
+
+    headers = {
         "Content-Type": "application/octet-stream",
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote(e.name)}",
-        "Content-Length": str(e.size),
+        "Content-Length": str(n),
         "Last-Modified": http_date(e.mtime),
-    })
+        "Accept-Ranges": "bytes",
+    }
+    if rng:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    resp = web.StreamResponse(status=206 if rng else 200, headers=headers)
     await resp.prepare(request)
     try:
-        async for chunk in store.iter_content(path):
-            await resp.write(chunk)
+        if fh is not None:
+            if start:
+                fh.seek(start)
+            left = n
+            while left > 0:
+                b = await asyncio.to_thread(fh.read, min(STREAM_CHUNK, left))
+                if not b:
+                    break
+                left -= len(b)
+                await resp.write(b)
+        else:
+            # 没 Range 就别传 offset/length：传了 iter_content 会当成部分读，
+            # 于是不写缓存、不校验全文件 hash。
+            if rng:
+                it = store.iter_content(path, offset=start, length=n)
+            else:
+                it = store.iter_content(path)
+            async for chunk in it:
+                await resp.write(chunk)
     except Exception as ex:
         log.warning("下载中断 %s: %s", path, ex)
-        # 200 + Content-Length 已经发出去了，只能硬断连接让客户端报错；
+        # 状态行和 Content-Length 已经发出去，只能硬断连接让客户端报错；
         # 调 write_eof 会因为长度不足再抛一次，客户端反而挂到超时。
         try:
             resp.force_close()
         except Exception:
             pass
         return resp
+    finally:
+        if fh is not None:
+            fh.close()
     await resp.write_eof()
     return resp
 

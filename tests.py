@@ -146,9 +146,13 @@ class FakeClient:
         return SimpleNamespace(full_chat=SimpleNamespace(
             pinned_msg_id=self._pinned_ids[-1] if self._pinned_ids else None))
 
-    async def iter_download(self, m, **kw):
+    async def iter_download(self, m, *, offset=0, limit=None, **kw):
         self.downloads += 1
         data = self._blobs.get(m.id, b"")
+        if offset:
+            data = data[offset:]
+        if limit is not None:
+            data = data[:limit]
         for i in range(0, len(data), 512 * 1024):
             yield data[i:i + 512 * 1024]
 
@@ -185,6 +189,13 @@ async def put_bytes(st, data, path, **kw):
 async def get_bytes(st, path):
     out = b""
     async for chunk in st.iter_content(path):
+        out += chunk
+    return out
+
+
+async def get_slice(st, path, off, n=None):
+    out = b""
+    async for chunk in st.iter_content(path, offset=off, length=n):
         out += chunk
     return out
 
@@ -1219,6 +1230,104 @@ async def main():
         finally:
             await stop_dav(cli, up)
 
+    # ---------- HTTP Range ----------
+    async def t_range_store():
+        data = rand(400000)
+        p = f"{D}/rng/s.bin"
+        await put_bytes(st, data, p, slice_size=64 * 1024)      # 片大小不整的 7 片
+        assert await get_slice(st, p, 0, 10) == data[:10]
+        assert await get_slice(st, p, 100000, 50000) == data[100000:150000]
+        assert await get_slice(st, p, 65530, 20) == data[65530:65550]   # 跨片边界
+        assert await get_slice(st, p, 390000, 100000) == data[390000:]  # 超末尾自动截
+        assert await get_slice(st, p, 400000, 10) == b""                # 起点在 EOF
+        assert await get_slice(st, p, 0, None) == data                  # 等效整份
+        assert await get_slice(st, p, 0, 0) == b""
+
+    async def t_range_http():
+        cli, s2, up, c, srv = await make_dav(start_up=False)
+        try:
+            data = rand(300000)
+            assert (await cli.put("/rng/h.bin", data=data)).status == 201
+            # 上传中：走 staging 的本地 fd，seek 后直读
+            r = await cli.get("/rng/h.bin", headers={"Range": "bytes=1000-1999"})
+            assert r.status == 206, f"staging range 应 206，实际 {r.status}"
+            assert r.headers.get("Content-Range") == "bytes 1000-1999/300000", \
+                r.headers.get("Content-Range")
+            assert r.headers.get("Content-Length") == "1000"
+            assert await r.read() == data[1000:2000]
+            # 不给 Range：200 且宣告可分段
+            r = await cli.get("/rng/h.bin")
+            assert r.status == 200 and r.headers.get("Accept-Ranges") == "bytes"
+            assert await r.read() == data
+            # 尾段
+            r = await cli.get("/rng/h.bin", headers={"Range": "bytes=-100"})
+            assert r.status == 206 and await r.read() == data[-100:]
+            # 开区间
+            r = await cli.get("/rng/h.bin", headers={"Range": "bytes=299000-"})
+            assert r.status == 206 and await r.read() == data[299000:]
+            # 起点越界 → 416
+            r = await cli.get("/rng/h.bin", headers={"Range": "bytes=999999-"})
+            assert r.status == 416, f"越界应 416，实际 {r.status}"
+            assert r.headers.get("Content-Range") == "bytes */300000"
+            # 多区间不实现：忽略 Range，回整份
+            r = await cli.get("/rng/h.bin", headers={"Range": "bytes=0-9,20-29"})
+            assert r.status == 200
+            # 乱写的 Range 也当没给
+            r = await cli.get("/rng/h.bin", headers={"Range": "bytes=abc"})
+            assert r.status == 416 or r.status == 200
+            # HEAD 同样宣告 bytes
+            r = await cli.head("/rng/h.bin")
+            assert r.headers.get("Accept-Ranges") == "bytes"
+        finally:
+            await stop_dav(cli, up)
+
+    async def t_range_after_upload():
+        cache_env(None)
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(300000)
+            assert (await cli.put("/rng/t.bin", data=data)).status == 201
+            e = None
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                e = s2.get("/rng/t.bin")
+                if e and e.status == 0:
+                    break
+            assert e and e.status == 0, "后台没传完"
+            r = await cli.get("/rng/t.bin", headers={"Range": "bytes=100000-100009"})
+            assert r.status == 206
+            assert r.headers.get("Content-Range") == "bytes 100000-100009/300000"
+            assert await r.read() == data[100000:100010], "从 TG 取的分段内容不对"
+            r = await cli.get("/rng/t.bin")
+            assert await r.read() == data
+        finally:
+            await stop_dav(cli, up)
+
+    async def t_range_cache_hit():
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(300000)
+            assert (await cli.put("/rng/k.bin", data=data)).status == 201
+            e = None
+            for _ in range(200):
+                await asyncio.sleep(0.05)
+                e = s2.get("/rng/k.bin")
+                if e and e.status == 0:
+                    break
+            assert e and e.status == 0
+            assert await (await cli.get("/rng/k.bin")).read() == data   # 落缓存
+            assert len(blobs()) == 1, f"没落缓存: {blobs()}"
+            n = c.downloads
+            r = await cli.get("/rng/k.bin", headers={"Range": "bytes=200000-200099"})
+            assert r.status == 206
+            assert await r.read() == data[200000:200100]
+            assert c.downloads == n, "命中缓存时 range 不该再去 TG"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
     for name, fn in [
         ("空文件", t_empty), ("1字节", t_one_byte), ("中文+空格", t_unicode),
         ("特殊字符", t_special), ("深目录", t_deep), ("多分片7片", t_multislice),
@@ -1269,6 +1378,10 @@ async def main():
         ("上传-覆盖未传完的", t_up_overwrite_pending),
         ("上传-崩溃后重启续传", t_up_crash_recover),
         ("上传-清无主staging", t_up_gc_orphan_staging),
+        ("范围-Store分段读", t_range_store),
+        ("范围-HTTP 206与416", t_range_http),
+        ("范围-传完后从TG读", t_range_after_upload),
+        ("范围-命中缓存seek", t_range_cache_hit),
     ]:
         await case(name, fn)
 

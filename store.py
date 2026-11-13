@@ -1302,16 +1302,33 @@ class Store:
             return ""
         return p
 
-    async def iter_content(self, path: str, verify: bool = True):
+    async def iter_content(self, path: str, verify: bool = True,
+                           offset: int = 0, length: int | None = None):
         """按分片顺序流式吐出内容；verify=True 时边下边算 hash，结束时跟索引比对。
+
+        offset/length 是给 HTTP Range 用的：只吐这一段，并且不写缓存、不校验全文件
+        摘要——手上只有一段字节，算不出整体 hash。分片缺失照样报错。
 
         开了本地缓存（CACHE_MAX_GB>0）多走一步：命中直接读本地盘，未命中边下边落盘。
         """
         e = self.backend.get(path)
         if not e or e.is_dir or e.status == 1:
             raise FileNotFoundError(path)
-        cache_sweep()
-        key = cache_key(e)
+        offset = max(0, int(offset or 0))
+        ranged = offset > 0 or length is not None
+        if e.size:
+            offset = min(offset, e.size)
+        if length is None:
+            want = (e.size - offset) if (ranged and e.size) else None
+        else:
+            want = max(0, int(length))
+            if e.size:
+                want = min(want, e.size - offset)
+        if ranged and want == 0:
+            return
+        key = "" if ranged else cache_key(e)
+        if not ranged:
+            cache_sweep()
         if key:
             cp = os.path.join(CACHE_DIR, "blobs", key)
             try:
@@ -1346,6 +1363,8 @@ class Store:
                     return
         h = hashlib.shake_128()
         got = 0
+        skip = offset
+        left = want
         tmp = None
         fh = None
         if key:
@@ -1364,6 +1383,8 @@ class Store:
         missing = []
         try:
             for i in range(0, len(order), batch):
+                if left is not None and left <= 0:
+                    break
                 chunk = order[i:i + batch]
                 try:
                     msgs = await self.client.get_messages(self.chat, ids=[mid for _, mid in chunk])
@@ -1372,40 +1393,58 @@ class Store:
                     msgs = []
                 by_id = {m.id: m for m in (msgs or []) if m}
                 for k, mid in chunk:
+                    if left is not None and left <= 0:
+                        break
                     m = by_id.get(mid)
                     if not m or not getattr(m, "document", None):
                         log.warning("分片缺失: %s idx=%s msg=%s", path, k, mid)
                         missing.append(k)
                         continue
-                    async for piece in self.client.iter_download(m):
-                        h.update(piece)
+                    # 分片大小不固定（上传时可能用过别的 slice_size），所以定位起点
+                    # 只能按消息上记的 document.size 一片片累加，整片跳过时不下字节。
+                    psize = getattr(m.document, "size", 0) or 0
+                    if skip:
+                        if skip >= psize:
+                            skip -= psize
+                            continue
+                        inner, skip = skip, 0
+                    else:
+                        inner = 0
+                    async for piece in self.client.iter_download(m, offset=inner, limit=left):
+                        if not ranged:
+                            h.update(piece)
                         got += len(piece)
+                        if left is not None:
+                            left -= len(piece)
                         if fh is not None:
                             fh.write(piece)
                         yield piece
+                        if left is not None and left <= 0:
+                            break
             if missing:
                 # 静默跳过会交付一个截断但「看起来成功」的文件，下载端必须知道失败。
                 raise IOError(f"{path} 缺 {len(missing)} 个分片 (idx {sorted(missing)[:10]}, "
                               f"共 {len(order)} 片)，只读到 {got} 字节")
-            if e.size and got != e.size:
-                # 大小不符是硬错误：交付出去的就是残缺文件
-                raise IOError(f"{path} 下载大小不符: 实际 {got} / 记录 {e.size}")
-            if verify and e.hash:
-                d = h.hexdigest(16)
-                if d != e.hash:
-                    # 分块追加写入（put --offset/--length）的记录只有首块的 hash，
-                    # 内容合法但对不上，这里只告警；真正的数据缺失由上面的分片/大小检查兜住。
-                    log.warning("下载校验不一致: %s 期望 %s 实际 %s（%d 字节 / 记录 %s 字节）",
-                                path, e.hash, d, got, e.size)
-            # 分片齐、大小对，才把这份内容留在本地
-            if fh is not None:
-                try:
-                    fh.close()
-                except OSError:
-                    pass
-                fh = None
-                cache_commit(tmp, key, got)
-                tmp = None
+            if not ranged:
+                if e.size and got != e.size:
+                    # 大小不符是硬错误：交付出去的就是残缺文件
+                    raise IOError(f"{path} 下载大小不符: 实际 {got} / 记录 {e.size}")
+                if verify and e.hash:
+                    d = h.hexdigest(16)
+                    if d != e.hash:
+                        # 分块追加写入（put --offset/--length）的记录只有首块的 hash，
+                        # 内容合法但对不上，这里只告警；真正的数据缺失由上面的分片/大小检查兜住。
+                        log.warning("下载校验不一致: %s 期望 %s 实际 %s（%d 字节 / 记录 %s 字节）",
+                                    path, e.hash, d, got, e.size)
+                # 分片齐、大小对，才把这份内容留在本地
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
+                    fh = None
+                    cache_commit(tmp, key, got)
+                    tmp = None
         finally:
             # 客户端中途断开（GeneratorExit）或出错：临时文件必须清掉
             if fh is not None:
