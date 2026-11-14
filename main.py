@@ -264,6 +264,9 @@ async def main():
     logger.configure(log_file=os.environ.get("TGND_LOG", ""),
                      log_max=int(os.environ.get("TGND_LOG_MAX") or 0))
     os.makedirs(cache.CACHE_DIR, exist_ok=True)
+    n = cache.sweep()
+    if n:
+        log.info("清掉 %d 个上次残留的临时上传文件", n)
 
     lock = LocalLock(ENV_PATH)
     if not await lock.acquire():

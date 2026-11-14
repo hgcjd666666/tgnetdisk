@@ -11,6 +11,7 @@
 的文件正在上传，删了就是丢数据。
 """
 import os
+import time
 
 CACHE_DIR = os.environ.get("TGND_CACHE") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "cache")
@@ -180,6 +181,32 @@ def drop(h: str):
 
 def has_staging(h: str) -> bool:
     return bool(h) and os.path.exists(staging_path(h))
+
+
+def sweep(max_age: float = 0.0) -> int:
+    """删掉 staging 里的临时上传文件（点文件），返回清掉的文件数。
+
+    这些是 PUT 写到一半留下的：正常路径会在 finally 里自己删，只有崩溃或
+    进程被杀才会残留。它们计入预算却不会被 trim 淘汰，所以启动时必须清。
+    """
+    n = 0
+    try:
+        it = os.scandir(staging_dir())
+    except OSError:
+        return 0
+    with it:
+        for de in it:
+            try:
+                if not de.name.startswith(".") or not de.is_file(follow_symlinks=False):
+                    continue
+                st = de.stat(follow_symlinks=False)
+                if max_age and time.time() - st.st_mtime < max_age:
+                    continue
+                os.unlink(de.path)
+                n += 1
+            except OSError:
+                continue
+    return n
 
 
 # ---------- 上传预算 ----------

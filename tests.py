@@ -594,6 +594,73 @@ async def t_dav_content_range(ctx):
         await cli.close()
 
 
+class FakeBody:
+    """会中途断线的 request body：吐完 parts 后按需抛 ConnectionResetError。"""
+
+    def __init__(self, parts, boom=False):
+        self.parts = parts
+        self.boom = boom
+
+    async def iter_chunked(self, n):
+        for p in self.parts:
+            yield p
+        if self.boom:
+            raise ConnectionResetError("peer reset")
+
+
+class FakeReq:
+    def __init__(self, parts, boom=False):
+        self.content = FakeBody(parts, boom)
+        self.headers = {}
+        self.content_length = None
+        self.path = "/"
+
+
+def _req(path, parts, boom=False, cr=None):
+    req = FakeReq(parts, boom)
+    req.path = path
+    if cr:
+        req.headers["Content-Range"] = cr
+    return req
+
+
+async def t_dav_abort_resume(ctx):
+    """传到一半断线：续传留住字节，普通 PUT 全丢且不写索引。"""
+    import webdav
+    dav = webdav.DAV(ctx.vfs, None)
+    data = rand(300000)
+    total, cut = len(data), 100000
+
+    # 1) 普通 PUT 断线：字节全丢，索引不登记
+    r = await dav.put(_req("/ab/plain.bin", [data[:cut]], boom=True))
+    assert r.status == 400, r.status
+    assert ctx.index.get("/ab/plain.bin") is None, "断线的普通 PUT 不该登记"
+
+    # 2) 续传断线：已收字节留住，offset 可查
+    r = await dav.put(_req("/ab/cr.bin", [data[:cut]], cr=f"bytes 0-{cut-1}/{total}"))
+    assert r.status == 308, r.status
+    r = await dav.put(_req("/ab/cr.bin", [data[cut:200000]], boom=True,
+                           cr=f"bytes {cut}-199999/{total}"))
+    assert r.status == 400, r.status
+    st = dav._resume["/ab/cr.bin"]
+    assert st["have"] == 200000, st["have"]
+    assert os.path.getsize(st["tmp"]) == 200000, "断线后文件长度必须等于已算入摘要的字节"
+
+    r = await dav.put(_req("/ab/cr.bin", [], cr=f"bytes */{total}"))
+    assert r.status == 308 and r.headers["X-Upload-Offset"] == "200000", r.headers
+
+    # 3) 临时文件被多写了字节，续传要能自愈（ftruncate 对齐）
+    with open(st["tmp"], "ab") as f:
+        f.write(b"garbage" * 100)
+    r = await dav.put(_req("/ab/cr.bin", [data[200000:]],
+                           cr=f"bytes 200000-{total-1}/{total}"))
+    assert r.status == 201, (r.status, r.body)
+    e = ctx.index.get("/ab/cr.bin")
+    assert e.size == total, e.size
+    assert e.hash == hashlib.shake_128(data).hexdigest(16), "断线重传后内容与原始字节不一致"
+    assert not dav._resume, "收尾后状态要清干净"
+
+
 async def t_dav_move_copy(ctx):
     cli = await make_dav(ctx)
     try:
@@ -643,6 +710,7 @@ CASES = [
     ("WebDAV 基本语义", t_dav_basic),
     ("WebDAV Range", t_dav_range),
     ("WebDAV 断点续传", t_dav_content_range),
+    ("WebDAV 断线续传", t_dav_abort_resume),
     ("WebDAV MOVE/COPY/DELETE", t_dav_move_copy),
     ("WebDAV Depth:infinity 拒绝", t_dav_depth_infinity),
 ]

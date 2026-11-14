@@ -350,10 +350,17 @@ class DAV:
                         checked = dg.size
                         if not cachemod.ensure(dg.size):
                             return Response(507, text="insufficient storage")
+            if cl is not None and dg.size != cl:
+                log.debug("PUT %s 收到的字节数 %d 与声明 %d 不符", path, dg.size, cl)
+                return Response(400, text="incomplete body")
             h = dg.hex()
             mtime = self._mtime(request)
             self.vfs.finish_put(path, tmp, h, dg.size, mtime)
             return Response(204 if existed else 201)
+        except ConnectionResetError:
+            # 客户端中途跑了：字节全丢，索引一个字都不写
+            log.debug("PUT %s 连接中断，已收 %d 字节", path, dg.size)
+            return Response(400, text="aborted")
         finally:
             try:
                 if os.path.exists(tmp):
@@ -368,13 +375,15 @@ class DAV:
         摘要跟着分块累计，收尾时直接取 hex，不再把临时文件整个重读一遍。
         """
         start, end, total = cr
+        self._expire_resume()
         st = self._resume.get(path)
         if st is None or st["want"] != total or start == 0:
             if st is not None:
                 self._forget(path)          # 旧临时文件不能留在 staging 里
             st = {"tmp": self.vfs.staging_tmp("cr"), "have": 0, "want": total,
-                  "dg": tg.Digest()}
+                  "dg": tg.Digest(), "ts": time.time()}
             self._resume[path] = st
+        st["ts"] = time.time()
         if start != st["have"]:
             return Response(400, text="bad offset",
                             headers={"X-Upload-Offset": str(st["have"])})
@@ -383,12 +392,20 @@ class DAV:
         got = 0
         try:
             with os.fdopen(fd, "wb") as f:
+                os.ftruncate(f.fileno(), st["dg"].size)   # 强制文件长度 == 摘要长度
                 async for chunk in request.content.iter_chunked(CHUNK):
                     await asyncio.to_thread(f.write, chunk)
                     st["dg"].update(chunk)   # 落盘之后才算，摘要与文件严格同步
                     got += len(chunk)
-        except Exception:
-            self._sync(st)                   # 网络断了：把文件截到摘要长度
+        except asyncio.CancelledError:
+            self._sync(st)                   # 进程要退出：状态先对齐再抛
+            raise
+        except ConnectionResetError:
+            self._sync(st)                   # 客户端跑了：保留已收字节，可以续
+            log.debug("续传 %s 连接中断，已收 %d/%d", path, st["dg"].size, total)
+            return Response(400, text="aborted")
+        except OSError:
+            self._sync(st)
             raise
         st["have"] = start + got
         if st["have"] < total:
@@ -399,6 +416,12 @@ class DAV:
         self._resume.pop(path, None)
         self.vfs.finish_put(path, tmp, h, size, self._mtime(request))
         return Response(204 if existed else 201)
+
+    def _expire_resume(self, ttl=3600.0):
+        """没人认领的续传状态不会永远占着 staging。"""
+        now = time.time()
+        for p in [p for p, s in self._resume.items() if now - s.get("ts", now) > ttl]:
+            self._forget(p)
 
     def _forget(self, path: str):
         """丢掉一条续传状态，顺手删掉它的临时文件。"""
