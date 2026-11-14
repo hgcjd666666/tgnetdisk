@@ -183,6 +183,40 @@ class VFS:
         self.mark_dirty()
         return self.index.get(p)
 
+    def teleport(self, path: str, h: str, mtime: int, size=None):
+        """秒传：客户端只给 hash，字节一个都不收，直接建路径。
+
+        内容必须在库里，而且**真能读出来**：要么已经上了 TG（有分片表），
+        要么本地缓存里还留着完整字节（后台上传还没跑完）。两者都没有就当
+        没命中——宁可让客户端老实传一遍，也不能建一条读不出字节的路径。
+
+        返回 (entry, None)；没命中返回 (None, 原因)。
+        """
+        got = self.index.content(h)
+        if got is None:
+            return None, "missing"
+        csize, parts = got
+        if size is not None and int(size) != csize:
+            return None, "size"
+        if parts:
+            status = STATUS_DONE
+        elif cache.find(h):
+            status = STATUS_PENDING
+        else:
+            return None, "unreadable"
+        p = norm(path)
+        if p == "/":
+            return None, "dir"
+        old = self.index.get(p)
+        if old is not None and old.is_dir:
+            return None, "dir"
+        self._ensure_parents(p)
+        self.index.put_file(p, h, mtime, status)
+        if old and old.hash and old.hash != h:
+            self._reclaim_hash(old.hash)
+        self.mark_dirty()
+        return self.index.get(p), None
+
     def _reclaim_hash(self, h: str):
         if not h or self.index.referenced([h]).get(h):
             return

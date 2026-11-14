@@ -333,6 +333,8 @@ class DAV:
         cr = parse_content_range(raw_cr)
         if cr:
             return await self._put_chunked(request, path, cr, existed)
+        if request.headers.get("X-Content-Hash") and cl == 0:
+            return self._teleport(request, path, existed)
         with cachemod.hold(cl or 0) as ok:
             if not ok:
                 return Response(507, text="insufficient storage")
@@ -355,8 +357,8 @@ class DAV:
                 return Response(400, text="incomplete body")
             h = dg.hex()
             mtime = self._mtime(request)
-            self.vfs.finish_put(path, tmp, h, dg.size, mtime)
-            return Response(204 if existed else 201)
+            e2 = self.vfs.finish_put(path, tmp, h, dg.size, mtime)
+            return Response(204 if existed else 201, headers={"ETag": etag_of(e2)})
         except ConnectionResetError:
             # 客户端中途跑了：字节全丢，索引一个字都不写
             log.debug("PUT %s 连接中断，已收 %d 字节", path, dg.size)
@@ -367,6 +369,36 @@ class DAV:
                     os.unlink(tmp)
             except OSError:
                 pass
+
+    def _teleport(self, request, path, existed):
+        """秒传：`PUT` 空 body + `X-Content-Hash`，服务端验过货就直接建路径。
+
+        客户端要的 hash 就是 ETag 里冒号前面那截（`"<hash>-<size>"`），
+        所以第一次老老实实传完、从响应的 ETag 里记住，之后同内容就不传了。
+
+        `X-Content-Length` 可选：给了就和库里的 size 对一下，防止 128 位
+        摘要各自算错或者客户端拿错 hash 时建出一条尺寸不对的路径。
+        """
+        h = (request.headers.get("X-Content-Hash") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", h):
+            return Response(400, text="bad hash")
+        raw = request.headers.get("X-Content-Length")
+        size = None
+        if raw is not None:
+            try:
+                size = int(raw)
+            except ValueError:
+                return Response(400, text="bad content length")
+            if size < 0:
+                return Response(400, text="bad content length")
+        entry, err = self.vfs.teleport(path, h, self._mtime(request), size)
+        if err is not None:
+            if err == "dir":
+                return Response(409, text="is a collection")
+            return Response(412, text=err, headers={"X-Content-Hash": h})
+        log.debug("秒传 %s ← %s", path, h)
+        return Response(204 if existed else 201,
+                        headers={"ETag": etag_of(entry)})
 
     async def _put_chunked(self, request, path, cr, existed):
         """Content-Range 续传：分多次把同一个文件写完，最后一段收齐才算完成。
@@ -414,8 +446,8 @@ class DAV:
         h = st["dg"].hex()
         size = st["dg"].size
         self._resume.pop(path, None)
-        self.vfs.finish_put(path, tmp, h, size, self._mtime(request))
-        return Response(204 if existed else 201)
+        e2 = self.vfs.finish_put(path, tmp, h, size, self._mtime(request))
+        return Response(204 if existed else 201, headers={"ETag": etag_of(e2)})
 
     def _expire_resume(self, ttl=3600.0):
         """没人认领的续传状态不会永远占着 staging。"""

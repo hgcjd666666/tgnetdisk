@@ -661,6 +661,93 @@ async def t_dav_abort_resume(ctx):
     assert not dav._resume, "收尾后状态要清干净"
 
 
+async def t_dav_teleport(ctx):
+    """秒传：客户端给 hash，服务端验过货就直接建路径。"""
+    cli = await make_dav(ctx)
+    try:
+        data = rand(120000)
+        r = await cli.put("/tp/a.bin", data=data)
+        assert r.status == 201, r.status
+        etag = r.headers["ETag"]
+        h = etag.strip('"').rsplit("-", 1)[0]
+        assert len(h) == 32 and h == hashlib.shake_128(data).hexdigest(16), etag
+        await ctx.vfs.upload_pending("/tp/a.bin")
+
+        # 同内容秒传到另一个路径：一个字节都不该收
+        r = await cli.put("/tp/b.bin", data=b"", headers={"X-Content-Hash": h})
+        assert r.status == 201, (r.status, await r.text())
+        assert r.headers["ETag"] == etag, "秒传后的 ETag 必须和原文件一致"
+        assert (await (await cli.get("/tp/b.bin")).read()) == data
+        assert ctx.index.referenced([h])[h] == 2, "两条路径共用一份内容"
+        # 覆盖已存在的路径回 204
+        r = await cli.put("/tp/b.bin", data=b"", headers={"X-Content-Hash": h})
+        assert r.status == 204, r.status
+        # 父目录自动补
+        r = await cli.put("/tp/deep/x/y.bin", data=b"", headers={"X-Content-Hash": h})
+        assert r.status == 201, r.status
+        assert ctx.vfs.get("/tp/deep") is not None
+
+        # 大小对不上：拒绝
+        r = await cli.put("/tp/sz.bin", data=b"", headers={
+            "X-Content-Hash": h, "X-Content-Length": "1"})
+        assert r.status == 412, r.status
+        # 大小对上：通过
+        r = await cli.put("/tp/sz.bin", data=b"", headers={
+            "X-Content-Hash": h, "X-Content-Length": str(len(data))})
+        assert r.status == 201, r.status
+        # 库里没有的 hash
+        r = await cli.put("/tp/no.bin", data=b"",
+                          headers={"X-Content-Hash": "0" * 32})
+        assert r.status == 412 and r.headers["X-Content-Hash"] == "0" * 32
+        # 畸形 hash
+        for bad_h in ("xyz", h[:31], h + "0", ""):
+            r = await cli.put("/tp/no.bin", data=b"",
+                              headers={"X-Content-Hash": bad_h})
+            if bad_h == "":
+                assert r.status == 201, "空 header 等于没带，走普通空文件上传"
+            else:
+                assert r.status == 400, (bad_h, r.status)
+        # 目标是个目录
+        r = await cli.put("/tp", data=b"", headers={"X-Content-Hash": h})
+        assert r.status == 409, r.status
+        # 带 body 又带 hash：body 说了算，走普通上传，内容不被 hash 顶掉
+        r = await cli.put("/tp/body.bin", data=b"payload",
+                          headers={"X-Content-Hash": h})
+        assert r.status == 201, r.status
+        assert (await (await cli.get("/tp/body.bin")).read()) == b"payload"
+
+        # 内容还没上 TG（只在本地暂存里）也能秒传，落地状态是「上传中」
+        pend = rand(5000)
+        r = await cli.put("/tp/pend0.bin", data=pend)
+        assert r.status == 201
+        ph = r.headers["ETag"].strip('"').rsplit("-", 1)[0]
+        assert ctx.vfs.get("/tp/pend0.bin").pending
+        r = await cli.put("/tp/pend1.bin", data=b"", headers={"X-Content-Hash": ph})
+        assert r.status == 201, (r.status, await r.text())
+        assert ctx.vfs.get("/tp/pend1.bin").pending, "内容没上 TG，路径要用上传中状态"
+        await ctx.vfs.upload_pending("/tp/pend1.bin")
+        assert (await (await cli.get("/tp/pend1.bin")).read()) == pend
+
+        # 0 字节内容也能秒传
+        r = await cli.put("/tp/empty0", data=b"")
+        assert r.status == 201, r.status
+        eh = r.headers["ETag"].strip('"').rsplit("-", 1)[0]
+        r = await cli.put("/tp/empty1", data=b"", headers={"X-Content-Hash": eh})
+        assert r.status == 201, (r.status, await r.text())
+        r = await cli.get("/tp/empty1")
+        assert r.status == 200 and await r.read() == b""
+        assert r.headers.get("ETag") == f'"{eh}-0"', r.headers.get("ETag")
+
+        # 只读模式一律 403
+        import webdav
+        ro = webdav.DAV(ctx.vfs, None, readonly=True)
+        req = _req("/tp/ro.bin", [])
+        req.headers["X-Content-Hash"] = h
+        assert (await ro.put(req)).status == 403
+    finally:
+        await cli.close()
+
+
 async def t_dav_move_copy(ctx):
     cli = await make_dav(ctx)
     try:
@@ -711,6 +798,7 @@ CASES = [
     ("WebDAV Range", t_dav_range),
     ("WebDAV 断点续传", t_dav_content_range),
     ("WebDAV 断线续传", t_dav_abort_resume),
+    ("WebDAV 秒传", t_dav_teleport),
     ("WebDAV MOVE/COPY/DELETE", t_dav_move_copy),
     ("WebDAV Depth:infinity 拒绝", t_dav_depth_infinity),
 ]

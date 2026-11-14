@@ -109,11 +109,40 @@ rclone mount tg: /mnt/tg
 | `OPTIONS` | `DAV: 1`、`MS-Author-Via: DAV` |
 | `PROPFIND` | `Depth: 0/1`；`infinity` 回 403 + `propfind-finite-depth` |
 | `GET` / `HEAD` | `Range`（单区间 206/416）、`ETag`、`If-None-Match`、`If-Modified-Since`、`If-Range` |
-| `PUT` | 支持 `Content-Range` 断点续传、`X-OC-Mtime` |
+| `PUT` | 支持 `Content-Range` 断点续传、`X-Content-Hash` 秒传、`X-OC-Mtime` |
 | `DELETE` / `MKCOL` | 429/409 按 RFC |
 | `MOVE` / `COPY` | `Destination`、`Overwrite`、412/409 |
 | `PROPPATCH` | 空 207（客户端设置属性不会报错） |
 | `LOCK` | 不支持，回 405 |
+
+## 秒传（非标准扩展）
+
+内容已经在库里时，客户端不必再传字节：把 hash 报上来，服务端验过货就直接建路径。
+
+第一次（每种内容只做一次）正常 PUT，从响应里抄下 ETag：
+
+```
+PUT /big.iso
+→ 201, ETag: "8f3a5c0e9b7d2146ad3f88c0b1e24f60-5368709120"
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ hash     ^^^^^^^^^^ 字节数
+```
+
+以后同内容换个路径：
+
+```
+PUT /copy.iso                         # 空 body，一个字节都不传
+X-Content-Hash: 8f3a5c0e9b7d2146ad3f88c0b1e24f60
+X-Content-Length: 5368709120          # 可选，给了就和库里的尺寸核对
+→ 201, ETag: "8f3a5c0e9b7d2146ad3f88c0b1e24f60-5368709120"
+```
+
+- 只认「内容在库里且真能读出来」：已经上了 TG，或者本地缓存里还留着完整字节（后台上传还没跑完）。两者都没有就回 `412`，客户端老老实实传一遍。
+- `412` 的 body 区分 `missing`（没见过这个 hash）/ `size`（尺寸对不上）/ `unreadable`（有记录但字节读不出来），响应头回显 `X-Content-Hash`。
+- hash 是 SHAKE-128 取前 16 字节的小写 hex，32 个字符。客户端算不出来就从 ETag 里抄。
+- 带 body 的 PUT 忽略这个头，一切照旧；空 body 且不带这个头，仍然是建一个 0 字节文件。
+- 目标已存在回 `204`，不存在回 `201`，目标是目录回 `409`，只读模式回 `403`。
+- 秒传只登记路径，不复制字节：两条路径共用一份内容，删掉一条另一条不受影响。
+- 命中「上传中」的内容时，路径立刻可用（本地暂存能读），上 TG 是后台的事，和普通 PUT 完全一致。
 
 ## 断点续传（非标准扩展）
 
@@ -158,6 +187,8 @@ Content-Range: bytes 5368709119-5368709119/5368709120
 - **切片大小**：`SLICE_MB` 超过 2047 会在 `SaveBigFilePartRequest` 上报 `FilePartsInvalidError`。
 - **快照滞后**：崩溃/断电最多丢 `SNAPSHOT_SEC` 秒内的快照推送（改动还在本地库，下次启动会补推）。
 - **孤儿分片**：上传到一半进程被杀，TG 上会留下没有索引引用的分片消息，`--reindex` 能扫回来。
+- **秒传信 hash**：服务端不校验内容，只核对尺寸。hash 是 SHAKE-128 前 128 位，碰错的概率可以忽略；但客户端把 hash 传错就会建出一条指向别的文件的路径。
+- **续传不跨重启**：续传状态在进程内存里，服务重启后重新上传。
 
 ## 重建索引
 
