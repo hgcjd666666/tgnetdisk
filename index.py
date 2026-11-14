@@ -38,6 +38,11 @@ STATUS_PENDING = 1
 STATUS_DONE = 0
 
 
+def like_esc(s: str) -> str:
+    """把字面量转成 LIKE 模式：路径里的 % _ \\ 必须转义，否则会匹配到别的目录。"""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def load_parts(raw) -> dict:
     """parts 在库里是 JSON 字符串：{"0": 123, "1": 124}。key 必须是 int。"""
     try:
@@ -205,18 +210,19 @@ class Index:
         path = norm(path)
         prefix = "/" if path == "/" else path + "/"
         start = len(prefix) + 1          # SQLite substr 从 1 开始
-        pat = prefix + "%"
+        pat = like_esc(prefix) + "%"
         out = []
         with self._conn() as db:
             rows = db.execute(
                 "SELECT f.path, f.hash, f.mtime, f.status, c.size "
                 "FROM files f LEFT JOIN content c ON c.hash=f.hash "
-                "WHERE f.path LIKE ? AND instr(substr(f.path, ?), '/')=0",
+                "WHERE f.path LIKE ? ESCAPE '\\' AND instr(substr(f.path, ?), '/')=0",
                 (pat, start)).fetchall()
             for p, h, mt, st, sz in rows:
                 out.append(Entry(p, False, h, sz or 0, None, mt, st))
             rows = db.execute(
-                "SELECT path, mtime FROM dirs WHERE path LIKE ? AND instr(substr(path, ?), '/')=0",
+                "SELECT path, mtime FROM dirs WHERE path LIKE ? ESCAPE '\\'"
+                " AND instr(substr(path, ?), '/')=0",
                 (pat, start)).fetchall()
             for p, mt in rows:
                 out.append(Entry(p, True, mtime=mt))
@@ -261,26 +267,32 @@ class Index:
     def list_under(self, path: str):
         """[(path, hash, is_dir)]：path 及其整棵子树，不删。"""
         path = norm(path)
-        like = "/%" if path == "/" else path.rstrip("/") + "/%"
+        like = "/%" if path == "/" else like_esc(path.rstrip("/") + "/") + "%"
         with self._conn() as db:
-            rows = db.execute("SELECT path, hash, 0 FROM files WHERE path=? OR path LIKE ?",
-                              (path, like)).fetchall()
-            rows += db.execute("SELECT path, '', 1 FROM dirs WHERE path=? OR path LIKE ?",
-                               (path, like)).fetchall()
+            rows = db.execute(
+                "SELECT path, hash, 0 FROM files WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                (path, like)).fetchall()
+            rows += db.execute(
+                "SELECT path, '', 1 FROM dirs WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                (path, like)).fetchall()
         return [(r[0], r[1], bool(r[2])) for r in rows]
 
     def take_under(self, path: str):
         """一次事务摘掉 path 及其整棵子树，返回 [(path, hash, is_dir)]。"""
         path = norm(path)
-        like = "/%" if path == "/" else path.rstrip("/") + "/%"
+        like = "/%" if path == "/" else like_esc(path.rstrip("/") + "/") + "%"
         with self._conn() as db:
-            rows = db.execute("SELECT path, hash, 0 FROM files WHERE path=? OR path LIKE ?",
-                              (path, like)).fetchall()
-            rows += db.execute("SELECT path, '', 1 FROM dirs WHERE path=? OR path LIKE ?",
-                               (path, like)).fetchall()
+            rows = db.execute(
+                "SELECT path, hash, 0 FROM files WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                (path, like)).fetchall()
+            rows += db.execute(
+                "SELECT path, '', 1 FROM dirs WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                (path, like)).fetchall()
             if path != "/":
-                db.execute("DELETE FROM files WHERE path=? OR path LIKE ?", (path, like))
-                db.execute("DELETE FROM dirs WHERE path=? OR path LIKE ?", (path, like))
+                db.execute("DELETE FROM files WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                           (path, like))
+                db.execute("DELETE FROM dirs WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                           (path, like))
         return [(r[0], r[1], bool(r[2])) for r in rows]
 
     def hash_of(self, path: str):

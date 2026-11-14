@@ -235,6 +235,7 @@ class hold:
 
     def __init__(self, size: int):
         self.size = max(0, int(size))
+        self._taken = False
 
     def __enter__(self):
         global _reserved
@@ -243,10 +244,13 @@ class hold:
         if not ensure(self.size):
             return False
         _reserved += self.size
+        self._taken = True
         return True
 
     def __exit__(self, *exc):
         global _reserved
-        if self.size > 0:
+        # 注意：__enter__ 返回 False 时 __exit__ 照样会跑，没占用的不能退
+        if self._taken:
             _reserved -= self.size
+            self._taken = False
         return False

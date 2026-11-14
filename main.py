@@ -34,6 +34,7 @@ ENV_PATH = os.environ.get("TGND_ENV", os.path.join(os.path.dirname(os.path.abspa
 PORT = int(os.environ.get("PORT", "8090"))
 BIND = os.environ.get("DAV_BIND", "0.0.0.0")
 SNAPSHOT_SEC = float(os.environ.get("SNAPSHOT_SEC", "10"))
+LOCK_CHECK_SEC = float(os.environ.get("LOCK_CHECK_SEC", "30"))
 
 
 # ---------- 本地单实例锁 ----------
@@ -177,7 +178,7 @@ class Keeper:
                 except Exception as e:
                     log.warning("后台快照失败: %s", e)
             # 锁：每 30 秒看一眼
-            if now - last_check >= 30:
+            if now - last_check >= LOCK_CHECK_SEC:
                 last_check = now
                 try:
                     st = await self.store.check_lock()

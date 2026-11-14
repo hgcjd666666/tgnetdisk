@@ -209,6 +209,21 @@ python main.py --reindex
 ## 测试
 
 ```bash
-python tests.py          # 内存版 Telegram，零网络
+python tests.py          # 内存版 Telegram，零网络，89 组用例
 python tests.py -k 缓存   # 按名字过滤
+```
+
+覆盖的是「协议语义 + 数据层边界」，重点在容易错的地方：
+
+- 路径：`..` 逃逸、NFC 归一、反斜杠、控制字符、`%` `_` 这些 LIKE 通配符、
+  特殊字符目录的搬移/删除不能波及邻居
+- 索引：覆盖文件↔目录、脏数据恢复、批量、dump/restore 坏库拒绝、老库迁移只跑一次
+- 缓存：预算解析、LRU 淘汰顺序、预留额度在异常路径上也要还回去、点文件不参与淘汰
+- 摘要与分片：增量哈希跨缓冲区一致、并发读不能错位、`SliceReader` 边界、
+  `hash.序号` 解析的畸形输入、缺片时绝不把半截内容写进缓存
+- 锁：本地 flock 的 inode 语义、TG 锁的 own/idle/other/gone 四态、被别人抢走要停
+- WebDAV：Range 矩阵（含 `bytes=-0`、多区间、越界）、`If-Range` 校验器、
+  弱 ETag 与 `*`、PROPFIND 的 Depth 与 XML、MOVE/COPY 的全部拒绝分支、
+  认证在方法分发之前、非法路径 400、秒传的全部参数组合、断点续传的状态回收
+- 并发：同路径并发写、同内容并发读（单飞）、并发搬移同一源
 ```

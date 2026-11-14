@@ -61,6 +61,21 @@ def etag_of(e) -> str:
     return '"%s-%d"' % (e.hash, e.size) if e and not e.is_dir else ""
 
 
+def etag_match(header: str, etag: str) -> bool:
+    """If-None-Match 的比较规则：弱比较，认 `*`，认逗号分隔的列表。"""
+    if not header or not etag:
+        return False
+    for part in header.split(","):
+        t = part.strip()
+        if t == "*":
+            return True
+        if t.startswith("W/"):
+            t = t[2:]
+        if t == etag:
+            return True
+    return False
+
+
 def mime_of(name: str) -> str:
     t, _ = mimetypes.guess_type(name or "")
     return t or "application/octet-stream"
@@ -222,6 +237,8 @@ class DAV:
                                 body=b'<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"/>')
         except FileNotFoundError:
             return Response(404, text="not found")
+        except NotADirectoryError as e:
+            return Response(409, text=f"parent is not a collection: {e}")
         except FileExistsError as e:
             return Response(409, text=str(e) or "conflict")
         except PermissionError:
@@ -279,8 +296,7 @@ class DAV:
             "Accept-Ranges": "bytes",
             "Content-Type": mime_of(base(path)),
         }
-        inm = request.headers.get("If-None-Match")
-        if inm and etag and inm.strip() == etag:
+        if etag_match(request.headers.get("If-None-Match"), etag):
             return Response(304, headers=headers)
         ims = request.headers.get("If-Modified-Since")
         if ims:
@@ -289,12 +305,17 @@ class DAV:
                 return Response(304, headers=headers)
         rng = None
         if not head:
-            ir = request.headers.get("If-Range")
-            if ir and etag and ir.strip() not in (etag,):
-                ts = _ts(ir)
-                if ts is None or int(mtime) > int(ts):
-                    ir = None                      # 内容变了，忽略 Range
-            if not ir:
+            # If-Range 是「Range 的校验器」：它说内容没变才做部分响应，
+            # 说变了（或压根认不出来）就当没给 Range，整份回 200。
+            ir = (request.headers.get("If-Range") or "").strip()
+            fresh = True
+            if ir:
+                if etag and ir == etag:
+                    fresh = True
+                else:
+                    ts = _ts(ir)
+                    fresh = ts is not None and int(mtime) <= int(ts)
+            if fresh:
                 rng = parse_range(request.headers.get("Range", ""), e.size)
         if rng == "unsat":
             return Response(416, headers={**headers, "Content-Range": f"bytes */{e.size}"})

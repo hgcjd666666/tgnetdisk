@@ -13,6 +13,7 @@ import logging
 import os
 import random
 import tempfile
+import threading
 import time
 import lzma
 
@@ -105,11 +106,18 @@ async def upload_parallel(client, src, workers=None, part=PART):
     n = max(1, (size + part - 1) // part)
     fid = random.randrange(1 << 62)
     sem = asyncio.Semaphore(workers or WORKERS)
+    # 并发读必须加锁：seek 和 read 是两步，两个线程交错会读到别人的位置，
+    # 上传出去的内容就错了（而且不会报错，只是文件坏掉）。
+    lock = threading.Lock()
+
+    def _take(off: int, want: int) -> bytes:
+        with lock:
+            f.seek(off)
+            return f.read(want)
 
     async def one(i):
         async with sem:
-            f.seek(i * part)
-            data = await asyncio.to_thread(f.read, part)
+            data = await asyncio.to_thread(_take, i * part, part)
             await client(SaveBigFilePartRequest(fid, i, n, data))
 
     try:
@@ -515,12 +523,19 @@ class TGStore:
                     yield b
         tmp = os.path.join(self.cache.staging_dir(), ".dl-" + h)
         f = open(tmp, "wb")
+        got = 0
         try:
             async for chunk in self.iter_slices(parts, size):
                 await asyncio.to_thread(f.write, chunk)
+                got += len(chunk)
                 yield chunk
             f.close()
-            self.cache.put(h, tmp)
+            if got == size:
+                self.cache.put(h, tmp)
+            else:
+                # 分片缺了：只拿到半截。绝不能把半截当整份塞进缓存，
+                # 否则以后每次读到的都是坏数据，而且看起来一切正常。
+                log.warning("内容 %s 只读到 %d/%d 字节，不落缓存", h, got, size)
         finally:
             try:
                 if not f.closed:

@@ -51,10 +51,15 @@ class VFS:
         return self.index.get(p)
 
     def _ensure_parents(self, path):
+        """把缺的上级目录补出来；中途撞上文件就报错（文件下面不能挂东西）。"""
         chain = []
         cur = parent(path)
-        while cur != "/" and self.index.get(cur) is None:
-            chain.append(cur)
+        while cur != "/":
+            e = self.index.get(cur)
+            if e is None:
+                chain.append(cur)
+            elif not e.is_dir:
+                raise NotADirectoryError(cur)
             cur = parent(cur)
         for d in reversed(chain):
             self.index.put_dir(d, int(time.time()))
@@ -64,7 +69,9 @@ class VFS:
         s, d = norm(src), norm(dst)
         if s == d:
             return
-        if d == "/" or d.startswith(s.rstrip("/") + "/"):
+        if d == "/" or s.startswith(d.rstrip("/") + "/"):
+            raise OSError("不能用源自己的祖先当目标：会把整棵源树一起抹掉")
+        if d.startswith(s.rstrip("/") + "/"):
             raise OSError("不能移动到自己或自己的子树里")
         if self.index.get(s) is None:
             raise FileNotFoundError(s)
@@ -86,7 +93,9 @@ class VFS:
         s, d = norm(src), norm(dst)
         if s == d:
             return
-        if d == "/" or d.startswith(s.rstrip("/") + "/"):
+        if d == "/" or s.startswith(d.rstrip("/") + "/"):
+            raise OSError("不能用源自己的祖先当目标：会把整棵源树一起抹掉")
+        if d.startswith(s.rstrip("/") + "/"):
             raise OSError("不能复制到自己或自己的子树里")
         if self.index.get(s) is None:
             raise FileNotFoundError(s)
