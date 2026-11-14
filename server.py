@@ -26,7 +26,7 @@ from telethon import TelegramClient
 import logger
 from store import (cache_file, cache_key, cache_limit, CACHE_DIR, first_hole, LockBusy,
                    make_session, need_tg_lock, partial_commit, partial_open,
-                   Store, norm, base_of, staging_dir, staging_hold,
+                   Store, norm, base_of, staging_dir, staging_hold, STG_SUFFIX,
                    staging_ok, staging_path)
 
 log = logging.getLogger("dav")
@@ -631,6 +631,79 @@ async def dav_copy(request, store):
     return web.Response(status=201)
 
 
+# ---------------- 控制面：给自写客户端用的极简 JSON 接口 ----------------
+def _entry_json(e) -> dict:
+    return {"path": e.path, "name": base_of(e.path), "dir": bool(e.is_dir),
+            "size": 0 if e.is_dir else (e.size or 0),
+            "mtime": int(e.mtime or 0), "uploading": e.status == 1}
+
+
+async def api_op(request, store):
+    """POST /_op  {"op": "mv", "src": "/a", "dst": "/b"}
+
+    客户端（自写的 App / 脚本）不用实现 WebDAV 的 MOVE/COPY 语义——Destination
+    头、Overwrite、412/409 那一套，报动作和路径就行。服务器在进程内直接调
+    store.*，跟 CLI 是同一套代码，不存在两套行为。
+    字节的上传下载仍然走 PUT / GET（流式，不塞进 JSON）。
+    """
+    if request.method.upper() != "POST":
+        return web.json_response({"error": "POST only"}, status=405)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "bad body"}, status=400)
+    op = str(body.get("op") or "").strip().lower()
+    src = norm(str(body.get("src") or body.get("path") or "/"))
+    dst = norm(str(body.get("dst") or "")) if body.get("dst") else ""
+    if bad_path(src) or (dst and bad_path(dst)):
+        return web.json_response({"error": "bad path"}, status=400)
+    write = op not in ("ls", "list", "stat")
+    if write and READONLY:
+        return web.json_response({"error": "readonly"}, status=403)
+    try:
+        if op in ("ls", "list"):
+            e = store.visible(src)
+            if e is None:
+                return web.json_response({"error": "not found"}, status=404)
+            if not e.is_dir:
+                return web.json_response({"ok": True, "path": src,
+                                          "entries": [_entry_json(e)]})
+            return web.json_response({"ok": True, "path": src,
+                                      "entries": [_entry_json(c) for c in store.children(src)]})
+        if op == "stat":
+            e = store.visible(src)
+            if e is None:
+                return web.json_response({"error": "not found"}, status=404)
+            return web.json_response({"ok": True, "entry": _entry_json(e)})
+        if op == "mkdir":
+            await store.mkdir(src)
+        elif op == "mv":
+            if not dst:
+                return web.json_response({"error": "need dst"}, status=400)
+            await store.move(src, dst)
+        elif op == "cp":
+            if not dst:
+                return web.json_response({"error": "need dst"}, status=400)
+            await store.copy(src, dst)
+        elif op in ("rm", "delete"):
+            if src == "/":
+                return web.json_response({"error": "cannot delete root"}, status=403)
+            await store.delete(src)
+        else:
+            return web.json_response({"error": "unknown op", "ops": ["ls", "stat", "mkdir",
+                                                                    "mv", "cp", "rm"]},
+                                     status=400)
+    except FileNotFoundError:
+        return web.json_response({"error": "not found"}, status=404)
+    except FileExistsError as ex:
+        return web.json_response({"error": str(ex) or "conflict"}, status=409)
+    except OSError as ex:
+        return web.json_response({"error": str(ex) or "conflict"}, status=409)
+    return web.json_response({"ok": True, "src": src, "dst": dst})
+
+
 async def dav_proppatch(request, store):
     if READONLY:
         return web.Response(status=403, text="readonly")
@@ -765,7 +838,11 @@ class Uploader:
             return
         now = time.time()
         for n in names:
-            if n.startswith(".") or n in pend:
+            # 缓存目录里还躺着正式条目和 .part，只有 .stg 是待上传暂存
+            if not n.endswith(STG_SUFFIX):
+                continue
+            dig = n[:-len(STG_SUFFIX)]
+            if dig in pend:
                 continue
             p = os.path.join(staging_dir(), n)
             try:
@@ -872,6 +949,8 @@ async def handle(request, store, up, fill=None):
         return web.Response(status=400, text="bad path")
     m = request.method.upper()
     try:
+        if request.path == "/_op":
+            return await api_op(request, store)
         if m == "OPTIONS":
             return await dav_options(request)
         if m == "PROPFIND":
@@ -908,7 +987,7 @@ async def handle(request, store, up, fill=None):
     finally:
         # 写操作只改本地索引：推送快照是后台的事（server 主循环里 backup_if_idle）。
         # 在请求路径上压缩整库 + 上传要几秒，MOVE 这种小操作会被它拖住。
-        if m in ("PUT", "DELETE", "MKCOL", "MOVE", "COPY"):
+        if m in ("PUT", "DELETE", "MKCOL", "MOVE", "COPY") or request.path == "/_op":
             store.kick_backup()
     return web.Response(status=405, text="method not allowed",
                         headers={"Allow": ALLOW})

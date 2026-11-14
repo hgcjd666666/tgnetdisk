@@ -112,6 +112,10 @@ def cache_key_of(h, size, parts) -> str:
 
 # 部分缓存：Range 请求边发边填的稀疏文件，收齐校验通过才转正去掉后缀
 PART_SUFFIX = ".part"
+# 待上传的字节就放在缓存目录里，只是先挂个 .stg 后缀：上传中还没有分片消息 id，
+# 算不出最终缓存键（hash-大小-id指纹），等传完 rename 成正式条目就行，
+# 一份字节自始至终只占一份磁盘，也不用两套配额和两套清理逻辑。
+STG_SUFFIX = ".stg"
 
 
 def partial_path(key: str) -> str:
@@ -244,15 +248,44 @@ def partial_commit(key: str, want_hash: str, size: int) -> bool:
     return True
 
 
+_staging_migrated = False
+
+
+def _migrate_staging():
+    """把旧版的 cache/staging/ 并进 blobs/：两边本来就是同一份字节的两段生命周期。"""
+    global _staging_migrated
+    if _staging_migrated:
+        return
+    _staging_migrated = True
+    old = os.path.join(CACHE_DIR, "staging")
+    try:
+        names = os.listdir(old)
+    except OSError:
+        return
+    moved = 0
+    for n in names:
+        try:
+            os.replace(os.path.join(old, n), staging_path(n))
+            moved += 1
+        except OSError:
+            pass
+    try:
+        os.rmdir(old)
+    except OSError:
+        pass
+    if moved:
+        log.info("上传暂存已并入缓存目录（迁移 %d 份）", moved)
+
+
 def staging_dir() -> str:
-    """待上传文件落盘的地方。写成「落盘即返回」以后，它就是这个功能的磁盘底。"""
-    d = os.path.join(CACHE_DIR, "staging")
-    os.makedirs(d, exist_ok=True)
+    """待上传文件落盘的地方——就是读缓存目录本身。"""
+    d = blob_dir()
+    _migrate_staging()
     return d
 
 
 def staging_path(digest: str) -> str:
-    return os.path.join(staging_dir(), digest) if digest else ""
+    return os.path.join(staging_dir(), digest + STG_SUFFIX) if digest else ""
 
 
 def staging_drop(digest: str):
@@ -296,20 +329,19 @@ def _scan_dir(d: str, collect: bool):
             if de.name.startswith("."):
                 continue
             # 正在填的部分文件也算占用，但不能被淘汰——删了等于把进度扔了
-            if collect and not de.name.endswith(PART_SUFFIX):
+            if collect and not de.name.endswith(PART_SUFFIX) \
+                    and not de.name.endswith(STG_SUFFIX):
                 items.append((st.st_mtime, st.st_size, de.path))
     return total, items
 
 
 def _cache_usage():
-    """本地占用 = 读缓存 + staging。返回 (总占用, 可淘汰条目)。
+    """本地占用 = 读缓存 + 待上传暂存，返回 (总占用, 可淘汰条目)。
 
-    staging 里的文件正在等着上传，只计入占用、不进淘汰列表——不然传一半的
-    文件会被自己腾空间的逻辑删掉，那才是真丢数据。
+    .stg（等着上传）和 .part（部分缓存）只计入占用、不进淘汰列表——把它们
+    删掉才是真丢数据。
     """
-    live, items = _scan_dir(blob_dir(), True)
-    pend, _ = _scan_dir(os.path.join(CACHE_DIR, "staging"), False)
-    return live + pend, items
+    return _scan_dir(blob_dir(), True)
 
 
 def cache_trim(need: int = 0, keep: str = "") -> int:

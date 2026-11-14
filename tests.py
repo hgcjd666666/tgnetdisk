@@ -41,6 +41,7 @@ CASES = [
     ("历史分片格式", "t_part_list_format"),
     ("缺分片必须报错", "t_missing_slice"),
     ("WebDAV 语义", "t_dav_basic"),
+    ("JSON 控制面 /_op", "t_api_op"),
     (".. 路径规范化", "t_norm_dotdot"),
     ("覆盖失败保留旧文件", "t_overwrite_fail_keeps_old"),
     ("父路径是文件", "t_parent_is_file"),

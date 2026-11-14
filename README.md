@@ -112,6 +112,15 @@ curl -u admin:密码 -r 1000000-1000099 http://IP:8090/远端路径   # Range，
 
 Windows 的「映射网络驱动器」、macOS 的「连接服务器」、安卓的 Solid Explorer / RCX 都能直连。
 
+**给自写客户端用的控制面**：`POST /_op`，body 是 JSON。
+
+```bash
+curl -u admin:pw -X POST http://IP:8090/_op -d '{"op":"mv","src":"/a","dst":"/b"}'
+curl -u admin:pw -X POST http://IP:8090/_op -d '{"op":"ls","path":"/a"}'
+```
+
+动作：`ls` / `stat` / `mkdir` / `mv` / `cp` / `rm`。客户端不用实现 WebDAV 的 `MOVE`/`COPY` 那套（`Destination` 头、`Overwrite`、412/409），服务器进程内直接调 `store.*`，跟 CLI 是同一套实现。字节的上传下载仍然走 `PUT` / `GET`——大文件不该塞进 JSON。这样客户端不需要连 Telegram、不需要 session、也不需要自己做缓存，全部由服务器承担。
+
 默认（`TGND_LOCK=none`）写操作只改本地索引，毫秒级返回，不做任何 TG 往返；索引推迟到空闲 `SNAPSHOT_SEC` 秒后由后台推上去。`TGND_LOCK=tg`（多设备）时锁被别的节点占着，写操作会返回 `503` + `Retry-After: 3`，不会卡住客户端。
 
 ## 测试

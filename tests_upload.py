@@ -138,7 +138,7 @@ async def t_up_gc_orphan_staging(ctx):
     st, client = ctx.st, ctx.client
     cli, s2, up, c, srv = await make_dav(start_up=False)
     try:
-        orphan = os.path.join(S.staging_dir(), "f" * 40)
+        orphan = S.staging_path("f" * 40)
         with open(orphan, "wb") as f:
             f.write(b"junk")
         up2 = srv.Uploader(s2, 1)

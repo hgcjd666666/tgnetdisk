@@ -72,6 +72,47 @@ async def t_dav_basic(ctx):
         else:
             os.environ["ONLINE"] = old
 
+async def t_api_op(ctx):
+    """客户端用的 JSON 控制面：走它挪/删/建，跟走 WebDAV 是同一套行为。"""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    import server as srv
+    c = FakeClient()
+    st = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+    st.fast = True
+    up = srv.Uploader(st, 1)
+    app = web.Application(client_max_size=0)
+    app.router.add_route("*", "/{tail:.*}", lambda r: srv.handle(r, st, up))
+    async with TestClient(TestServer(app)) as cli:
+        r = await cli.post("/_op", json={"op": "mkdir", "path": "/api/d"})
+        assert r.status == 200, await r.text()
+        assert st.get("/api/d") is not None and st.get("/api/d").is_dir
+        r = await cli.put("/api/a.bin", data=b"x" * 5000)
+        assert r.status == 201
+        r = await cli.post("/_op", json={"op": "mv", "src": "/api/a.bin", "dst": "/api/d/a.bin"})
+        assert r.status == 200, await r.text()
+        assert st.get("/api/a.bin") is None and st.get("/api/d/a.bin") is not None
+        r = await cli.post("/_op", json={"op": "ls", "path": "/api/d"})
+        j = await r.json()
+        assert r.status == 200 and [e["name"] for e in j["entries"]] == ["a.bin"], j
+        assert j["entries"][0]["size"] == 5000
+        r = await cli.post("/_op", json={"op": "cp", "src": "/api/d/a.bin", "dst": "/api/b.bin"})
+        assert r.status == 200, await r.text()
+        r = await cli.post("/_op", json={"op": "stat", "path": "/api/b.bin"})
+        assert (await r.json())["entry"]["size"] == 5000
+        r = await cli.post("/_op", json={"op": "mv", "src": "/api/b.bin", "dst": "/api/b.bin"})
+        assert r.status == 200
+        r = await cli.post("/_op", json={"op": "rm", "path": "/api/d"})
+        assert r.status == 200, await r.text()
+        assert st.get("/api/d/a.bin") is None, "rm 目录没摘掉子树"
+        r = await cli.post("/_op", json={"op": "rm", "path": "/nope"})
+        assert r.status == 404, f"删不存在的应 404，实际 {r.status}"
+        r = await cli.post("/_op", json={"op": "bogus"})
+        assert r.status == 400, f"未知动作应 400，实际 {r.status}"
+        r = await cli.get("/_op")
+        assert r.status == 405, f"GET /_op 应 405，实际 {r.status}"
+
+
 async def t_range_store(ctx):
     st, client = ctx.st, ctx.client
     data = rand(400000)
@@ -260,6 +301,7 @@ async def t_slice_reuse_rejects_mismatch(ctx):
 async def main(ctx):
     return [
         ("t_dav_basic", t_dav_basic),
+        ("t_api_op", t_api_op),
         ("t_range_store", t_range_store),
         ("t_range_http", t_range_http),
         ("t_range_after_upload", t_range_after_upload),
