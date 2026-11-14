@@ -273,7 +273,9 @@ async def dav_get(request, store, fill=None):
             # 边发给客户端边落到部分缓存：稀疏文件，写过的区间就是已缓存，
             # 「填到哪了」交给 SEEK_HOLE，不用另外记账。
             key = cache_key(e)
-            pfd = partial_open(key, total) if key else None
+            # FILL_RATE=0 就是关掉「边看边缓存」：没人补洞的话，留下一个永远
+            # 填不满的 .part 只是占地方
+            pfd = partial_open(key, total) if (key and FILL_RATE > 0) else None
             if pfd is not None:
                 # SEEK_HOLE 的粒度是文件系统块，不是字节。只写半个块的话整块都会
                 # 被当成已缓存，块内没写的部分是 0，补洞会跳过它，最后 hash 对不上。

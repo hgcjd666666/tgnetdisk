@@ -18,6 +18,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import traceback
 from types import SimpleNamespace
 
@@ -928,12 +929,19 @@ async def main():
 
     def blobs():
         try:
-            return sorted(n for n in os.listdir(BLOBS) if not n.startswith("."))
+            return sorted(n for n in os.listdir(BLOBS)
+                          if not n.startswith(".") and not n.endswith(S.PART_SUFFIX))
+        except OSError:
+            return []
+
+    def parts():
+        try:
+            return sorted(n for n in os.listdir(BLOBS) if n.endswith(S.PART_SUFFIX))
         except OSError:
             return []
 
     def wipe_cache():
-        for n in blobs():
+        for n in blobs() + parts():
             try:
                 os.unlink(os.path.join(BLOBS, n))
             except OSError:
@@ -1483,6 +1491,337 @@ async def main():
         finally:
             await stop_dav(cli, up)
 
+    # ---------- Range / 补洞的边界 ----------
+    async def t_edge_tiny_file():
+        # 比一个块还小的文件：整段都不足一块，一个字节都不该写进缓存
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(100)
+            assert (await cli.put("/edge/tiny.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/tiny.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/edge/tiny.bin")
+            key = S.cache_key(e)
+            r = await cli.get("/edge/tiny.bin", headers={"Range": "bytes=0-99"})
+            assert r.status == 206 and await r.read() == data
+            assert await wait_done(
+                lambda: os.path.exists(os.path.join(S.CACHE_DIR, "blobs", key))), "小文件没补齐"
+            with open(os.path.join(S.CACHE_DIR, "blobs", key), "rb") as f:
+                assert f.read() == data
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_one_block():
+        # 正好一个块：Range 覆盖整块，应该直接写进缓存
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_fill=False)
+        try:
+            blk = os.statvfs(S.CACHE_DIR).f_frsize or 4096
+            data = rand(blk)
+            assert (await cli.put("/edge/one.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/one.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/edge/one.bin")
+            key = S.cache_key(e)
+            pp = S.partial_path(key)
+            r = await cli.get("/edge/one.bin", headers={"Range": f"bytes=0-{blk - 1}"})
+            assert r.status == 206 and await r.read() == data
+            fd = os.open(pp, os.O_RDONLY)
+            try:
+                assert S.first_hole(fd, blk) is None, "整块写完应该没有洞"
+                assert os.pread(fd, blk, 0) == data
+            finally:
+                os.close(fd)
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_tail_block():
+        # size 不是块整数倍：尾块不足一块，绝不能只写一半
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_fill=False)
+        try:
+            blk = os.statvfs(S.CACHE_DIR).f_frsize or 4096
+            size = blk * 4 + 1234
+            data = rand(size)
+            assert (await cli.put("/edge/tail.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/tail.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/edge/tail.bin")
+            key = S.cache_key(e)
+            pp = S.partial_path(key)
+            last_blk = blk * 4
+            r = await cli.get("/edge/tail.bin", headers={"Range": f"bytes=0-{size - 1}"})
+            assert r.status == 206 and await r.read() == data
+            fd = os.open(pp, os.O_RDONLY)
+            try:
+                assert os.pread(fd, last_blk, 0) == data[:last_blk], "前面的完整块该写进去"
+                tail = os.pread(fd, size - last_blk, last_blk)
+                assert tail == b"\0" * (size - last_blk), \
+                    "不足一块的尾块不能写，写半个块会把整块标成已缓存"
+                assert S.first_hole(fd, size) == last_blk, "尾块应该还是洞，留给补洞"
+            finally:
+                os.close(fd)
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_whole_and_suffix():
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(50000)
+            assert (await cli.put("/edge/ws.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/ws.bin") or SimpleNamespace(status=1)).status == 0)
+            r = await cli.get("/edge/ws.bin", headers={"Range": "bytes=0-"})
+            assert r.status == 206 and await r.read() == data
+            r = await cli.get("/edge/ws.bin", headers={"Range": "bytes=-1000"})
+            assert r.status == 206 and await r.read() == data[-1000:]
+            r = await cli.get("/edge/ws.bin", headers={"Range": "bytes=49999-"})
+            assert r.status == 206 and await r.read() == data[-1:]
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_empty_file():
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            assert (await cli.put("/edge/zero.bin", data=b"")).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/zero.bin") or SimpleNamespace(status=1)).status == 0)
+            r = await cli.get("/edge/zero.bin")
+            assert r.status == 200 and await r.read() == b""
+            r = await cli.get("/edge/zero.bin", headers={"Range": "bytes=0-0"})
+            assert r.status in (200, 416), f"空文件 Range 不该 500，实际 {r.status}"
+            assert not parts(), "空文件不该有部分缓存"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_concurrent_ranges():
+        # 多个 Range 同时写同一个稀疏文件的不同块
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_fill=False)
+        try:
+            blk = os.statvfs(S.CACHE_DIR).f_frsize or 4096
+            size = blk * 8
+            data = rand(size)
+            assert (await cli.put("/edge/par.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/par.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/edge/par.bin")
+            pp = S.partial_path(S.cache_key(e))
+            spans = [(i * blk, i * blk + blk - 1) for i in (1, 3, 5, 7)]
+            rs = await asyncio.gather(*[
+                cli.get("/edge/par.bin", headers={"Range": f"bytes={a}-{b}"})
+                for a, b in spans])
+            bodies = [await r.read() for r in rs]
+            for (a, b), body in zip(spans, bodies):
+                assert body == data[a:b + 1], "并发 Range 内容错位"
+            fd = os.open(pp, os.O_RDONLY)
+            try:
+                for a, _b in spans:
+                    assert os.pread(fd, blk, a) == data[a:a + blk], f"块 {a} 没写对"
+                assert S.first_hole(fd, size) == 0, "前面没写的块应该还是洞"
+            finally:
+                os.close(fd)
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_tampered_partial():
+        # 部分缓存被人改过：补完洞之后 hash 必须对不上，整份丢掉
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_fill=False)
+        try:
+            blk = os.statvfs(S.CACHE_DIR).f_frsize or 4096
+            data = rand(blk * 4)
+            assert (await cli.put("/edge/tamper.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/tamper.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/edge/tamper.bin")
+            key = S.cache_key(e)
+            pp = S.partial_path(key)
+            final = os.path.join(S.CACHE_DIR, "blobs", key)
+            r = await cli.get("/edge/tamper.bin", headers={"Range": f"bytes=0-{blk - 1}"})
+            assert r.status == 206
+            with open(pp, "r+b") as f:          # 写进去的块被改掉
+                f.seek(0)
+                f.write(b"Z" * blk)
+            up.fill.want("/edge/tamper.bin")
+            up.fill.start()
+            assert await wait_done(lambda: not os.path.exists(pp)), "坏数据没被丢掉"
+            assert not os.path.exists(final), "hash 不对还转正了"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_partial_size_changed():
+        # 部分缓存长度和记录对不上（内容换过了）：要整个重建
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_fill=False)
+        try:
+            blk = os.statvfs(S.CACHE_DIR).f_frsize or 4096
+            data = rand(blk * 3)
+            assert (await cli.put("/edge/resize.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/resize.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/edge/resize.bin")
+            pp = S.partial_path(S.cache_key(e))
+            r = await cli.get("/edge/resize.bin", headers={"Range": f"bytes=0-{blk - 1}"})
+            assert r.status == 206
+            with open(pp, "r+b") as f:          # 模拟长度错乱
+                f.truncate(1000)
+            r = await cli.get("/edge/resize.bin", headers={"Range": f"bytes=0-{blk - 1}"})
+            assert r.status == 206 and await r.read() == data[:blk]
+            assert os.path.getsize(pp) == blk * 3, "长度不对没重建"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_multislice_range():
+        # 多个 TG 分片：Range 跨片时不能错位
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_fill=False)
+        try:
+            data = rand(300000)
+            await put_bytes(s2, data, "/edge/multi.bin", slice_size=64 * 1024)  # 5 片
+            e = s2.get("/edge/multi.bin")
+            assert e.status == 0 and len(e.parts) == 5, f"分片数 {len(e.parts)}"
+            for lo, hi in ((60000, 70000), (65530, 65550), (130000, 140000)):
+                r = await cli.get("/edge/multi.bin",
+                                  headers={"Range": f"bytes={lo}-{hi}"})
+                assert r.status == 206, r.status
+                assert await r.read() == data[lo:hi + 1], f"[{lo},{hi}] 跨片读错位"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_staging_range():
+        # 还没传完的文件：Range 从 staging 读，不建部分缓存
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_up=False)
+        try:
+            data = rand(50000)
+            assert (await cli.put("/edge/stg.bin", data=data)).status == 201
+            r = await cli.get("/edge/stg.bin", headers={"Range": "bytes=1000-1999"})
+            assert r.status == 206 and await r.read() == data[1000:2000]
+            assert not parts(), "上传中的文件不该建部分缓存"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    # ---------- 部分缓存的维护边界 ----------
+    async def t_edge_part_not_evicted():
+        # 正在填的 .part 算占用但不参与淘汰，腾空间只能删正式条目
+        cache_env(0.001)                       # ≈1MB
+        wipe_cache()
+        pp = os.path.join(BLOBS, "deadbeef-300000" + S.PART_SUFFIX)
+        with open(pp, "wb") as f:
+            f.write(b"P" * 10000)
+        fp = os.path.join(BLOBS, "cafe-300000")
+        with open(fp, "wb") as f:
+            f.write(b"F" * (2 << 20))
+        S.cache_trim(0)
+        assert os.path.exists(pp), "正在填的部分缓存被 LRU 删掉了"
+        assert not os.path.exists(fp), "正式条目该被淘汰腾地方"
+        wipe_cache()
+        cache_env(None)
+
+    async def t_edge_part_ttl():
+        cache_env(1)
+        wipe_cache()
+        pp = os.path.join(BLOBS, "feedface-1000" + S.PART_SUFFIX)
+        with open(pp, "wb") as f:
+            f.write(b"Q" * 100)
+        old = time.time() - S.PART_TTL - 100
+        os.utime(pp, (old, old))
+        S._cache_swept_at = 0.0
+        S.cache_sweep()
+        assert not os.path.exists(pp), "过期部分缓存没被清掉"
+        cache_env(None)
+
+    async def t_edge_fill_failure_keeps_partial():
+        # 补洞时数据拿不到：不能转正，部分缓存留着等下次
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav(start_fill=False)
+        try:
+            blk = os.statvfs(S.CACHE_DIR).f_frsize or 4096
+            data = rand(blk * 3)
+            assert (await cli.put("/edge/fail.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/fail.bin") or SimpleNamespace(status=1)).status == 0)
+            e = s2.get("/edge/fail.bin")
+            key = S.cache_key(e)
+            pp = S.partial_path(key)
+            final = os.path.join(S.CACHE_DIR, "blobs", key)
+            r = await cli.get("/edge/fail.bin", headers={"Range": f"bytes=0-{blk - 1}"})
+            assert r.status == 206
+            mid = S.part_id(next(iter(e.parts.values())))
+            c._blobs.pop(mid, None)             # 分片消息取不到数据了
+            up.fill.want("/edge/fail.bin")
+            up.fill.start()
+            await asyncio.sleep(0.4)
+            assert not os.path.exists(final), "拿不到数据却转正了"
+            assert os.path.exists(pp), "失败后部分缓存该留着，别把已下的也扔了"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_fill_rate_zero():
+        # FILL_RATE_KB=0 关掉边看边缓存：不建 .part，Range 照常可用
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        old_rate = srv.FILL_RATE
+        srv.FILL_RATE = 0
+        try:
+            data = rand(50000)
+            assert (await cli.put("/edge/off.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/off.bin") or SimpleNamespace(status=1)).status == 0)
+            r = await cli.get("/edge/off.bin", headers={"Range": "bytes=0-99"})
+            assert r.status == 206 and await r.read() == data[:100]
+            assert not parts(), "补洞关了还建部分缓存"
+        finally:
+            srv.FILL_RATE = old_rate
+            cache_env(None)
+            await stop_dav(cli, up)
+
+    async def t_edge_full_get_and_range_race():
+        # 同一个文件，一边全量下、一边拖进度条
+        cache_env(1)
+        wipe_cache()
+        cli, s2, up, c, srv = await make_dav()
+        try:
+            data = rand(200000)
+            assert (await cli.put("/edge/race.bin", data=data)).status == 201
+            assert await wait_done(
+                lambda: (s2.get("/edge/race.bin") or SimpleNamespace(status=1)).status == 0)
+            full, part = await asyncio.gather(
+                cli.get("/edge/race.bin"),
+                cli.get("/edge/race.bin", headers={"Range": "bytes=100000-100999"}))
+            assert await full.read() == data, "全量下载内容被影响"
+            assert await part.read() == data[100000:101000], "Range 内容被影响"
+        finally:
+            cache_env(None)
+            await stop_dav(cli, up)
+
     for name, fn in [
         ("空文件", t_empty), ("1字节", t_one_byte), ("中文+空格", t_unicode),
         ("特殊字符", t_special), ("深目录", t_deep), ("多分片7片", t_multislice),
@@ -1542,6 +1881,21 @@ async def main():
         ("补洞-全0块打成稀疏", t_fill_punch_zeros),
         ("补洞-已有缓存不重建", t_fill_no_partial_after_full_get),
         ("补洞-缓存关时不建", t_fill_off_when_cache_off),
+        ("边界-小于一块的文件", t_edge_tiny_file),
+        ("边界-正好一块", t_edge_one_block),
+        ("边界-尾块不足一块", t_edge_tail_block),
+        ("边界-全份与后缀Range", t_edge_whole_and_suffix),
+        ("边界-空文件Range", t_edge_empty_file),
+        ("边界-并发Range不同块", t_edge_concurrent_ranges),
+        ("边界-部分缓存被篡改", t_edge_tampered_partial),
+        ("边界-部分缓存长度变了", t_edge_partial_size_changed),
+        ("边界-跨分片Range", t_edge_multislice_range),
+        ("边界-上传中Range不建缓存", t_edge_staging_range),
+        ("边界-部分缓存不被淘汰", t_edge_part_not_evicted),
+        ("边界-部分缓存过期清理", t_edge_part_ttl),
+        ("边界-补洞失败保留", t_edge_fill_failure_keeps_partial),
+        ("边界-补洞关闭", t_edge_fill_rate_zero),
+        ("边界-全量与Range并发", t_edge_full_get_and_range_race),
     ]:
         await case(name, fn)
 
