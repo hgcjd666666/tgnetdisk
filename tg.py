@@ -70,6 +70,11 @@ def is_db_msg(msg) -> bool:
     return False
 
 
+def slice_key(h: str, idx: int) -> str:
+    """残片单独成一条内容时用的键。带序号，不会和完整内容的 hash 撞。"""
+    return "%s-s%d" % (h, idx)
+
+
 def slice_name(h: str, idx: int) -> str:
     return "%s.%d" % (h, idx)
 
@@ -554,12 +559,20 @@ class TGStore:
         for h, parts in by_hash.items():
             idxs = sorted(parts)
             whole = idxs == list(range(len(idxs)))
-            size = 0
             if whole:
                 # 片数 × SLICE，最后一片按实际大小修正
                 last = await self.client.get_messages(self.chat, ids=parts[idxs[-1]])
-                size = (len(idxs) - 1) * SLICE + int(getattr(getattr(last, "document", None), "size", 0) or 0)
-            self.index.content_put(h, size, parts)
+                size = (len(idxs) - 1) * SLICE + int(
+                    getattr(getattr(last, "document", None), "size", 0) or 0)
+                self.index.content_put(h, size, parts)
+            else:
+                # 序号不连续：拼起来就是错位的字节流，不能当一份内容。
+                # 每个分片单独记成一条内容（重编号成 0），各自可下载。
+                for idx in idxs:
+                    m = await self.client.get_messages(self.chat, ids=parts[idx])
+                    size = int(getattr(getattr(m, "document", None), "size", 0) or 0)
+                    if size > 0:
+                        self.index.content_put(slice_key(h, idx), size, {0: parts[idx]})
         # 已有路径如果内容变完整了，把上传中标记改成完成
         for path, h, mtime, status in self.index.all_files():
             if status == STATUS_PENDING and h and self.index.content(h):
@@ -574,13 +587,24 @@ class TGStore:
         for h, parts in by_hash.items():
             if refs.get(h):
                 continue
-            got = self.index.content(h)
-            if not got or not got[1]:
-                continue
-            path = f"/lost+found/{h}"
-            if self.index.get(path) is None:
-                self.index.put_file(path, h, now, STATUS_DONE)
-                lost += 1
+            idxs = sorted(parts)
+            if idxs == list(range(len(idxs))):
+                path = f"/lost+found/{h}"
+                if self.index.get(path) is None:
+                    self.index.put_file(path, h, now, STATUS_DONE)
+                    lost += 1
+            else:
+                # 残片就按分片一条条列出来：/lost+found/<hash>.<序号>，
+                # 每个都能单独下载，交付的是那一片真实的字节
+                for idx in idxs:
+                    key = slice_key(h, idx)
+                    got = self.index.content(key)
+                    if not got or not got[1]:
+                        continue
+                    path = f"/lost+found/{h}.{idx}"
+                    if self.index.get(path) is None:
+                        self.index.put_file(path, key, now, STATUS_DONE)
+                        lost += 1
         if lost:
             log.warning("有 %d 份内容没有路径引用，已挂到 /lost+found 下", lost)
         log.info("重建索引：扫 %d 条消息，%d 份内容", n, len(by_hash))

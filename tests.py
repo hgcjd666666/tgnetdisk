@@ -459,6 +459,31 @@ async def t_reindex(ctx):
     assert out == data, "lost+found 里的内容下载不出来"
 
 
+async def t_lostfound_fragments(ctx):
+    """序号不连续的残片：每个分片单独列出来，各自能下载到真实字节。"""
+    from types import SimpleNamespace as NS
+    h = "d" * 32
+    p0 = rand(4000)
+    p2 = rand(3000)
+    await ctx.client.send_file(1, p0, attributes=[NS(file_name=f"{h}.0")])
+    await ctx.client.send_file(1, p2, attributes=[NS(file_name=f"{h}.2")])
+    await ctx.store.reindex()
+    e0 = ctx.vfs.get(f"/lost+found/{h}.0")
+    e2 = ctx.vfs.get(f"/lost+found/{h}.2")
+    assert e0 and e0.size == 4000, e0
+    assert e2 and e2.size == 3000, e2
+    got0 = b""
+    async for c in ctx.vfs.iter_content(f"/lost+found/{h}.0"):
+        got0 += c
+    assert got0 == p0, "分片 0 的内容不对"
+    got2 = b""
+    async for c in ctx.vfs.iter_content(f"/lost+found/{h}.2"):
+        got2 += c
+    assert got2 == p2, "分片 2 的内容不对"
+    # 不该凭空合成一个完整的 /lost+found/<hash>
+    assert ctx.vfs.get(f"/lost+found/{h}") is None
+
+
 # ---------------- WebDAV ----------------
 async def make_dav(ctx):
     from aiohttp.test_utils import TestClient, TestServer
@@ -583,6 +608,7 @@ CASES = [
     ("并发写入", t_concurrent_put),
     ("后台上传队列", t_uploader),
     ("重建索引", t_reindex),
+    ("残片按分片暴露", t_lostfound_fragments),
     ("旧库自动迁移", t_migrate_legacy),
     ("快照上传与拉回", t_snapshot_roundtrip),
     ("TG 锁获取与释放", t_lock_roundtrip),
