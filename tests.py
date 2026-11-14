@@ -446,6 +446,17 @@ async def t_reindex(ctx):
     await ctx.store.reindex()
     got = ctx.index.content(h)
     assert got and got[1], f"重建后没有分片: {got}"
+    # 路径还在，不该进 lost+found
+    assert ctx.vfs.get("/ri/a.bin") is not None
+    # 把路径也删掉，模拟索引彻底丢失：内容应挂到 /lost+found 下
+    ctx.index.drop("/ri/a.bin")
+    await ctx.store.reindex()
+    e = ctx.vfs.get(f"/lost+found/{h}")
+    assert e is not None and e.hash == h, "没挂进 lost+found"
+    out = b""
+    async for c in ctx.vfs.iter_content(f"/lost+found/{h}"):
+        out += c
+    assert out == data, "lost+found 里的内容下载不出来"
 
 
 # ---------------- WebDAV ----------------

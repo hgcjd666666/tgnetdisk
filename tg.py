@@ -564,5 +564,24 @@ class TGStore:
         for path, h, mtime, status in self.index.all_files():
             if status == STATUS_PENDING and h and self.index.content(h):
                 self.index.set_status(path, STATUS_DONE)
+
+        # 没有任何路径引用的内容挂到 /lost+found/<hash>：TG 消息里只有 hash，
+        # 原始路径恢复不了，但至少内容还能列出来、还能下载。
+        refs = self.index.referenced(list(by_hash))
+        lost = 0
+        if by_hash:
+            self.index.put_dir("/lost+found", now)
+        for h, parts in by_hash.items():
+            if refs.get(h):
+                continue
+            got = self.index.content(h)
+            if not got or not got[1]:
+                continue
+            path = f"/lost+found/{h}"
+            if self.index.get(path) is None:
+                self.index.put_file(path, h, now, STATUS_DONE)
+                lost += 1
+        if lost:
+            log.warning("有 %d 份内容没有路径引用，已挂到 /lost+found 下", lost)
         log.info("重建索引：扫 %d 条消息，%d 份内容", n, len(by_hash))
         return n
