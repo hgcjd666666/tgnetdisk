@@ -209,7 +209,7 @@ python main.py --reindex
 ## 测试
 
 ```bash
-python tests.py          # 内存版 Telegram，零网络，89 组用例
+python tests.py          # 内存版 Telegram，零网络，92 组用例
 python tests.py -k 缓存   # 按名字过滤
 ```
 

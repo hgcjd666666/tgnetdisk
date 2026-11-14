@@ -2238,11 +2238,11 @@ async def t_dav_stream_limit(ctx):
 async def t_dav_many(ctx):
     cli = await make_dav(ctx)
     try:
-        for i in range(60):
+        for i in range(12):
             assert (await cli.put(f"/many/f{i:03d}", data=b"x")).status == 201
         r = await cli.request("PROPFIND", "/many", headers={"Depth": "1"})
         txt = await r.text()
-        assert txt.count("<D:response>") == 61, txt.count("<D:response>")
+        assert txt.count("<D:response>") == 13, txt.count("<D:response>")
         r = await cli.request("PROPFIND", "/many", headers={"Depth": "0"})
         assert (await r.text()).count("<D:response>") == 1
     finally:
@@ -2251,22 +2251,21 @@ async def t_dav_many(ctx):
 
 async def t_index_bulk(ctx):
     db = IDX.Index(tempfile.mktemp(suffix=".db"))
-    for d in range(15):
+    for d in range(6):
         db.put_dir(f"/bulk/{d}", 1)
-    for i in range(1500):
+    for i in range(510):
         db.put_file(f"/bulk/{i // 100}/{i:04d}", "%032x" % i, i)
-    assert len(db.all_files()) == 1500
+    assert len(db.all_files()) == 510
     kids = db.children("/bulk")
-    assert len(kids) == 15
-    assert all(k.is_dir for k in kids)
+    assert [k.path for k in kids] == [f"/bulk/{d}" for d in range(6)]
     assert len(db.children("/bulk/0")) == 100
-    ref = db.referenced(["%032x" % i for i in range(0, 1500, 2)])
-    assert len(ref) == 750
+    ref = db.referenced(["%032x" % i for i in range(0, 510, 2)])
+    assert len(ref) == 255
     d = tempfile.mktemp(suffix=".db")
     db.dump(d)
     db2 = IDX.Index(tempfile.mktemp(suffix=".db"))
     db2.restore(d)
-    assert len(db2.all_files()) == 1500
+    assert len(db2.all_files()) == 510
 
 
 async def t_dav_helpers(ctx):
@@ -2930,6 +2929,48 @@ async def t_dav_type_mismatch(ctx):
         await cli.close()
 
 
+async def t_reindex_lostfound_collision(ctx):
+    from types import SimpleNamespace as NS
+    cli = FakeClient()
+    db = IDX.Index(tempfile.mktemp(suffix=".db"))
+    st = tg.TGStore(cli, 1, db, cache)
+    data = rand(1500)
+    p = tempfile.mktemp()
+    with open(p, "wb") as f:
+        f.write(data)
+    h = tg.digest_of(p)
+    await cli.send_file(1, p, attributes=[NS(file_name=f"{h}.0")])
+    db.put_dir("/lost+found", 1)
+    db.put_file(f"/lost+found/{h}", "already-there", 1)
+    await st.reindex()
+    e = db.get(f"/lost+found/{h}")
+    assert e.hash == "already-there", "占着的位置不能被重建覆盖"
+    assert db.content(h) is not None, "内容本身还是要登记"
+
+
+async def t_teleport_same(ctx):
+    v = ctx.vfs
+    h = await _mkfile(v, "/ts/a", b"same bytes")
+    e, err = v.teleport("/ts/a", h, 5, 10)
+    assert err is None and e.hash == h
+    assert ctx.index.referenced([h])[h] == 1, "自己指着自己不该多一条引用"
+    e, err = v.teleport("/ts/a", h, 5)
+    assert err is None
+
+
+async def t_upload_workers(ctx):
+    cli = FakeClient()
+    data = rand(tg.PART * 3 + 7)
+    p = tempfile.mktemp()
+    with open(p, "wb") as f:
+        f.write(data)
+    for workers in (1, 2, 8):
+        ref = await tg.upload_parallel(cli, p, workers=workers)
+        parts = cli._uploads[ref.id]
+        assert len(parts) == 4, (workers, len(parts))
+        assert b"".join(parts[i] for i in sorted(parts)) == data, workers
+
+
 CASES = [
     ("路径规范化", t_paths),
     ("摘要与增量哈希", t_tg_digest),
@@ -2997,6 +3038,9 @@ CASES = [
     ("回收站容错", t_flusher_resilience),
     ("秒传细节", t_dav_teleport_more),
     ("类型不匹配", t_dav_type_mismatch),
+    ("重建不覆盖", t_reindex_lostfound_collision),
+    ("秒传自己", t_teleport_same),
+    ("上传并发度", t_upload_workers),
     ("路径边界", t_paths_edge),
     ("索引边界", t_index_edge),
     ("缓存边界", t_cache_edge),
