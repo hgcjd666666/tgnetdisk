@@ -8,13 +8,16 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
+import mimetypes
 import os
 import sys
 import time
 import uuid
-from email.utils import formatdate
+from contextlib import ExitStack
+from email.utils import formatdate, parsedate_to_datetime
 from urllib.parse import quote, unquote, urlsplit
 
 from aiohttp import web
@@ -23,8 +26,8 @@ from telethon import TelegramClient
 import logger
 from store import (cache_file, cache_key, cache_limit, CACHE_DIR, first_hole, LockBusy,
                    make_session, is_online, partial_commit, partial_open,
-                   Store, norm, base_of, staging_dir, staging_drop, staging_ok,
-                   staging_path)
+                   Store, norm, base_of, staging_dir, staging_hold,
+                   staging_ok, staging_path)
 
 log = logging.getLogger("dav")
 
@@ -41,10 +44,13 @@ READONLY = os.environ.get("DAV_READONLY", "0") == "1"
 
 # 正在给客户端吐字节的响应数。补洞靠它判断「现在忙不忙」，忙就降速让路。
 ACTIVE_STREAMS = 0
+MAX_STREAMS = int(os.environ.get("MAX_STREAMS", "64") or 64)   # 同时在吐字节的响应上限
 FILL_CHUNK = 4 << 20                                        # 补洞一次拉多少
 FILL_RATE = int(os.environ.get("FILL_RATE_KB", "2048") or 0) * 1024
 FILL_YIELD = 8                                              # 有人在读时降到 1/8
 
+PROPFIND_MAX = int(os.environ.get("PROPFIND_MAX_ENTRIES", "50000") or 50000)
+GHOST_TTL = 24 * 3600      # 「上传中」放这么久还没动静，就当对方早没了，允许接管
 ALLOW = "OPTIONS, HEAD, GET, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, COPY"
 DAV_CLASS = "1"            # 只宣告 Class 1：锁（Class 2）不实现，别假装支持
 
@@ -53,8 +59,17 @@ DAV_CLASS = "1"            # 只宣告 Class 1：锁（Class 2）不实现，别
 STREAM_CHUNK = 1 << 20
 
 
+def mime_of(name: str) -> str:
+    """按扩展名猜类型：对客户端来说比一律 octet-stream 有用（预览/内联播放）。"""
+    t, _ = mimetypes.guess_type(name or "")
+    return t or "application/octet-stream"
+
+
 def http_date(ts: float) -> str:
-    return formatdate(ts or time.time(), usegmt=True)
+    try:
+        return formatdate(ts or time.time(), usegmt=True)
+    except (OverflowError, OSError, ValueError):
+        return formatdate(time.time(), usegmt=True)
 
 
 def fs_block_size(fd=None) -> int:
@@ -72,10 +87,10 @@ def fs_block_size(fd=None) -> int:
 
 
 def parse_range(value, size: int):
-    """解析单区间 Range，返回 (start, end) / None（当没给）/ "bad"（要回 416）。
+    """解析单区间 Range，返回 (start, end) / None（没给或语法错）/ "unsat"（要 416）。
 
-    多区间不支持：RFC 9110 允许服务端忽略 Range 直接回整份，这比自己做 multipart
-    简单也安全得多。播放器拖进度条用的都是单区间，够。
+    RFC 9110：语法错的 Range 必须忽略、回整份；只有「语法正确但取不到任何字节」
+    才回 416。多区间也不支持，按允许的方式忽略掉。
     """
     if not value or size <= 0 or not value.startswith("bytes="):
         return None
@@ -89,15 +104,59 @@ def parse_range(value, size: int):
         if not a:                       # bytes=-N：最后 N 字节
             n = int(b)
             if n <= 0:
-                return "bad"
+                return None             # bytes=-0 之类：语法不成立，忽略
             return max(0, size - n), size - 1
         start = int(a)
         end = int(b) if b else size - 1
     except ValueError:
-        return "bad"
-    if start < 0 or start > end or start >= size:
-        return "bad"
+        return None                     # bytes=abc-def 之类：忽略
+    if start < 0:
+        return None
+    if start >= size:
+        return "unsat"                  # 起点超出文件：真取不到
+    if start > end:
+        return None                     # 显式倒序区间：语法不成立，忽略
     return start, min(end, size - 1)
+
+
+def etag_of(e, total=None) -> str:
+    """内容身份：hash + 大小。秒传/缓存天然一致，不用另算。"""
+    if not e or not e.hash:
+        return ""
+    return '"%s-%d"' % (e.hash, e.size if total is None else total)
+
+
+def _http_ts(value: str):
+    try:
+        return parsedate_to_datetime(value).timestamp()
+    except Exception:
+        return None
+
+
+def is_fresh(request, etag: str, mtime: float) -> bool:
+    """条件请求命中：客户端手上的副本就是当前内容。"""
+    inm = request.headers.get("If-None-Match")
+    if inm:
+        tags = [t.strip().removeprefix("W/") for t in inm.split(",")]
+        return "*" in tags or (bool(etag) and etag in tags)
+    ims = request.headers.get("If-Modified-Since")
+    if ims:
+        ts = _http_ts(ims)
+        if ts is not None:
+            return int(mtime) <= int(ts)
+    return False
+
+
+def if_range_ok(request, etag: str, mtime: float) -> bool:
+    """If-Range：跟当前内容对不上就让调用方忽略 Range、回整份。"""
+    v = request.headers.get("If-Range")
+    if not v:
+        return True
+    v = v.strip()
+    if v.startswith('"') or v.startswith("W/"):
+        return v == etag
+    ts = _http_ts(v)
+    return ts is not None and int(mtime) <= int(ts)
 
 
 def xesc(s: str) -> str:
@@ -121,7 +180,9 @@ def is_authorized(request) -> bool:
     try:
         raw = base64.b64decode(h[6:]).decode("utf-8", "replace")
         u, _, p = raw.partition(":")
-        return u == DAV_USER and p == DAV_PASS
+        # 恒定时间比较：别让响应时间把用户名/密码一位位漏出去
+        return (hmac.compare_digest(u.encode("utf-8"), DAV_USER.encode("utf-8"))
+                and hmac.compare_digest(p.encode("utf-8"), DAV_PASS.encode("utf-8")))
     except Exception:
         return False
 
@@ -136,10 +197,16 @@ def unauthorized() -> web.Response:
 
 def prop_xml(entry, path, is_dir) -> str:
     mtime = entry.mtime if entry else time.time()
+    try:
+        created = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(mtime))
+    except (OverflowError, OSError, ValueError):
+        created = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     size = "" if is_dir else str(entry.size if entry else 0)
-    ctype = "httpd/unix-directory" if is_dir else "application/octet-stream"
+    ctype = "httpd/unix-directory" if is_dir else mime_of(entry.name if entry else path)
     rt = "<D:resourcetype><D:collection/></D:resourcetype>" if is_dir else "<D:resourcetype/>"
     name = "/" if norm(path) == "/" else base_of(path)
+    tag = "" if is_dir else etag_of(entry)
+    etag = f"<D:getetag>{xesc(tag)}</D:getetag>" if tag else ""
     return f"""<D:response>
 <D:href>{xesc(href_for(path, is_dir))}</D:href>
 <D:propstat><D:prop>
@@ -148,8 +215,8 @@ def prop_xml(entry, path, is_dir) -> str:
 <D:getcontentlength>{size}</D:getcontentlength>
 <D:getcontenttype>{ctype}</D:getcontenttype>
 <D:getlastmodified>{http_date(mtime)}</D:getlastmodified>
-<D:creationdate>{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(mtime))}</D:creationdate>
-<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>
+{etag}
+<D:creationdate>{created}</D:creationdate>
 </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>
 </D:response>"""
 
@@ -165,23 +232,24 @@ async def dav_options(request):
 
 async def dav_propfind(request, store):
     path = norm(request.path)
-    e = store.get(path)
+    e = store.visible(path)
     if e is None:
         return web.Response(status=404, text="not found")
-    depth = request.headers.get("Depth", "1")
+    depth = (request.headers.get("Depth") or "1").strip().lower()
+    if depth not in ("0", "1"):
+        # 只支持 Depth 0/1。infinity 要把整库拼成一份 XML（几万条就是几十 MB），
+        # 客户端也基本不等它；直接拒掉，让它逐层走。
+        body = (b'<?xml version="1.0" encoding="utf-8"?>'
+                b'<D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>')
+        return web.Response(status=403, body=body, content_type="application/xml")
     parts = [prop_xml(e, path, e.is_dir)]
-    if e.is_dir and depth in ("1", "infinity"):
-        if depth == "infinity":
-            stack = [path]
-            while stack:
-                cur = stack.pop()
-                for c in store.children(cur):
-                    parts.append(prop_xml(c, c.path, c.is_dir))
-                    if c.is_dir:
-                        stack.append(c.path)
-        else:
-            for c in store.children(path):
-                parts.append(prop_xml(c, c.path, c.is_dir))
+    if e.is_dir and depth == "1":
+        kids = store.children(path)
+        if len(kids) > PROPFIND_MAX:
+            log.warning("PROPFIND %s 子项 %d 个，超过上限 %d", path, len(kids), PROPFIND_MAX)
+            return web.Response(status=507, text="too many entries in one collection")
+        for c in kids:
+            parts.append(prop_xml(c, c.path, c.is_dir))
     body = ('<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">'
             + "".join(parts) + "</D:multistatus>")
     return web.Response(status=207, body=body.encode("utf-8"),
@@ -190,43 +258,77 @@ async def dav_propfind(request, store):
 
 async def dav_head(request, store):
     path = norm(request.path)
-    e = store.get(path)
+    e = store.visible(path)
     if e is None:
         return web.Response(status=404)
     if e.is_dir:
-        return web.Response(status=200, content_type="httpd/unix-directory")
-    return web.Response(status=200, headers={
-        "Content-Length": str(e.size),
-        "Content-Type": "application/octet-stream",
-        "Last-Modified": http_date(e.mtime),
+        return web.Response(status=200, content_type="httpd/unix-directory",
+                            headers={"Last-Modified": http_date(e.mtime)})
+    # HEAD 和 GET 必须给出一致的结论：CLI 切片上传中的文件 staging 没有字节，
+    # GET 会 503，HEAD 就不能先报 200 + 一个根本拿不到的长度。
+    uploading = e.status == 1 or bool(e.expect and len(e.parts) < e.expect)
+    total = e.size
+    if uploading:
+        try:
+            total = os.path.getsize(staging_path(e.hash))
+        except OSError:
+            return web.Response(status=404)
+    etag = etag_of(e, total)
+    last = http_date(e.mtime)
+    if is_fresh(request, etag, e.mtime):
+        h = {"Last-Modified": last}
+        if etag:
+            h["ETag"] = etag
+        return web.Response(status=304, headers=h)
+    headers = {
+        "Content-Length": str(total),
+        "Content-Type": mime_of(e.name),
+        "Last-Modified": last,
         "Accept-Ranges": "bytes",
-    })
+    }
+    if etag:
+        headers["ETag"] = etag
+    return web.Response(status=200, headers=headers)
 
 
 async def dav_get(request, store, fill=None):
+    global ACTIVE_STREAMS
     path = norm(request.path)
-    e = store.get(path)
+    e = store.visible(path)          # 上传中且本机没有那份缓冲 → 当作不存在
     if e is None:
         return web.Response(status=404, text="not found")
     if e.is_dir:
+        kids = store.children(path)
+        if len(kids) > PROPFIND_MAX:
+            return web.Response(status=507, text="too many entries in one collection")
         rows = []
-        for c in store.children(path):
+        for c in kids:
             icon = "🗀" if c.is_dir else "🗎"
             rows.append(f'<li><a href="{xesc(href_for(c.path, c.is_dir))}">{icon} {xesc(c.name)}</a></li>')
         html = f"<html><body><h3>{xesc(path)}</h3><ul>{''.join(rows)}</ul></body></html>"
         return web.Response(text=html, content_type="text/html", charset="utf-8")
 
+    if ACTIVE_STREAMS >= MAX_STREAMS:
+        # 每个流都在占 TG 带宽/本地 fd；不限的话几十个并发 Range 就能把
+        # 上传队列和补洞全饿死
+        return web.Response(status=503, text="too many concurrent streams",
+                            headers={"Retry-After": "5"})
     # 能走本地文件的两种情形：还没传完（staging）或命中读缓存。
     # 这两条路径支持 seek，Range 直接落到底层 fd 上，不用重下前面的字节。
     uploading = e.status == 1 or bool(e.expect and len(e.parts) < e.expect)
+    etag = etag_of(e)
+    if not uploading and is_fresh(request, etag, e.mtime):
+        h = {"Last-Modified": http_date(e.mtime)}
+        if etag:
+            h["ETag"] = etag
+        return web.Response(status=304, headers=h)
     fh = None
     if uploading:
         try:
             fh = open(staging_path(e.hash), "rb")
         except OSError:
-            # Content-Length 一旦发出去客户端会等满超时，所以这里先拒绝
-            return web.Response(status=503, text="file is being uploaded or incomplete",
-                                headers={"Retry-After": "3"})
+            # 这台设备没有那份缓冲：对它来说就是没有这个文件
+            return web.Response(status=404, text="not found")
     else:
         hit = store.cached_path(path)
         if hit:
@@ -237,25 +339,28 @@ async def dav_get(request, store, fill=None):
     total = os.fstat(fh.fileno()).st_size if fh is not None else e.size
 
     rng = parse_range(request.headers.get("Range"), total)
-    if rng == "bad":
+    if rng == "unsat":
         if fh is not None:
             fh.close()
         return web.Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+    if rng and not if_range_ok(request, etag, e.mtime):
+        rng = None                      # If-Range 不匹配：按整份回，别拼出坏文件
     start, end = rng if rng else (0, total - 1)
     n = end - start + 1 if total else 0
 
     headers = {
-        "Content-Type": "application/octet-stream",
+        "Content-Type": mime_of(e.name),
         "Content-Disposition": f"attachment; filename*=UTF-8''{quote(e.name)}",
         "Content-Length": str(n),
         "Last-Modified": http_date(e.mtime),
         "Accept-Ranges": "bytes",
     }
+    if etag:
+        headers["ETag"] = etag
     if rng:
         headers["Content-Range"] = f"bytes {start}-{end}/{total}"
     resp = web.StreamResponse(status=206 if rng else 200, headers=headers)
     await resp.prepare(request)
-    global ACTIVE_STREAMS
     ACTIVE_STREAMS += 1
     pfd = None
     try:
@@ -346,51 +451,78 @@ async def dav_put(request, store, up):
     e = store.get(path)
     if e and e.is_dir:
         return web.Response(status=409, text="is a collection")
-    # 客户端先报了大小就提前判断，装不下别白传一遍
+    if e is not None and e.status == 1 and not os.path.exists(staging_path(e.hash)):
+        # 本机没有这份缓冲 = 上传是别的设备发起的：那个路径对它来说是「存在但
+        # 不可读」，不该被这边顶掉。本机有缓冲（自己上一次没传完）时允许覆盖，
+        # 那是同一台设备在改自己的东西。
+        # 超过 GHOST_TTL 还没动静的当作幽灵（对方早就不在了），允许接管。
+        if time.time() - (e.mtime or 0) < GHOST_TTL:
+            return web.Response(status=409, text="file is being uploaded by another node",
+                                headers={"Retry-After": "5"})
+        log.warning("接管陈旧的上传中记录: %s（%d 秒没动静）", path, time.time() - (e.mtime or 0))
+    # 预检查时就把这一份的大小记进预留：两个 PUT 同时进来，谁都不该以为
+    # 预算还是空的。chunked 没有 Content-Length，只能边写边看。
     cl = request.content_length
-    if cl and cl > 0 and not staging_ok(cl):
-        return web.Response(status=507, text="insufficient storage, raise CACHE_MAX_GB")
-    # 落到磁盘，而不是 /tmp（tmpfs，等于内存）。
-    # 名字必须带唯一后缀：只按路径生成的话，同路径两个并发 PUT 会写同一个文件。
-    tmp = cache_file(f"put-{os.getpid()}-{uuid.uuid4().hex[:12]}.part")
-    fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    h = hashlib.shake_128()          # 落盘的同时把 hash 算出来，省一次全量读
-    size = 0
-    try:
-        with os.fdopen(fd, "wb") as f:
-            async for chunk in request.content.iter_chunked(1 << 20):
-                h.update(chunk)
-                size += len(chunk)
-                f.write(chunk)
-        digest = h.hexdigest(16)
-        # 客户端若带了 X-OC-Mtime（ownCloud/Nextcloud 约定）就用它，否则交给 store 取文件 mtime
-        raw = request.headers.get("X-OC-Mtime") or request.headers.get("X-Update-Mtime")
-        try:
-            mtime = int(float(raw)) if raw and raw != "false" else None
-        except ValueError:
-            mtime = None
-        if mtime is not None and mtime <= 0:
-            mtime = None
-        existed = e is not None
-        if size == 0:
-            # 空文件没有字节要传，直接登记
-            await store.put_file(path, tmp, mtime)
-            return web.Response(status=204 if existed else 201)
-        if not staging_ok(size):
+    # 预留只需要覆盖「字节还在临时文件里」这段：一旦 os.replace 进 staging，
+    # 它就已经计入 _cache_usage 了，再留着预留会让后面的 cache_adopt 误判超限。
+    with ExitStack() as budget:
+        ok = budget.enter_context(staging_hold(cl or 0))
+        if not ok:
             return web.Response(status=507, text="insufficient storage, raise CACHE_MAX_GB")
-        src = staging_path(digest)
-        os.replace(tmp, src)             # 原子改名：staging 里要么没有、要么是完整的一份
-        ent = await store.register(path, src, digest, size, mtime)
-        if ent is not None and ent.status == 0:
-            staging_drop(digest)         # 秒传命中，字节根本不用传
-        else:
-            up.nudge()                   # 剩下的交给后台，请求立刻返回
-        return web.Response(status=204 if existed else 201)
-    finally:
+        # 落到磁盘，而不是 /tmp（tmpfs，等于内存）。
+        # 名字必须带唯一后缀：只按路径生成的话，同路径两个并发 PUT 会写同一个文件。
+        tmp = cache_file(f"put-{os.getpid()}-{uuid.uuid4().hex[:12]}.part")
+        fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        h = hashlib.shake_128()      # 落盘的同时把 hash 算出来，省一次全量读
+        size = 0
+        checked = 0
         try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+            with os.fdopen(fd, "wb") as f:
+                async for chunk in request.content.iter_chunked(1 << 20):
+                    h.update(chunk)
+                    size += len(chunk)
+                    await asyncio.to_thread(f.write, chunk)
+                    # 没有 Content-Length 时按 64MB 粒度回头看一眼预算，
+                    # 别让一次误操作先写满盘再报错
+                    if not cl and size - checked >= (64 << 20):
+                        checked = size
+                        if not staging_ok(size):
+                            return web.Response(status=507,
+                                                text="insufficient storage, raise CACHE_MAX_GB")
+            digest = h.hexdigest(16)
+            # 客户端若带了 X-OC-Mtime（ownCloud/Nextcloud 约定）就用它，否则交给 store 取文件 mtime
+            raw = request.headers.get("X-OC-Mtime") or request.headers.get("X-Update-Mtime")
+            try:
+                mtime = int(float(raw)) if raw and raw != "false" else None
+            except (ValueError, OverflowError):
+                mtime = None
+            # 只收 1970..2038 之间的秒数：inf/nan/超大整数会一路炸到 SQLite
+            # 和 http_date()，留一个脏值进索引后面每个 PROPFIND 都会 500
+            if mtime is not None and not (0 < mtime <= 2 ** 31 - 1):
+                mtime = None
+            existed = e is not None
+            if size == 0:
+                # 空文件没有字节要传，直接登记
+                await store.put_file(path, tmp, mtime)
+                return web.Response(status=204 if existed else 201)
+            # 实际字节比声明的多：把差额也过一遍预算（预留只覆盖了 cl）
+            if cl and size > cl and not staging_ok(size - cl):
+                return web.Response(status=507, text="insufficient storage, raise CACHE_MAX_GB")
+            src = staging_path(digest)
+            os.replace(tmp, src)             # 原子改名：staging 里要么没有、要么是完整的一份
+            budget.pop_all().close()         # 字节已落盘，预留还回去
+            ent = await store.register(path, src, digest, size, mtime)
+            if ent is not None and ent.status == 0:
+                store.staging_finish(path, digest)  # 秒传命中，字节根本不用传
+            else:
+                up.nudge()                   # 剩下的交给后台，请求立刻返回
+            return web.Response(status=204 if existed else 201)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 async def dav_delete(request, store):
@@ -401,14 +533,7 @@ async def dav_delete(request, store):
         return web.Response(status=403, text="cannot delete root")
     if store.get(path) is None:
         return web.Response(status=404)
-    doomed = [x.hash for x in (store.get(q) for q in store.backend.paths_under(path))
-              if x and not x.is_dir and x.status == 1 and x.hash]
-    await store.delete(path)
-    # 队列不存 path，靠索引现扫；这里只要把没人认领的 staging 收掉
-    alive = {d for _p, d, *_ in store.backend.pending()}
-    for d in set(doomed):
-        if d not in alive:
-            staging_drop(d)
+    await store.delete(path)          # 索引一次摘掉，staging 由 store 内部收
     return web.Response(status=204)
 
 
@@ -422,11 +547,19 @@ async def dav_mkcol(request, store):
     return web.Response(status=201)
 
 
+def bad_path(p: str) -> bool:
+    """控制字符（含 NUL）不能进索引：SQLite 收得下，但查询、日志、HTTP 头全会被它搞坏。"""
+    return any(ord(c) < 0x20 or ord(c) == 0x7f for c in (p or ""))
+
+
 def _dest_path(request) -> str:
     d = request.headers.get("Destination", "")
     if not d:
         return ""
-    return norm(unquote(urlsplit(d).path))
+    p = unquote(urlsplit(d).path)
+    if bad_path(p):
+        return ""
+    return norm(p)
 
 
 async def dav_move(request, store):
@@ -438,18 +571,28 @@ async def dav_move(request, store):
         return web.Response(status=400, text="no destination")
     if dst == src:
         return web.Response(status=204)          # 移到自己：什么都不用做
-    # 目标是自己祖先（含根）时，下面会先 delete(dst)——那会把源子树一起删掉。
+    se = store.visible(src)
+    if se is None:
+        return web.Response(status=404)
+    # 目标是自己的祖先（含根）时，下面会先 delete(dst)——那会把源子树一起删掉。
     # 必须在删除之前拦下来。
     if dst == "/" or src.startswith(dst.rstrip("/") + "/"):
         return web.Response(status=409, text="destination is an ancestor of source")
-    if store.get(src) is None:
-        return web.Response(status=404)
-    ow = request.headers.get("Overwrite", "T").strip().upper()
-    exists = store.get(dst) is not None
-    if exists and ow == "F":
-        return web.Response(status=412, text="destination exists")
-    if exists:
-        await store.delete(dst)
+    if dst.startswith(src.rstrip("/") + "/"):
+        return web.Response(status=409, text="cannot move into itself")
+    de = store.get(dst)
+    if de is not None and store.visible(dst) is None:
+        # 目标是个本机看不见的「上传中」：别的设备正占着这个路径
+        return web.Response(status=409, text="destination is being uploaded")
+    if de is not None:
+        if de.is_dir:
+            # RFC 4918：集合不能被资源覆盖。以前是先递归删目标再移，等于
+            # 一个请求头就把整个目录抹了，还回 204。
+            return web.Response(status=409, text="destination is a collection")
+        if se.is_dir != de.is_dir:
+            return web.Response(status=409, text="resource type mismatch")
+        if request.headers.get("Overwrite", "T").strip().upper() == "F":
+            return web.Response(status=412, text="destination exists")
         await store.move(src, dst)
         return web.Response(status=204)
     await store.move(src, dst)
@@ -465,16 +608,23 @@ async def dav_copy(request, store):
         return web.Response(status=400)
     if dst == src:
         return web.Response(status=403, text="copy onto itself")
+    se = store.visible(src)
+    if se is None:
+        return web.Response(status=404)
     if dst == "/" or src.startswith(dst.rstrip("/") + "/"):
         return web.Response(status=409, text="destination is an ancestor of source")
-    if store.get(src) is None:
-        return web.Response(status=404)
-    ow = request.headers.get("Overwrite", "T").strip().upper()
-    exists = store.get(dst) is not None
-    if exists and ow == "F":
-        return web.Response(status=412, text="destination exists")
-    if exists:
-        await store.delete(dst)
+    if dst.startswith(src.rstrip("/") + "/"):
+        return web.Response(status=409, text="cannot copy into itself")
+    de = store.get(dst)
+    if de is not None and store.visible(dst) is None:
+        return web.Response(status=409, text="destination is being uploaded")
+    if de is not None:
+        if de.is_dir:
+            return web.Response(status=409, text="destination is a collection")
+        if se.is_dir != de.is_dir:
+            return web.Response(status=409, text="resource type mismatch")
+        if request.headers.get("Overwrite", "T").strip().upper() == "F":
+            return web.Response(status=412, text="destination exists")
         await store.copy(src, dst)
         return web.Response(status=204)
     await store.copy(src, dst)
@@ -482,6 +632,8 @@ async def dav_copy(request, store):
 
 
 async def dav_proppatch(request, store):
+    if READONLY:
+        return web.Response(status=403, text="readonly")
     return web.Response(status=207, body=b'<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"/>',
                         content_type="application/xml")
 
@@ -498,7 +650,9 @@ class Filler:
         self.store = store
         self.q = asyncio.Queue()
         self.seen = set()
+        self.fails = {}
         self.tasks = []
+        self.retries = set()
 
     def start(self):
         self.tasks.append(asyncio.create_task(self._loop(), name="tgnd-fill"))
@@ -516,8 +670,27 @@ class Filler:
                 await self._one(path)
             except Exception as ex:
                 log.warning("补洞失败 %s: %s: %s", path, type(ex).__name__, ex)
+                n = self.fails.get(path, 0) + 1
+                if n <= 3:
+                    self.fails[path] = n
+                    t = asyncio.create_task(self._retry(path, n))
+                    self.retries.add(t)
+                    t.add_done_callback(self.retries.discard)
+                else:
+                    self.fails.pop(path, None)
+                    log.error("补洞连续失败 %d 次，放弃 %s", n, path)
+            else:
+                self.fails.pop(path, None)
             finally:
                 self.seen.discard(path)
+
+    async def _retry(self, path: str, n: int):
+        """退避一会儿再排一次：网络抖一下就放弃的话，缓存永远补不齐。"""
+        try:
+            await asyncio.sleep(30 * n)
+            self.want(path)
+        except asyncio.CancelledError:
+            raise
 
     async def _one(self, path: str):
         e = self.store.get(path)
@@ -541,7 +714,7 @@ class Filler:
                 n = min(FILL_CHUNK, e.size - hole)
                 pos = 0
                 async for chunk in self.store.iter_content(path, offset=hole, length=n):
-                    os.pwrite(fd, chunk, hole + pos)
+                    await asyncio.to_thread(os.pwrite, fd, chunk, hole + pos)
                     pos += len(chunk)
                     sent += len(chunk)
                 if pos == 0:
@@ -554,7 +727,7 @@ class Filler:
                     spent = time.monotonic() - t0
         finally:
             os.close(fd)
-        if partial_commit(key, e.hash, e.size):
+        if await asyncio.to_thread(partial_commit, key, e.hash, e.size):
             log.info("缓存补齐 %s (%.1f MB，补了 %.1f MB)",
                      path, e.size / 1048576, sent / 1048576)
 
@@ -578,18 +751,27 @@ class Uploader:
         self.fails = {}
         self.ok = 0
 
-    def _gc_staging(self):
-        """清掉没人认领的 staging：比如落盘之后、登记之前被 kill 的那一份。"""
+    def _gc_staging(self, age: float = 0):
+        """清掉没人认领的 staging：比如落盘之后、登记之前被 kill 的那一份。
+
+        age>0 时只清「够老」的。运行期扫必须带 age：PUT 把文件 os.replace
+        进 staging 之后、register() 之前有一个短窗口，此刻索引里还查不到它，
+        抢在这个窗口里删掉就等于把刚传完的字节扔了。
+        """
         pend = {d for _p, d, *_ in self.store.backend.pending()}
         try:
             names = os.listdir(staging_dir())
         except OSError:
             return
+        now = time.time()
         for n in names:
             if n.startswith(".") or n in pend:
                 continue
+            p = os.path.join(staging_dir(), n)
             try:
-                os.unlink(os.path.join(staging_dir(), n))
+                if age and now - os.path.getmtime(p) < age:
+                    continue
+                os.unlink(p)
                 log.info("清掉无主的 staging: %s", n[:12])
             except OSError:
                 pass
@@ -612,6 +794,10 @@ class Uploader:
         while True:
             await asyncio.sleep(30)
             self.wake.set()
+            try:
+                self._gc_staging(age=600)     # 运行期也收孤儿，10 分钟内的一律当在写
+            except Exception as ex:
+                log.warning("staging 巡检失败: %s", ex)
 
     def _pick(self):
         now = time.monotonic()
@@ -643,32 +829,25 @@ class Uploader:
                     self.fails.pop(digest, None)
                     self.retry_at.pop(digest, None)
                 except Exception as ex:
-                    n = self.fails.get(digest, 0) + 1
+                    n = min(self.fails.get(digest, 0) + 1, 20)
                     self.fails[digest] = n
-                    delay = min(300, 2 ** n)
+                    delay = min(300, 2 ** min(n, 12))
                     self.retry_at[digest] = time.monotonic() + delay
-                    log.warning("后台上传 %s 第 %d 次失败（%ds 后重试）: %s: %s",
-                                path, n, delay, type(ex).__name__, ex)
-                    if n >= 6:
-                        self.dead.add(digest)
-                        log.error("放弃自动重试 %s：本地副本留在 %s，索引里仍是「上传中」",
-                                  path, staging_path(digest))
+                    if n <= 6:
+                        log.warning("后台上传 %s 第 %d 次失败（%ds 后重试）: %s: %s",
+                                    path, n, delay, type(ex).__name__, ex)
+                    else:
+                        # 不放弃：网络恢复了就该自己继续，别逼人重启进程
+                        log.error("后台上传 %s 连续失败 %d 次，每 %ds 重试一次；"
+                                  "本地副本留在 %s", path, n, delay, staging_path(digest))
                 finally:
                     self.busy.discard(path)
-
-    def _needed(self, digest: str) -> bool:
-        """还有没有别的记录在等这份 staging。"""
-        for _path, d, *_ in self.store.backend.pending():
-            if d == digest:
-                return True
-        return False
 
     async def _settle(self, path: str, digest: str):
         e = self.store.get(path)
         if not e or e.is_dir or e.status != 1 or e.hash != digest:
             # 传之前就被删掉/被覆盖了，这份字节已经没人要
-            if not self._needed(digest):
-                staging_drop(digest)
+            self.store.staging_release(digest)
             return
         # 同一份内容已经被别的路径传完了（并发上传同内容），直接秒传落地
         for opath, osize, oparts in self.store.backend.find_by_hash(digest):
@@ -677,20 +856,20 @@ class Uploader:
                                             dict(oparts), 0, 0)
                 self.store.dirty = True
                 log.info("后台秒传落地: %s（复用 %s）", path, opath)
-                if not self._needed(digest):
-                    staging_drop(digest)
+                self.store.staging_finish(path, digest)
                 return
         src = staging_path(digest)
         await self.store.upload_pending(path, src)
         self.ok += 1
         log.info("后台上传完成: %s", path)
-        if not self._needed(digest):
-            staging_drop(digest)
+        self.store.staging_finish(path, digest)   # 字节就在手边：留成本地缓存，或收掉
 
 
 async def handle(request, store, up, fill=None):
     if not is_authorized(request):
         return unauthorized()
+    if bad_path(request.path):
+        return web.Response(status=400, text="bad path")
     m = request.method.upper()
     try:
         if m == "OPTIONS":
@@ -722,8 +901,10 @@ async def handle(request, store, up, fill=None):
         # 父路径已经是文件，或同名资源类型冲突：RFC 4918 要 409
         return web.Response(status=409, text=str(ex) or "conflict")
     except Exception as ex:
+        # 内部异常只进日志：把 str(ex) 回给客户端等于把路径、SQLite 错误、
+        # 甚至文件系统结构泄给任何人
         log.exception("处理 %s %s 失败: %s", m, request.path, ex)
-        return web.Response(status=500, text=str(ex))
+        return web.Response(status=500, text="internal error")
     finally:
         # 写操作后把索引推上去，缩短两个节点互相覆盖的窗口。
         # 有租约任务在跑时交给它（空闲 3 秒统一落库），避免每个请求都 edit 两次；
@@ -741,7 +922,8 @@ async def handle(request, store, up, fill=None):
                     pass
                 except Exception as ex:
                     log.warning("写后快照失败: %s", ex)
-    return web.Response(status=405, text="method not allowed")
+    return web.Response(status=405, text="method not allowed",
+                        headers={"Allow": ALLOW})
 
 
 async def ensure_chat(client, cfg_path="/opt/tgnd/chat.json", title="tgnd") -> int:
@@ -804,9 +986,13 @@ async def main():
     app.router.add_route("*", "/{tail:.*}", lambda r: handle(r, store, up, fill))
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    bind = os.environ.get("DAV_BIND", "0.0.0.0")
+    if not DAV_PASS:
+        log.warning("DAV_PASS 未设置：WebDAV 不需要认证，任何能连到 %s:%d 的人都能读写删。"
+                    "绑公网前务必设置 DAV_PASS，或把 DAV_BIND 改成 127.0.0.1", bind, PORT)
+    site = web.TCPSite(runner, bind, PORT)
     await site.start()
-    log.info("WebDAV 已启动: http://0.0.0.0:%d/", PORT)
+    log.info("WebDAV 已启动: http://%s:%d/", bind, PORT)
     while True:
         await asyncio.sleep(30)
         try:

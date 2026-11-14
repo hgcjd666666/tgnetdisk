@@ -4,6 +4,7 @@
 !cli.py
 !logger.py
 !tests.py
+!tests_*.py
 !hashdir.py
 !.gitignore
 !README.md

@@ -22,7 +22,7 @@ import random
 import shutil
 import sqlite3
 import tempfile
-import traceback
+import weakref
 from urllib.parse import quote
 import time
 
@@ -65,6 +65,15 @@ PART_TTL = 6 * 3600            # 部分缓存多久没动就扔掉（秒）
 _cache_swept_at = 0.0
 
 
+def adopt_on() -> bool:
+    """上传完成后要不要把字节直接留作读缓存（默认开）。
+
+    测试里默认关掉：很多用例的前提是「本地还没缓存、需要从 TG 读」。
+    """
+    return os.environ.get("TGND_CACHE_ADOPT", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
 def cache_limit() -> int:
     """上限字节数，<=0 表示关闭。每次读环境变量——env 是运行期才加载的。"""
     try:
@@ -81,16 +90,24 @@ def blob_dir() -> str:
 
 
 def cache_key(e) -> str:
-    """这条记录的内容身份：<hash>-<大小>；拿不到（缓存关闭 / 上传中 / 空文件）返回空串。
+    """这条记录的内容身份：<hash>-<大小>-<分片消息指纹>；缓存关闭/上传中返回空串。
 
-    直接用 hash 当名字，肉眼能看出是哪份内容。大小必须带上：`put --offset` 追加
-    重传时 hash 会保留首块不变、大小变了，只靠 hash 会把两份内容混成一个缓存。
+    大小必须带上：`put --offset` 追加重传时 hash 保留首块、大小会变。分片消息
+    id 也要算进去：`put --offset` 原地覆盖同一长度的块时，hash 和大小都可能不变，
+    只有分片消息换了——不带指纹就会命中旧内容的缓存，交付出去的是错的字节。
     """
     if cache_limit() <= 0 or not e or e.is_dir or e.status == 1:
         return ""
-    if not part_ids(e.parts) or not e.hash:
+    return cache_key_of(e.hash, e.size or 0, e.parts)
+
+
+def cache_key_of(h, size, parts) -> str:
+    """缓存键的底层构造，删除/回收时没有 Entry 也能算。"""
+    ids = part_ids(parts)
+    if not h or not size or not ids:
         return ""
-    return "%s-%d" % (e.hash, e.size or 0)
+    stamp = hashlib.md5(",".join(str(i) for i in ids).encode()).hexdigest()[:12]
+    return "%s-%d-%s" % (h, size, stamp)
 
 
 # 部分缓存：Range 请求边发边填的稀疏文件，收齐校验通过才转正去掉后缀
@@ -111,13 +128,14 @@ def partial_open(key: str, size: int):
     if not p or size <= 0:
         return None
     try:
-        fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(p, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
         cur = os.fstat(fd).st_size
         if cur == size:
             return fd
         # 长度对不上说明这条记录的内容换过了，旧的部分文件整个作废
         os.close(fd)
-        fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        fd = os.open(p, os.O_RDWR | os.O_CREAT | os.O_TRUNC
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
         os.ftruncate(fd, size)
         return fd
     except OSError as ex:
@@ -248,6 +266,16 @@ def staging_drop(digest: str):
         pass
 
 
+def _has_staging(digest: str) -> bool:
+    """本机有没有这份待上传的字节。没有就说明上传是别的设备发起的（或已经丢了）。"""
+    if not digest:
+        return False
+    try:
+        return os.path.exists(staging_path(digest))
+    except OSError:
+        return False
+
+
 def _scan_dir(d: str, collect: bool):
     items, total = [], 0
     try:
@@ -256,15 +284,17 @@ def _scan_dir(d: str, collect: bool):
         return 0, items
     with it:
         for de in it:
-            if de.name.startswith("."):
-                continue
             try:
                 if not de.is_file(follow_symlinks=False):
                     continue
                 st = de.stat(follow_symlinks=False)
             except OSError:
                 continue
+            # 点开头的文件（.dl- 下载暂存）也要计入占用：几个大文件同时从 TG
+            # 下回来时，它们加起来同样是实打实的磁盘占用，不算的话预算形同虚设。
             total += st.st_size
+            if de.name.startswith("."):
+                continue
             # 正在填的部分文件也算占用，但不能被淘汰——删了等于把进度扔了
             if collect and not de.name.endswith(PART_SUFFIX):
                 items.append((st.st_mtime, st.st_size, de.path))
@@ -311,21 +341,49 @@ def staging_ok(size: int) -> bool:
 
     有总预算（CACHE_MAX_GB>0）时，读缓存给 staging 让路：先淘汰，淘汰完还是装不下
     就拒绝这次上传；预算关掉时只盯磁盘，留 2G 别把机器写死。
+
+    已经把「正在传、还没落盘」的那几份算进去了（见 staging_hold），否则两个
+    PUT 同时进来会各自看到一份空预算，双双放行、加起来超限。
     """
     limit = cache_limit()
     if limit > 0:
         total, _ = _cache_usage()
-        if total + size > limit:
-            cache_trim(need=size)
+        need = size + _reserved
+        if total + need > limit:
+            cache_trim(need=need)
             total, _ = _cache_usage()
-        return total + size <= limit
+        return total + need <= limit
     try:
         st = os.statvfs(CACHE_DIR)
     except OSError:
         return True
     avail = st.f_bavail * st.f_frsize
-    # 留一点余量别把盘写死；小盘（比如 tmpfs）上按 20% 算，别一律卡 2G
-    return avail >= size + min(2 << 30, int(avail * 0.2))
+    # 已经放行、还在写的那些也要占盘，别让并发上传把盘写死
+    return avail >= size + _reserved + min(2 << 30, int(avail * 0.2))
+
+
+_reserved = 0            # 已经放行、正在往磁盘里写的字节数（单进程内记账）
+
+
+@contextmanager
+def staging_hold(size: int):
+    """为一次上传预留 size 字节的预算，yield 是否放行。
+
+    从「预检查」到「字节真的落进 staging」之间会有一段窗口，不预留的话并发
+    PUT 会一起通过检查然后把限额撑爆。
+    """
+    global _reserved
+    if size <= 0:
+        yield True
+        return
+    if not staging_ok(size):
+        yield False
+        return
+    _reserved += size
+    try:
+        yield True
+    finally:
+        _reserved -= size
 
 
 def cache_sweep(gap: float = CACHE_SWEEP_GAP) -> int:
@@ -376,9 +434,11 @@ def cache_commit(tmp: str, key: str, size: int) -> str:
             pass
         return ""
     dst = os.path.join(blob_dir(), key)
-    cache_trim(need=size, keep=dst)
+    # tmp 自己就算在 _cache_usage 里（.dl- 也计入占用），rename 不会让 total 变大，
+    # 所以只需要把总量削回限额内，不能再按「再放 size」去预留一遍。
+    cache_trim(0, keep=dst)
     total, _ = _cache_usage()
-    if total + size > limit:      # staging 把预算吃满了，读缓存先让路
+    if total > limit:             # staging 把预算吃满了，读缓存先让路
         try:
             os.unlink(tmp)
         except OSError:
@@ -402,7 +462,6 @@ def cache_commit(tmp: str, key: str, size: int) -> str:
 DB_PATH = os.environ.get("TGND_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "tgnd.db"))
 BACKEND = os.environ.get("TGND_BACKEND", "sqlite")
 DB_NAME = "tgnd.db.xz"
-LOCK_NAME = "tgnd.lock"
 LOCK_IDLE = "lock:null"
 LOCK_PREFIX = "lock:"
 # 单机模式：ONLINE=0 时不抢锁、不写 caption，快照也尽量少发。
@@ -410,7 +469,6 @@ LOCK_PREFIX = "lock:"
 def is_online() -> bool:
     """每次调用都读环境变量——env 文件是运行期才加载的，不能做成模块常量。"""
     return os.environ.get("ONLINE", "1").strip().lower() not in ("0", "false", "no", "off")
-LOCK_TTL = 120                     # 锁超过这么久没释放就视为残留
 
 
 # ---------- 基础工具 ----------
@@ -515,25 +573,6 @@ def is_db_msg(msg) -> bool:
 
 class LockBusy(Exception):
     """索引写锁被别的节点占着，且调用方要求「不等待」时抛出。"""
-
-
-def is_lock_msg(msg) -> bool:
-    doc = getattr(msg, "document", None)
-    if doc is None:
-        return False
-    for a in doc.attributes:
-        if getattr(a, "file_name", None) == LOCK_NAME:
-            return True
-    return False
-
-
-def parse_lock(msg):
-    """返回 (token, ts)。"""
-    try:
-        d = json.loads((msg.message or "").strip() or "{}")
-        return d.get("lock", ""), float(d.get("ts", 0))
-    except Exception:
-        return "", 0.0
 
 
 def doc_file_name(msg):
@@ -711,6 +750,24 @@ class Backend(abc.ABC):
 
     @abc.abstractmethod
     def remove(self, path: str): ...
+
+    @abc.abstractmethod
+    def take_under(self, prefix: str) -> list:
+        """一次性摘掉 prefix 及其整棵子树，返回被摘的 [(path, hash, parts), ...]。
+
+        删目录时用：要么在一次事务里全删掉，要么一条都不删。逐条 remove 的话
+        大目录要开几百次连接，而且中途失败会留下半棵子树。
+        """
+        ...
+
+    @abc.abstractmethod
+    def referenced_ids(self, hashes: list) -> dict:
+        """{hash: {msg_id, ...}}：这些 hash 在索引里还有哪些分片消息被引用。
+
+        批量版的 find_by_hash：删目录后一次算清哪些消息成了孤儿，
+        不用每个文件查一遍。
+        """
+        ...
 
     @abc.abstractmethod
     def find_by_hash(self, hash: str) -> list: ...
@@ -945,6 +1002,37 @@ class SqliteBackend(Backend):
             db.execute("delete from dirs where path=?", (p,))
 
     @_resilient
+    def take_under(self, prefix):
+        """一个事务里摘掉整棵子树，返回被摘掉的文件行。"""
+        p = norm(prefix)
+        pre = p.rstrip("/") + "/"
+        hi = pre[:-1] + "0"
+        with self._conn() as db:
+            rows = db.execute(
+                "select path,hash,parts,status,size from files where path=? or (path>=? and path<?)",
+                (p, pre, hi)).fetchall()
+            db.execute("delete from files where path=? or (path>=? and path<?)",
+                       (p, pre, hi))
+            db.execute("delete from dirs where path=? or (path>=? and path<?)",
+                       (p, pre, hi))
+        return [(r[0], r[1], load_parts(r[2]), r[3], r[4]) for r in rows]
+
+    @_resilient
+    def referenced_ids(self, hashes):
+        want = [h for h in dict.fromkeys(hashes) if h]
+        out = {}
+        if not want:
+            return out
+        with self._conn() as db:
+            for i in range(0, len(want), 400):      # 别撞 SQLite 的变量个数上限
+                part = want[i:i + 400]
+                q = ",".join("?" * len(part))
+                for h, ps in db.execute(
+                        f"select hash,parts from files where hash in ({q})", part):
+                    out.setdefault(h, set()).update(part_ids(load_parts(ps)))
+        return out
+
+    @_resilient
     def find_by_hash(self, hash):
         with self._conn() as db:
             return [(r[0], r[1], load_parts(r[2])) for r in db.execute(
@@ -993,7 +1081,9 @@ class SqliteBackend(Backend):
 
         替换后不必管别的进程：它们每个方法自己开连接，下次操作就会打开新文件。
         """
-        tmp = self.path + ".restore"
+        d = os.path.dirname(self.path) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".restore-", dir=d)
+        os.close(fd)
         try:
             with lzma.open(src, "rb") as f, open(tmp, "wb") as out:
                 shutil.copyfileobj(f, out)
@@ -1094,16 +1184,77 @@ class Store:
         self._last_op = 0.0
         self._gen = 0                 # dirty 代数：快照推送期间又写了东西就不能把 dirty 清掉
         self._replaced = {}           # register 覆盖掉的旧条目，等 upload_pending 成功后清理
+        self._graveyard = []          # 索引里已经删掉、等着删 TG 消息的分片 id
+        self._flush_task = None
+        # 同一份内容同时只让一个协程回 TG 下载。用弱引用：没人持有时锁自动回收，
+        # 不用自己维护「哪些 key 还在用」。
+        self._dl_locks = weakref.WeakValueDictionary()
 
-    @property
-    def entries(self):
-        return self.backend.all_entries()
+    def _dl_lock(self, key: str):
+        if not key:
+            return None
+        lock = self._dl_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._dl_locks[key] = lock
+        return lock
+
+    async def _open_cached(self, cp: str, e, path: str):
+        """打开缓存条目；长度不对就丢掉重下。返回文件对象或 None。"""
+        try:
+            f = await asyncio.to_thread(open, cp, "rb")
+        except OSError:
+            return None
+        try:
+            fsize = await asyncio.to_thread(os.path.getsize, cp)
+        except OSError:
+            fsize = -1
+        if e.size and fsize != e.size:
+            log.warning("缓存条目长度不符，弃用重下: %s 本地 %d 字节 / 记录 %s",
+                        path, fsize, e.size)
+            f.close()
+            try:
+                os.unlink(cp)
+            except OSError:
+                pass
+            return None
+        await asyncio.to_thread(os.utime, cp, None)     # 刷新 LRU 位置
+        return f
+
+    async def _drain_file(self, f):
+        try:
+            while True:
+                b = await asyncio.to_thread(f.read, CACHE_CHUNK)
+                if not b:
+                    break
+                yield b
+        finally:
+            f.close()
 
     def get(self, path):
         return self.backend.get(path)
 
     def children(self, path):
-        return self.backend.children(path)
+        """列直接子项。上传中、且本机没有那份缓冲的，对这台设备来说等于不存在。
+
+        A 机（收到 PUT 的那台）本地有 staging，能看见也能读；B 机拉快照后只看到
+        一条 status=1 的记录，字节不在这里，列出来也没用——按「文件不存在」处理。
+        """
+        out = []
+        for c in self.backend.children(path):
+            if c.status == 1 and not _has_staging(c.hash):
+                continue
+            out.append(c)
+        return out
+
+    def visible(self, path):
+        """单条记录对这台设备是否可见：上传中且没有本地缓冲 → 不存在。"""
+        e = self.backend.get(path)
+        if e is None:
+            return None
+        if e.status == 1 and not _has_staging(e.hash):
+            return None
+        return e
 
     # ---------- 写入 ----------
     async def _ensure_parents(self, p: str):
@@ -1159,24 +1310,95 @@ class Store:
                 msg = await self.client.send_file(self.chat, src, force_document=True,
                                                   attributes=attrs)
             else:
-                msg = await self.client.send_file(self.chat, ref, force_document=True,
-                                                  attributes=attrs)
+                # 字节已经躺在 DC 上了，失败的是建消息这一步。ref 还能用，就拿它
+                # 重试，别再把整个 slice 重传一遍（一个 slice 最多 2000MB）。
+                msg = None
+                for attempt in range(3):
+                    try:
+                        msg = await self.client.send_file(
+                            self.chat, ref, force_document=True, attributes=attrs)
+                        break
+                    except Exception as ex:
+                        if attempt == 2:
+                            raise
+                        delay = 2 ** attempt
+                        log.warning("建消息失败（第 %d 次，%ds 后用已上传的字节重试）: %s: %s",
+                                    attempt + 1, delay, type(ex).__name__, ex)
+                        await asyncio.sleep(delay)
             parts[idx_no] = msg.id
             self.last_id = max(self.last_id, msg.id)
             return msg
 
         if size <= S:
-            await send(local_path, base_idx)
+            if base_idx not in parts:          # 已经有人传过这一片就直接复用
+                await send(local_path, base_idx)
             return 1
         n = 0
         pos = 0
         with open(local_path, "rb") as f:
             while pos < size:
                 length = min(S, size - pos)
-                await send(SliceReader(f, pos, length), base_idx + n)
+                idx = base_idx + n
+                if idx not in parts:           # 同上：缺口才传
+                    await send(SliceReader(f, pos, length), idx)
                 pos += length
                 n += 1
         return n
+
+    async def _reusable_slices(self, digest: str, S: int, size: int) -> dict:
+        """同一个 hash 在 TG 上已经有的分片，按 slice 序号捡回来复用。
+
+        lost+found 里捡回来的残片也能用：只要消息里的字节数跟这次该片应有的
+        大小一致，就说明切片边界没变（换了 --slice 大小就对不上，自动放弃）。
+        """
+        if not digest or size <= 0:
+            return {}
+        cand = {}
+        for _p, _sz, parts in self.backend.find_by_hash(digest):
+            for idx, v in (parts or {}).items():
+                try:
+                    i = int(idx)
+                except (TypeError, ValueError):
+                    continue
+                mid = part_id(v)
+                if mid:
+                    cand.setdefault(i, []).append(mid)
+        if not cand:
+            return {}
+        # 只关心落在这次文件范围内的片；按大小校验，别把别的 slice 划分混进来
+        want = {i: mids for i, mids in cand.items() if 0 <= i * S < size}
+        if not want:
+            return {}
+        ids = list({mid for mids in want.values() for mid in mids})
+        got = {}
+        for k in range(0, len(ids), 100):
+            batch = ids[k:k + 100]
+            msgs = None
+            for attempt in range(2):
+                try:
+                    msgs = await self.client.get_messages(self.chat, ids=batch)
+                    break
+                except Exception as ex:
+                    if attempt:
+                        log.warning("查询可复用分片失败，这次不复用直接传: %s", ex)
+                        return {}
+                    await asyncio.sleep(1)
+            for m in (msgs or []):
+                got[m.id] = m
+        out = {}
+        for i, mids in want.items():
+            exp = min(S, size - i * S)
+            for mid in mids:
+                m = got.get(mid)
+                if not m or not getattr(m, "document", None):
+                    continue
+                if (getattr(m.document, "size", 0) or 0) == exp:
+                    out[i] = mid               # 同一序号有多条消息时，挑大小对的那条
+                    break
+        if out:
+            log.info("复用已有分片 %d/%d 片 (hash %s)", len(out),
+                     max(1, (size + S - 1) // S), digest[:8])
+        return out
 
     async def put_file(self, path: str, local_path: str, mtime: int | None = None,
                        slice_size: int | None = None, append: bool = False,
@@ -1189,12 +1411,24 @@ class Store:
         digest = None if append else digest_of(local_path)
         mt = int(mtime) if mtime else int(os.path.getmtime(local_path))
         await self.ensure_fresh()
+        # TG 上已经有的同 hash 分片（含 lost+found 里捡回来的）先捡起来，
+        # 这一步要查消息，放在锁外。整份完好的记录不用查——下面的秒传会直接命中。
+        have = {}
+        if not append and digest:
+            known = self.backend.find_by_hash(digest)
+            if not any(self._dedup_source_ok(opath, osz, oparts)
+                       for opath, osz, oparts in known):
+                have = await self._reusable_slices(digest, S, size)
 
         # 阶段一：只在索引里登记「上传中」，锁在这几百毫秒内就释放。
         # 注意：这里不删旧内容。新字节还没传上去，先删旧记录/旧消息的话，
         # 阶段二一断网旧文件就永久没了（索引只剩 status=1 的幽灵记录）。
         async with self.lock:
             old = self.backend.get(p)
+            if old and old.is_dir:
+                # 文件不能顶掉同名目录：顶了以后 dirs 表里还留着子树，
+                # 但 get() 永远先返回文件，整棵子树在客户端就"消失"了
+                raise FileExistsError(f"同名目录已存在: {p}")
             if old and not old.is_dir and not append:
                 if skip_same and old.status == 0 and old.hash == digest and old.size == size:
                     old.skipped = True
@@ -1206,7 +1440,7 @@ class Store:
                 self.backend.set_file(p, digest or "", 0, mt, {}, 0, 0)
                 self.dirty = True
                 log.info("空文件只登记索引: %s", p)
-                await self._release_hash(old)
+                self._bury_hash(old)
                 return self.backend.get(p)
 
             if digest and not append:
@@ -1216,7 +1450,7 @@ class Store:
                     self.backend.set_file(p, digest, osize, mt, oparts, 0, 0)
                     self.dirty = True
                     log.info("秒传命中 %s (hash %s) ← %s", p, digest[:8], opath)
-                    await self._release_hash(old)
+                    self._bury_hash(old)
                     return self.backend.get(p)
 
             parts = {}
@@ -1224,8 +1458,11 @@ class Store:
                 parts = dict(old.parts)
                 if not digest:
                     digest = old.hash
+            elif have:
+                parts = dict(have)          # 复用已有分片，只补缺口
+            # 追加写才从「最后一片之后」开始；复用的分片不能拿来推 base_idx
             base_idx = start_index if start_index is not None else (
-                (max(parts) + 1) if parts else 0)
+                (max(parts) + 1) if (append and parts) else 0)
             tag = digest or hashlib.md5(f"{p}{time.time()}".encode()).hexdigest()[:32]
             nparts = max(1, (blob + S - 1) // S) if blob else 0
             self.backend.set_file(p, digest or tag, size, mt, parts, 1, nparts)
@@ -1255,12 +1492,14 @@ class Store:
                     if opath != p and self._dedup_source_ok(opath, osize, oparts):
                         self.backend.set_file(p, digest, osize, mt, dict(oparts), 0, 0)
                         self.dirty = True
-                        await self._release_hash(
+                        self._bury_hash(
                             Entry(p, False, mt, digest, size, dict(parts), 0, nparts))
                         return self.backend.get(p)
             self.backend.set_file(p, digest or tag, size, mt, parts, 0, nparts)
             self.dirty = True
-            await self._release_hash(old)
+            self._bury_hash(old)
+            if old is not None and old.status == 1 and old.hash and old.hash != digest:
+                self.staging_release(old.hash)
         return self.backend.get(p)
 
     async def register(self, path: str, local_path: str, digest: str | None = None,
@@ -1279,6 +1518,12 @@ class Store:
                 return old
             await self._ensure_parents(p)
             if old and not old.is_dir:
+                # 上一次覆盖还没落地就又被覆盖：更早的那份旧内容已经没人要了
+                prev = self._replaced.get(p)
+                if prev is not None and prev is not old:
+                    self._bury_hash(prev)
+                    if prev.status == 1 and prev.hash and prev.hash != digest:
+                        self.staging_release(prev.hash)
                 # 字节还没传，先把旧条目留着；upload_pending 成功后再清理旧消息
                 self._replaced[p] = old
             if digest:
@@ -1287,6 +1532,8 @@ class Store:
                         continue
                     self.backend.set_file(p, digest, osize, mt, dict(oparts), 0, 0)
                     self.dirty = True
+                    # 秒传：字节不用传，之前留着的旧记录也不用再等 upload_pending 了
+                    self._bury_hash(self._replaced.pop(p, None))
                     return self.backend.get(p)
             nparts = max(1, (size + SLICE - 1) // SLICE) if size else 0
             self.backend.set_file(p, digest, size, mt, {}, 1, nparts)
@@ -1306,8 +1553,10 @@ class Store:
         parts: dict[int, int] = {}
 
         if size:
+            parts.update(await self._reusable_slices(digest, S, size))
             await self._send_slices(local_path, tag, 0, size, parts, S)
         orphan = None
+        src = ""
         async with self.mutex:
             # 字节传完可能已经过了几分钟，这中间这条记录完全可能被删掉、被同名覆盖。
             # 不复核就提交，会把删掉的路径重新挂回索引，或者拿旧字节顶掉新内容。
@@ -1317,15 +1566,28 @@ class Store:
             elif digest and cur.hash and cur.hash != digest:
                 orphan = list(parts.values())
             else:
-                self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0, len(parts))
+                # 传字节这几分钟里，同内容的另一条记录可能已经先传完了。
+                # 复用它那组分片、把自己刚传的这组消息删掉，否则 TG 上存两份。
+                for opath, osize, oparts in self.backend.find_by_hash(digest):
+                    if opath != p and self._dedup_source_ok(opath, osize, oparts):
+                        src = opath
+                        self.backend.set_file(p, digest, osize, e.mtime,
+                                              dict(oparts), 0, 0)
+                        orphan = list(parts.values())
+                        log.info("上传期间同内容已被 %s 传完，复用其分片: %s", src, p)
+                        break
+                else:
+                    self.backend.set_file(p, digest or tag, size, e.mtime, parts, 0,
+                                          len(parts))
                 self.dirty = True
-        if orphan:
-            log.info("上传期间记录已失效，丢弃刚传的 %d 个分片: %s", len(orphan), p)
-            await self._del_ids(orphan)
-            return self.backend.get(p)
         old = self._replaced.pop(p, None)
+        if orphan:
+            log.info("丢弃刚传的 %d 个分片: %s", len(orphan), p)
+            await self._del_ids(orphan)
         if old is not None:
-            await self._release_hash(old)
+            self._bury_hash(old)
+            if old.status == 1 and old.hash and old.hash != digest:
+                self.staging_release(old.hash)     # 被覆盖顶掉的旧缓冲，没人要了
         return self.backend.get(p)
 
     @staticmethod
@@ -1341,51 +1603,171 @@ class Store:
             return False
         return True
 
-    async def _release_hash(self, e):
-        """删掉条目 e 的分片消息——只删「没有任何其他条目引用」的那些 id。
+    # ---------- 删除 / 回收 ----------
+    def _bury_ids(self, ids):
+        """把待删的分片消息先记账，真正删除交给后台协程。"""
+        ids = [i for i in ids if i]
+        if not ids:
+            return
+        self._graveyard.extend(ids)
+        if self._flush_task is None or self._flush_task.done():
+            try:
+                self._flush_task = asyncio.create_task(self.flush_dead())
+            except RuntimeError:
+                pass
 
-        引用计数按消息 id 而不是按 hash：同一 hash 可能有重传的多个批次，
-        粗粒度按 hash 会让旧批次残片永远删不掉（重传用的已经是新消息）。
-        """
+    async def flush_dead(self):
+        """去 TG 删消息。不持锁、分批：慢就慢慢来，别挡着索引写。"""
+        while self._graveyard:
+            batch, self._graveyard = self._graveyard[:200], self._graveyard[200:]
+            await self._del_ids(batch)
+
+    def _bury_hash(self, e):
+        """条目 e 已从索引里拿掉，把没人再引用的分片消息记进回收站。"""
         if not e or e.is_dir or not e.parts:
             return
         mine = part_ids(e.parts)
         if not mine:
             return
-        referenced = set()
-        for _, _, oparts in self.backend.find_by_hash(e.hash):
-            referenced.update(part_ids(oparts))
+        referenced = self.backend.referenced_ids([e.hash]).get(e.hash, set())
         doomed = [mid for mid in mine if mid not in referenced]
-        if not doomed:
-            return
-        await self._del_ids(doomed)
-        log.info("删除 %s 的 %d 个分片消息", e.path, len(doomed))
+        if doomed:
+            log.info("回收 %s 的 %d 个分片消息", e.path, len(doomed))
+            self._bury_ids(doomed)
+        k = cache_key(e)
+        if k:
+            self._drop_cache([k])          # 旧内容的本地缓存也别留着占地方
 
-    async def _drop(self, path: str, hard=True):
-        """删记录；hard 时若该 hash 没有别的路径引用，连 TG 消息一起删。"""
-        p = norm(path)
-        e = self.backend.get(p)
-        self.backend.remove(p)
-        self.dirty = True
-        if hard:
-            await self._release_hash(e)
+    def _ghost_ids(self, rows):
+        """rows=[(path, hash, parts)] 已从索引摘掉；返回其中彻底没人引用的消息 id。"""
+        by_hash = {}
+        for row in rows:
+            h, parts = row[1], row[2]
+            if h and parts:
+                by_hash.setdefault(h, []).extend(part_ids(parts))
+        if not by_hash:
+            return []
+        refs = self.backend.referenced_ids(list(by_hash))
+        out = []
+        for h, ids in by_hash.items():
+            alive = refs.get(h, set())
+            out.extend(i for i in ids if i not in alive)
+        return out
+
+    def _drop_cache(self, keys):
+        """删掉这些缓存键，前提是索引里已经没有记录再引用同一份内容。"""
+        if cache_limit() <= 0 or not keys:
+            return
+        hashes = {k.split("-", 1)[0] for k in keys}
+        alive = self.backend.referenced_ids(list(hashes))
+        for k in keys:
+            if k.split("-", 1)[0] in alive:
+                continue                       # 还有别的路径用这份内容
+            try:
+                os.unlink(os.path.join(blob_dir(), k))
+            except OSError:
+                pass
+            try:
+                os.unlink(os.path.join(blob_dir(), k + PART_SUFFIX))
+            except OSError:
+                pass
+
+    def cache_adopt(self, path: str, src: str) -> bool:
+        """把一份已经上传完成的 staging 直接转正成本地读缓存（同盘 rename，零拷贝）。
+
+        PUT 返回后字节本来就在本地，传完就丢的话，第一次读还得从 TG 把它整个
+        下回来——白费一遍带宽。预算装不下就返回 False，调用方照常删 staging。
+        """
+        if not adopt_on():
+            return False
+        key = cache_key(self.get(path))
+        limit = cache_limit()
+        if not key or limit <= 0:
+            return False
+        try:
+            size = os.path.getsize(src)
+        except OSError:
+            return False
+        if size <= 0 or size > limit:
+            return False
+        dst = os.path.join(blob_dir(), key)
+        total, _ = _cache_usage()
+        if total > limit:
+            cache_trim(0, keep=dst)        # rename 不增加占用，只需削回限额内
+            total, _ = _cache_usage()
+            if total > limit:
+                return False
+        try:
+            os.replace(src, dst)           # 原子：别的进程要么没有、要么是完整一份
+        except OSError as ex:
+            log.warning("上传完成转缓存失败 %s: %s", key[:12], ex)
+            return False
+        try:
+            os.utime(dst, None)
+        except OSError:
+            pass
+        log.info("上传完成，字节直接留作本地缓存 %s (%.1f MB)", key[:12], size / 1048576)
+        return True
+
+    def staging_waited(self, digest: str) -> bool:
+        """还有别的记录在等这份 staging 吗。"""
+        if not digest:
+            return False
+        for _path, d, *_ in self.backend.pending():
+            if d == digest:
+                return True
+        return False
+
+    def staging_release(self, digest: str):
+        """没有别的记录还在等这份 staging 时，才收掉它。
+
+        秒传命中时最容易踩：这条记录不需要字节了，但同内容的另一条记录
+        可能还排在队列里，staging 是它唯一的来源，删了就永远传不上去。
+        """
+        if not digest or self.staging_waited(digest):
+            return
+        staging_drop(digest)
+
+    def staging_finish(self, path: str, digest: str):
+        """一份 staging 用完了：没人再等就转成本地缓存，转不了就删。
+
+        必须先确认没人再等——并发上传同内容到两个路径时，先完成的那个
+        不能把另一个唯一的字节来源拿走。
+        """
+        if not digest or self.staging_waited(digest):
+            return
+        src = staging_path(digest)
+        if self.cache_adopt(path, src):
+            return                       # 字节已经 rename 成缓存条目
+        staging_drop(digest)
 
     async def delete(self, path: str, recursive=True):
+        """把路径（含子树）从索引里摘掉，TG 消息回收交给后台。
+
+        锁里只干本地活：一次范围删除 + 一次引用计数查询。几百条消息的删除
+        要等网络，绝不能抱着写锁做，那会把所有写请求一起冻住。
+        """
         p = norm(path)
         await self.ensure_fresh()
         async with self.lock:
             e = self.backend.get(p)
             if not e:
                 raise FileNotFoundError(p)
-            if e.is_dir:
-                if self.children(p) and not recursive:
-                    raise OSError("目录非空")
-                kids = [x for x in self.backend.paths_under(p) if x != p]
-                for k in sorted(kids, key=len, reverse=True):
-                    await self._drop(k)
-                await self._drop(p)
-            else:
-                await self._drop(p)
+            if e.is_dir and not recursive and self.children(p):
+                raise OSError("目录非空")
+            rows = self.backend.take_under(p)
+            self.dirty = True
+            self._bury_ids(self._ghost_ids(rows))
+            # 还在排队、staging 是唯一字节来源的记录，索引都删了就别把字节留着了
+            doomed = {row[1] for row in rows if row[3] == 1 and row[1]}
+            # 本地读缓存跟着索引走：内容已经没人引用，留着只会占满 CACHE_MAX_GB
+            keys = [cache_key_of(row[1], row[4] or 0, row[2]) for row in rows
+                    if row[1] and row[4] and row[3] != 1]
+            keys = [k for k in keys if k]
+        for d in doomed:
+            self.staging_release(d)
+        if keys:
+            self._drop_cache(keys)
 
     async def move(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
@@ -1401,6 +1783,11 @@ class Store:
         if not self.backend.get(s):
             raise FileNotFoundError(s)
         async with self.lock:
+            old = self.backend.get(d)
+            if old is not None and old.is_dir:
+                # 文件不能顶掉目录。WebDAV 层会先拦，这里是最后一道闸：
+                # 顶上去以后 dirs 表里的子树还在，但客户端只看得到文件。
+                raise FileExistsError(f"目标是目录: {d}")
             await self._ensure_parents(d)          # 目标父目录不存在就补上，否则子树挂不上
             rows = [self.backend.get(x) for x in self.backend.paths_under(s)]
             rows = [x for x in rows if x]
@@ -1414,6 +1801,9 @@ class Store:
             for x in rows:
                 self.backend.remove(x.path)
             self.dirty = True
+            self._bury_hash(old)
+            if old is not None and old.status == 1 and old.hash:
+                self.staging_release(old.hash)
 
     async def copy(self, src: str, dst: str):
         s, d = norm(src), norm(dst)
@@ -1427,6 +1817,9 @@ class Store:
         if not self.backend.get(s):
             raise FileNotFoundError(s)
         async with self.lock:
+            old = self.backend.get(d)
+            if old is not None and old.is_dir:
+                raise FileExistsError(f"目标是目录: {d}")
             await self._ensure_parents(d)
             rows = [self.backend.get(x) for x in self.backend.paths_under(s)]
             for x in rows:
@@ -1439,6 +1832,9 @@ class Store:
                     self.backend.set_file(newp, x.hash, x.size, x.mtime, x.parts,
                                         x.status, x.expect)
             self.dirty = True
+            self._bury_hash(old)
+            if old is not None and old.status == 1 and old.hash:
+                self.staging_release(old.hash)
 
     # ---------- 读取内容 ----------
     def cached_path(self, path: str) -> str:
@@ -1488,38 +1884,24 @@ class Store:
             return
         key = "" if ranged else cache_key(e)
         cache_sweep()
+        lock = None
         if key:
             cp = os.path.join(CACHE_DIR, "blobs", key)
-            try:
-                f = await asyncio.to_thread(open, cp, "rb")
-            except OSError:
-                f = None
+            f = await self._open_cached(cp, e, path)      # 先无锁看一眼
             if f is not None:
-                # 先比长度再吐字节：残片一旦 yield 出去就收不回来了，
-                # 客户端会拿到「坏前缀 + 重下内容」拼起来的怪东西。
-                try:
-                    fsize = await asyncio.to_thread(os.path.getsize, cp)
-                except OSError:
-                    fsize = -1
-                if e.size and fsize != e.size:
-                    log.warning("缓存条目长度不符，弃用重下: %s 本地 %d 字节 / 记录 %s",
-                                path, fsize, e.size)
-                    f.close()
-                    try:
-                        os.unlink(cp)
-                    except OSError:
-                        pass
-                else:
-                    await asyncio.to_thread(os.utime, cp, None)     # 刷新 LRU 位置
-                    try:
-                        while True:
-                            b = await asyncio.to_thread(f.read, CACHE_CHUNK)
-                            if not b:
-                                break
-                            yield b
-                    finally:
-                        f.close()
-                    return
+                async for b in self._drain_file(f):
+                    yield b
+                return
+            # 没命中：同一份内容只让一个协程回 TG 拉，其他人等它落盘后直接读缓存。
+            # 否则 N 个客户端同时打开同一个大文件，就要往 TG 拉 N 遍。
+            lock = self._dl_lock(key)
+            await lock.acquire()
+            f = await self._open_cached(cp, e, path)      # 等锁期间可能已经被别人下完
+            if f is not None:
+                lock.release()
+                async for b in self._drain_file(f):
+                    yield b
+                return
         h = hashlib.shake_128()
         got = 0
         skip = offset
@@ -1576,7 +1958,7 @@ class Store:
                         if left is not None:
                             left -= len(piece)
                         if fh is not None:
-                            fh.write(piece)
+                            await asyncio.to_thread(fh.write, piece)
                         yield piece
                         if left is not None and left <= 0:
                             break
@@ -1585,8 +1967,9 @@ class Store:
                 raise IOError(f"{path} 缺 {len(missing)} 个分片 (idx {sorted(missing)[:10]}, "
                               f"共 {len(order)} 片)，只读到 {got} 字节")
             if not ranged:
-                if e.size and got != e.size:
-                    # 大小不符是硬错误：交付出去的就是残缺文件
+                if got != e.size:
+                    # 大小不符是硬错误：交付出去的就是残缺文件。lost+found 里
+                    # 缺片的残片（size=0）也会在这里被挡下来，不给错位字节。
                     raise IOError(f"{path} 下载大小不符: 实际 {got} / 记录 {e.size}")
                 if verify and e.hash:
                     d = h.hexdigest(16)
@@ -1616,6 +1999,8 @@ class Store:
                     os.unlink(tmp)
                 except OSError:
                     pass
+            if lock is not None and lock.locked():
+                lock.release()
 
     async def _del_ids(self, ids):
         ids = [i for i in ids if i]
@@ -1711,6 +2096,7 @@ class Store:
                 now = int(time.time())
                 self.backend.set_dir("/lost+found", now)
                 for mid, (fname, msize) in manual.items():
+                    fname = (fname or "unnamed").replace("/", "_")
                     p = f"/lost+found/{fname}"
                     k = 1
                     while self.backend.get(p):
@@ -1722,8 +2108,12 @@ class Store:
                 now = int(time.time())
                 self.backend.set_dir("/lost+found", now)
                 for h, parts in orphan.items():
-                    # size 用扫到的分片总字节：记 0 的话下载时没法校验完整性
-                    self.backend.set_file(f"/lost+found/{h}", h, size_by_hash.get(h, 0),
+                    idx = sorted(int(k) for k in parts)
+                    whole = idx == list(range(len(idx)))
+                    # 序号从 0 开始连续才敢给 size：中间缺片的残片按顺序拼起来是
+                    # 错位的字节流，size 记 0 让下载时的大小校验直接挡掉。
+                    self.backend.set_file(f"/lost+found/{h}", h,
+                                          size_by_hash.get(h, 0) if whole else 0,
                                           now, parts, 0, len(parts))
                 log.info("无主消息归入 /lost+found：%d 个 hash，%d 片",
                          len(orphan), sum(len(v) for v in orphan.values()))
@@ -1908,15 +2298,6 @@ class Store:
             self.backend.set_meta("dirty", "1" if v else "0")
         except Exception:
             pass
-
-    @staticmethod
-    def _who() -> str:
-        """抢锁/放锁的调用来源，方便定位到底是谁在频繁动锁。"""
-        frames = traceback.extract_stack()[:-2]
-        for fr in reversed(frames):
-            if not fr.filename.endswith("store.py"):
-                return f"{os.path.basename(fr.filename)}:{fr.lineno} {fr.name}"
-        return "store"
 
     def _lock_text(self) -> str:
         """锁状态写在快照消息的 caption 里：空闲 lock:null，锁定 lock:<hash>。单机模式留空。"""

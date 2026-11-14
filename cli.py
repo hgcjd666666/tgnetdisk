@@ -21,7 +21,6 @@
   TG_API_ID, TG_API_HASH, TG_SESSION, TG_CHAT
 """
 import asyncio
-import logging
 import os
 import shutil
 import sqlite3
@@ -33,7 +32,8 @@ from logger import configure, endline, log, progress
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from store import (Store, LockBusy, norm, base_of, make_session,
-                   is_path_session, digest_of, is_online, DB_PATH)  # noqa: E402
+                   is_path_session, digest_of, is_online, DB_PATH,
+                   staging_path)  # noqa: E402
 
 
 
@@ -213,6 +213,10 @@ async def cmd_put(st, args):
     for idx, (f, dst) in enumerate(jobs, 1):
         tag = f"[{idx}/{total}]"
         try:
+            tgt = st.get(norm(dst))
+            if tgt is not None and tgt.is_dir:
+                # put 本地文件 /已存在目录 → 放进目录、叫本地同名
+                dst = dst.rstrip("/") + "/" + os.path.basename(f)
             if offset is not None or length is not None:
                 off = offset or 0
                 if slice_size and off % slice_size:
@@ -235,7 +239,13 @@ async def cmd_put(st, args):
                     # append 模式必须显式给最终大小：只传这一块的话记录 size 会变成块大小，
                     # 之后 HEAD/GET 的 Content-Length 全错。
                     old = st.backend.get(norm(dst))
-                    total_size = max(old.size if old and not old.is_dir else 0, off + wrote)
+                    if old is None or old.is_dir:
+                        sys.exit(f"--offset 只能追加到已存在的文件: {dst}")
+                    if off > old.size:
+                        sys.exit(f"--offset {off} 超出文件大小 {old.size}: {dst}")
+                    if old.status == 1:
+                        sys.exit(f"文件还在后台上传，不能追加写: {dst}")
+                    total_size = max(old.size, off + wrote)
                     e = await st.put_file(dst, tmp, slice_size=slice_size, append=True,
                                           start_index=si, total_size=total_size)
                 finally:
@@ -419,15 +429,29 @@ async def cmd_get(st, args):
     local = args[1] if len(args) > 1 else base_of(remote)
     if os.path.isdir(local):
         local = os.path.join(local, base_of(remote))
-    e = st.get(remote)
+    e = st.visible(remote)          # 上传中且本机没有缓冲 → 视为不存在
     if e is None or e.is_dir:
         sys.exit(f"不存在或不是文件: {remote}")
     # 先写 .part 再替换：下载中途失败（分片缺失）不会留下半截文件冒充完整文件
     part = local + ".part"
     try:
-        hit = st.cached_path(remote)
+        # WebDAV 那边刚 PUT 完、后台还没传完的文件，字节其实就在本地 staging。
+        # 不走这条路的话 iter_content 会直接拒（status=1），刚传的文件立刻取不到。
+        uploading = e.status == 1 or bool(e.expect and len(e.parts) < e.expect)
+        hit = "" if uploading else st.cached_path(remote)
         done = False
-        if hit and e.size >= LINK_MIN:
+        if uploading:
+            sp = staging_path(e.hash)
+            if not os.path.exists(sp):
+                sys.exit(f"文件正在后台上传，字节还不在本地: {remote}")
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            shutil.copyfile(sp, part)
+            done = True
+            log("文件还在后台上传，直接从本地 staging 取")
+        if not done and hit and e.size >= LINK_MIN:
             # 大文件优先硬链接：同 inode，零拷贝；缓存条目之后被 LRU 淘汰也只是少了
             # 一个链接，inode 还挂在我们这个路径上，数据不会跟着没。
             # 关键是把结果设成只读——硬链接和缓存条目共 inode，可写就等于把缓存池
@@ -481,25 +505,36 @@ async def cmd_rm(st, args):
 async def cmd_mv(st, args):
     if len(args) < 2:
         sys.exit("用法: tgnd mv <源> <目标>")
-    await st.move(norm(args[0]), norm(args[1]))
-    log(f"{args[0]} -> {args[1]}")
+    src, dst = norm(args[0]), norm(args[1])
+    d = st.get(dst)
+    if d is not None and d.is_dir:
+        # mv a dir 的直觉是「放进 dir」，不是「用 a 顶掉 dir」
+        dst = dst.rstrip("/") + "/" + base_of(src)
+    await st.move(src, dst)
+    log(f"{args[0]} -> {dst}")
 
 
 async def cmd_cp(st, args):
     if len(args) < 2:
         sys.exit("用法: tgnd cp <源> <目标>")
-    await st.copy(norm(args[0]), norm(args[1]))
-    log(f"copied {args[0]} -> {args[1]}")
+    src, dst = norm(args[0]), norm(args[1])
+    d = st.get(dst)
+    if d is not None and d.is_dir:
+        dst = dst.rstrip("/") + "/" + base_of(src)
+    await st.copy(src, dst)
+    log(f"copied {args[0]} -> {dst}")
 
 
 def cmd_stat(st, args):
     if not args:
         sys.exit("用法: tgnd stat <路径>")
-    e = st.get(norm(args[0]))
+    e = st.visible(norm(args[0]))
     if not e:
         sys.exit("不存在")
     log(f"path={e.path}")
     log(f"type={'dir' if e.is_dir else 'file'}")
+    if e.status == 1:
+        log("state=上传中（字节在本机 staging，还没同步到 TG）")
     log(f"size={e.size} ({human(e.size)})")
     log(f"slices={len(e.slices)} ids={e.slices[:5]}{'...' if len(e.slices) > 5 else ''}")
 
@@ -627,6 +662,10 @@ async def main():
                     pass
         except Exception as e:
             log("快照上传失败:", e)
+        try:
+            await st.flush_dead()          # 删目录/覆盖后攒下的旧分片，退出前尽量收掉
+        except Exception as e:
+            log("清理旧分片失败:", e)
         await client.disconnect()
         cleanup(tmp)
 
