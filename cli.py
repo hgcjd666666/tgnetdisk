@@ -32,7 +32,7 @@ from logger import configure, endline, log, progress
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from store import (Store, LockBusy, norm, base_of, make_session,
-                   is_path_session, digest_of, is_online, DB_PATH,
+                   is_path_session, digest_of, need_tg_lock, DB_PATH,
                    staging_path)  # noqa: E402
 
 
@@ -111,7 +111,11 @@ async def get_store():
     chat = os.environ["TG_CHAT"]
     chat = int(chat) if chat.lstrip("-").isdigit() else chat
     st = Store(client, chat)
-    await st.load()
+    # 单设备模式（TGND_LOCK=file）下本地库就是权威：再去 TG 拉一份旧快照覆盖它，
+    # 反而会把 server 刚写进去、还没备份的改动抹掉。只有跨设备模式或者本地库
+    # 还是空的（第一次用）才需要从 TG 拉。
+    if need_tg_lock() or st.is_empty():
+        await st.load()
     return client, st, tmp
 
 
@@ -401,7 +405,7 @@ async def cmd_pushdir(st, args):
             failed += 1
             endline()
             log(f"[{i}/{len(todo)}] FAIL {d}: {type(ex).__name__}: {ex}", flush=True)
-        if is_online() and i % 100 == 0 and st.dirty:
+        if i % 100 == 0 and st.dirty:
             try:
                 await st.snapshot_locked()      # 拿不到锁会在 acquire 里抛 LockBusy
             except LockBusy:

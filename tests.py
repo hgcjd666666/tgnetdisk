@@ -118,6 +118,10 @@ CASES = [
     ("边界-补洞失败保留", "t_edge_fill_failure_keeps_partial"),
     ("边界-补洞关闭", "t_edge_fill_rate_zero"),
     ("边界-全量与Range并发", "t_edge_full_get_and_range_race"),
+    ("单设备-文件锁跨进程互斥", "t_lock_file_across_processes"),
+    ("备份-写完不立即推快照", "t_backup_idle_only"),
+    ("备份-只留最近N份", "t_backup_keep_n"),
+    ("单设备-写操作零 TG 往返", "t_write_no_tg_rpc"),
 ]
 
 
@@ -128,6 +132,11 @@ async def main():
     group = None
     if "--group" in sys.argv:
         group = sys.argv[sys.argv.index("--group") + 1]
+
+    if "--full" in sys.argv:
+        # 默认走 file 模式（单设备）。--full 才把分布式锁接回来，
+        # 那几个锁用例断言的正是 TG 锁协议。
+        os.environ["TGND_LOCK"] = "tg"
 
     if "--real" in sys.argv:                    # 连真实 Telegram
         from telethon import TelegramClient

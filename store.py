@@ -9,6 +9,7 @@
 import abc
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
+import fcntl
 import functools
 import hashlib
 import io
@@ -469,6 +470,46 @@ LOCK_PREFIX = "lock:"
 def is_online() -> bool:
     """每次调用都读环境变量——env 文件是运行期才加载的，不能做成模块常量。"""
     return os.environ.get("ONLINE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+LOCK_MODES = ("tg", "file", "none")
+
+
+def lock_mode() -> str:
+    """写索引时的互斥方式。
+
+    tg   —— 跨设备：锁挂在 TG 置顶快照的 caption 上，每写一次都要先等别人让出来。
+    file —— 单设备（默认）：flock 一个 <db>.lock。同一台机器上的 server 与 cli
+            本来就是同一个索引文件，进程间互斥用文件锁就够了，不碰 TG。
+    none —— 只靠 sqlite 自己串行（测试用）。
+
+    只有 tg 需要跨设备协调：它保证「读-改-写」期间没有第二个节点推快照，
+    代价是每笔写操作至少三次网络往返。单设备时这几趟 RPC 纯属浪费。
+    """
+    if not is_online():
+        return "none"
+    m = (os.environ.get("TGND_LOCK") or "file").strip().lower()
+    return m if m in LOCK_MODES else "file"
+
+
+def need_tg_lock() -> bool:
+    return lock_mode() == "tg"
+
+
+def snap_idle() -> float:
+    """后台备份的触发条件：有改动且空闲这么多秒。"""
+    try:
+        return max(0.0, float(os.environ.get("SNAPSHOT_SEC") or 10))
+    except ValueError:
+        return 10.0
+
+
+def snap_keep() -> int:
+    """TG 上保留几份快照。>1 时每份新发一条消息，误覆盖还能回滚到上一版。"""
+    try:
+        return max(1, int(os.environ.get("SNAPSHOT_KEEP") or 3))
+    except ValueError:
+        return 3
 
 
 # ---------- 基础工具 ----------
@@ -1126,10 +1167,11 @@ def make_backend(name: str | None = None, **kw) -> Backend:
 
 # ---------- 业务层 ----------
 class _WriteGuard:
-    """`async with self.lock:` 的入口：抢分布式锁 + 本地互斥 + 租约续期。
+    """`async with self.lock:` 的入口：进程内互斥 + 按 TGND_LOCK 选互斥层。
 
-    WebDAV 连着写几个文件时，只抢一次锁；空闲满 lease 秒后由 _lease_watch
-    统一落库并放锁。这样不会每写一次就 edit 两次 TG。
+    tg 模式沿用租约：连着写几个文件只抢一次锁，空闲满 lease 秒后由 _lease_watch
+    统一落库放锁。file / none 模式上锁只是本地几微秒的事，写操作立即返回，
+    推送快照交给后台备份（见 Store.backup_if_idle）。
     """
 
     def __init__(self, store, lease: float = 3.0):
@@ -1140,25 +1182,30 @@ class _WriteGuard:
         s = self.s
         await s.mutex.acquire()
         try:
-            if not s.fast and is_online():
-                await s.ensure_fresh()
-                if not s._holding:
-                    await s.acquire()
-                if self.lease > 0:
-                    s._lease = self.lease
-                    s._touch()
-                    if s._lease_task is None or s._lease_task.done():
-                        s._lease_task = asyncio.create_task(s._lease_watch())
+            if not s.fast:
+                if need_tg_lock():
+                    await s.ensure_fresh()
+                    if not s._holding:
+                        await s.acquire()
+                    if self.lease > 0:
+                        s._lease = self.lease
+                        s._touch()
+                        if s._lease_task is None or s._lease_task.done():
+                            s._lease_task = asyncio.create_task(s._lease_watch())
+                elif lock_mode() == "file":
+                    await s.acquire_local()
             s._in_guard = True
             return self
         except Exception:
+            await s.release_local()
             s.mutex.release()
             raise
 
     async def __aexit__(self, *exc):
         s = self.s
         s._in_guard = False
-        s._touch()                    # 续租约：真正落库留给 _lease_watch
+        s._touch()                    # 后台备份靠它判断「空闲了多久」
+        await s.release_local()
         s.mutex.release()
 
 
@@ -1186,6 +1233,16 @@ class Store:
         self._replaced = {}           # register 覆盖掉的旧条目，等 upload_pending 成功后清理
         self._graveyard = []          # 索引里已经删掉、等着删 TG 消息的分片 id
         self._flush_task = None
+        self._lock_fd = None          # file 模式：<db>.lock 的 fd
+        self._lock_held = False
+        self._snap_ids = []           # TG 上保留的快照消息 id（最近的在最后）
+        self._backup_wake = asyncio.Event()   # 写操作结束后叫一声后台备份
+        # 单设备模式启动时不拉远端快照，得从本地 meta 里认出「上一版是哪条消息」，
+        # 否则每次重启都会新发一条，旧快照全变成没人删的孤儿。
+        try:
+            self.snap_msg_id = int(self.backend.get_meta("snap_msg_id") or 0)
+        except Exception:
+            self.snap_msg_id = 0
         # 同一份内容同时只让一个协程回 TG 下载。用弱引用：没人持有时锁自动回收，
         # 不用自己维护「哪些 key 还在用」。
         self._dl_locks = weakref.WeakValueDictionary()
@@ -1198,6 +1255,46 @@ class Store:
             lock = asyncio.Lock()
             self._dl_locks[key] = lock
         return lock
+
+    def is_empty(self) -> bool:
+        """本地索引是不是空的（从没同步过）。cli 首次运行要靠它决定拉不拉快照。"""
+        try:
+            return self.backend.get("/") is None and not self.backend.children("/")
+        except Exception:
+            return True
+
+    # ---------- 本机进程间互斥 ----------
+    def _lock_path(self) -> str:
+        path = getattr(self.backend, "path", None) or DB_PATH
+        return os.path.abspath(path) + ".lock"
+
+    async def acquire_local(self):
+        """flock 一个 <db>.lock：同一台机器上的 server 与 cli 靠它串行。
+
+        调用方必须已经持有 self.mutex。同一进程里两个协程共用同一个 fd，
+        flock 会把它们当成同一个持有者（第二次上锁直接成功），进程内的互斥
+        只能靠 mutex，flock 只负责挡住别的进程。
+        """
+        if self._lock_held:
+            return
+        if self._lock_fd is None:
+            path = self._lock_path()
+            self._lock_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            await asyncio.to_thread(fcntl.flock, self._lock_fd, fcntl.LOCK_EX)
+        except OSError as ex:
+            log.warning("本地文件锁获取失败（继续无锁写）: %s", ex)
+            return
+        self._lock_held = True
+
+    async def release_local(self):
+        if not self._lock_held:
+            return
+        self._lock_held = False
+        try:
+            await asyncio.to_thread(fcntl.flock, self._lock_fd, fcntl.LOCK_UN)
+        except OSError as ex:
+            log.warning("本地文件锁释放失败: %s", ex)
 
     async def _open_cached(self, cp: str, e, path: str):
         """打开缓存条目；长度不对就丢掉重下。返回文件对象或 None。"""
@@ -2131,12 +2228,25 @@ class Store:
         if doc_id:
             self.snap_doc_id = doc_id
 
-    async def _push_snapshot(self, tmp: str, caption: str):
-        """把压缩好的快照推上去：能就地替换置顶那条就替换，否则新发一条并置顶。
+    def _known_snap_ids(self):
+        """TG 上保留的快照消息 id（最近的在最后）。第一次用时从 meta 里捞。"""
+        if not self._snap_ids:
+            try:
+                ids = json.loads(self.backend.get_meta("snap_ids") or "[]")
+                self._snap_ids = [int(i) for i in ids if i]
+            except Exception:
+                self._snap_ids = []
+        return self._snap_ids
 
+    async def _push_snapshot(self, tmp: str, caption: str):
+        """把压缩好的快照推上去。
+
+        SNAPSHOT_KEEP=1（tg 模式强制）时就地替换置顶那条，只留一份。
+        >1 时新发一条并置顶，只保留最近 keep 份——推错了还能从上一版捞回来。
         返回 (msg, replaced)：msg 是消息对象或已有消息 id，replaced 表示是否原地替换。
         """
-        if self.snap_msg_id:
+        keep = 1 if need_tg_lock() else snap_keep()
+        if keep <= 1 and self.snap_msg_id:
             try:
                 m = await self.client.edit_message(
                     self.chat, self.snap_msg_id, file=tmp, force_document=True,
@@ -2151,12 +2261,28 @@ class Store:
         old = self.snap_msg_id
         self.snap_msg_id = msg.id
         self._remember_snap_doc(msg)
-        if old and old != msg.id:
-            await self._del_ids([old])
         try:
             await self.client.pin_message(self.chat, msg, notify=False)
         except Exception as e:
             log.warning("置顶失败: %s", e)
+        if keep > 1:
+            seen = []
+            for i in self._known_snap_ids() + ([old] if old else []):
+                if i and i != msg.id and i not in seen:
+                    seen.append(i)          # 重启后可能只认得上一版，一并纳入轮换
+            ids = seen + [msg.id]
+            drop, ids = ids[:-keep], ids[-keep:]
+            self._snap_ids = ids
+            try:
+                self.backend.set_meta("snap_ids", json.dumps(ids))
+                self.backend.set_meta("snap_msg_id", str(msg.id))
+            except Exception:
+                pass
+            if drop:
+                await self._del_ids(drop)
+            log.info("快照保留最近 %d 份，清掉旧的 %s", keep, drop or "无")
+        elif old and old != msg.id:
+            await self._del_ids([old])
         return msg, False
 
     async def snapshot(self, final: bool = False, grab_lock: bool = False):
@@ -2168,9 +2294,9 @@ class Store:
         grab_lock=True 才先抢锁。acquire() 内部建快照时必须传 False，
         否则 acquire → snapshot → acquire 互相递归，空频道上直接卡死。
         """
-        if grab_lock and is_online() and not self._holding:
+        if grab_lock and need_tg_lock() and not self._holding:
             await self.acquire()
-        cap = (LOCK_IDLE if is_online() else "") if final else self._lock_text()
+        cap = (LOCK_IDLE if need_tg_lock() else "") if final else self._lock_text()
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
         os.close(fd)
         try:
@@ -2199,6 +2325,8 @@ class Store:
         nonblock=True 时锁被别的节点占着就立刻抛 LockBusy（给 WebDAV 的收尾用，
         否则每个写请求都要在锁上等满 acquire 的 timeout）。
         """
+        # 不拿本地写锁：dump 是 sqlite 事务读，推送是网络 IO，都阻塞不了索引写入。
+        # 两个进程同时推只会多发一条内容等价的消息，比让请求等几秒划算得多。
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
         os.close(fd)
         try:
@@ -2211,10 +2339,11 @@ class Store:
                 if self._gen == gen:
                     self.dirty = False              # 内容没变，一次网络都不发
                 return self.snap_msg_id
-            if is_online() and not self._holding:
+            if need_tg_lock() and not self._holding:
                 await self.acquire(nonblock=nonblock)
             try:
-                msg, replaced = await self._push_snapshot(tmp, LOCK_IDLE)
+                msg, replaced = await self._push_snapshot(
+                    tmp, LOCK_IDLE if need_tg_lock() else "")
                 self._holding = False
                 self._snap_digest = digest          # 推成功才记：失败后同样的内容还要能重试
                 if self._gen == gen:
@@ -2223,7 +2352,7 @@ class Store:
                 log.info("快照已%s并放锁 (msg %s, %d 字节)", "就地替换" if replaced else "上传", mid, size)
                 return mid
             finally:
-                if is_online() and self._holding:
+                if need_tg_lock() and self._holding:
                     await self.release()
                 else:
                     self._holding = False
@@ -2301,7 +2430,7 @@ class Store:
 
     def _lock_text(self) -> str:
         """锁状态写在快照消息的 caption 里：空闲 lock:null，锁定 lock:<hash>。单机模式留空。"""
-        if not is_online():
+        if not need_tg_lock():
             return ""
         return (LOCK_PREFIX + self.token) if self._holding else LOCK_IDLE
 
@@ -2332,7 +2461,7 @@ class Store:
         空闲时是 `lock:null`，被占用时是 `lock:<sha256(盐+token)>`。
         token 本身是 TG_SESSION 的 sha256 派生值，不暴露 session。
         """
-        if not is_online():                     # 单机模式：不碰 TG，直接认为持有
+        if not need_tg_lock():                  # file/none 模式：不碰 TG，直接认为持有
             self._holding = True
             return
         mine = LOCK_PREFIX + self.token
@@ -2375,7 +2504,7 @@ class Store:
 
     async def release(self):
         """把 caption 改回 lock:null。"""
-        if not is_online():
+        if not need_tg_lock():
             self._holding = False
             return
         if not self._holding or not self.snap_msg_id:
@@ -2389,7 +2518,7 @@ class Store:
 
     async def _clear_own_stale_lock(self, timeout: int = 120):
         """启动时：锁是自己的残留就置空，是别人的就轮询等它释放。单机模式跳过。"""
-        if not is_online():
+        if not need_tg_lock():
             return
         end = time.time() + timeout
         mine = LOCK_PREFIX + self.token
@@ -2450,40 +2579,30 @@ class Store:
 
     @asynccontextmanager
     async def guard(self, lease: float = 0.0, timeout: int = 60):
-        """写操作统一入口。
+        """写操作统一入口（CLI 用：进程短命，退出前必须把索引推上去）。
 
-        lease=0（默认）：抢锁 → 干完 → 写快照 → 放锁。
-        lease>0（批量模式）：抢到锁就一直拿着，期间不写快照也不放锁，
-                            空闲满 lease 秒后由 _lease_watch 统一落库并释放。
+        tg   —— 抢分布式锁 → 干完 → 推快照 → 放锁；lease>0 时落库交给 _lease_watch。
+        file —— 只拿本地文件锁；干完立刻推快照，没有后台进程替它兜底。
+        none —— 不碰任何锁，只按 dirty 推快照。
         """
         if self._in_guard:                      # 重入
             self._touch()
             yield
             return
-        if not is_online():                          # 单机：不碰锁，只在退出时落库
-            self._in_guard = True
-            try:
-                yield
-            finally:
-                if self.dirty:
-                    try:
-                        await self.snapshot()
-                    except Exception as e:
-                        log.warning("快照上传失败: %s", e)
-                self._in_guard = False
-            return
+        mode = "none" if self.fast else lock_mode()
         self._in_guard = True
         try:
-            await self.ensure_fresh()
-            if is_online() and not self._holding:
-                await self.acquire(timeout=timeout, nonblock=(timeout <= 0))
-            elif not is_online():
-                self._holding = True
+            if mode == "tg":
+                await self.ensure_fresh()
+                if not self._holding:
+                    await self.acquire(timeout=timeout, nonblock=(timeout <= 0))
+            elif mode == "file":
+                await self.acquire_local()
         except Exception:
             self._in_guard = False
             raise
 
-        if lease > 0:
+        if mode == "tg" and lease > 0:
             self._lease = lease
             self._touch()
             if self._lease_task is None or self._lease_task.done():
@@ -2505,12 +2624,36 @@ class Store:
                     except Exception as e:
                         log.warning("快照上传失败: %s", e)
             finally:
-                await self.release()
+                if mode == "tg":
+                    await self.release()
+                elif mode == "file":
+                    await self.release_local()
                 self._in_guard = False
 
+    def kick_backup(self):
+        """写完叫一声后台：备份协程自己判断「空闲够没够」，这里只负责别让它睡死。"""
+        self._backup_wake.set()
+
+    async def backup_if_idle(self, idle: float | None = None) -> bool:
+        """后台备份：有改动、且空闲够久了，才把索引推上去一次。
+
+        连续写 100 个文件也只会在安静下来后推一次；推完 dirty 清零，
+        没有新改动就不再重复上传。返回是否真的推了。
+        """
+        if not self.dirty or self.fast:
+            return False
+        gap = snap_idle() if idle is None else idle
+        if time.time() - self._last_op < gap:
+            return False
+        try:
+            await self.snapshot_locked(nonblock=True)
+            return True
+        except LockBusy:
+            return False
+
     async def ensure_fresh(self):
-        """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。单机模式直接跳过。"""
-        if not is_online():
+        """写操作前先看 TG 上的快照有没有被别人更新，有就先拉下来。只有 tg 模式需要。"""
+        if not need_tg_lock():
             return False
         # 快照用 edit_message 原地替换，消息 id 不变，靠 document.id 判断内容是否换过
         if self._holding and self._lease:

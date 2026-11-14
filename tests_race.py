@@ -194,6 +194,8 @@ async def t_race_dump_while_write(ctx):
 
 async def t_race_lock_contend(ctx):
     st, client = ctx.st, ctx.client
+    if st.fast:
+        return                       # fast 模式不碰 TG 锁，acquire 直接返回
     if st._holding:                  # 前面的用例可能还在租约里，先把锁让出来
         await st.release()
     stores = []
@@ -386,9 +388,121 @@ async def t_race_kill_recovery(ctx):
     assert ok == "ok", f"被 kill 后库损坏: {ok}"
     assert n >= 2, f"少量写入应保留，实际 {n}"
 
+def _env(**kw):
+    """临时改环境变量，返回恢复函数。"""
+    old = {k: os.environ.get(k) for k in kw}
+    os.environ.update({k: str(v) for k, v in kw.items()})
+    def restore():
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return restore
+
+
+async def t_lock_file_across_processes(ctx):
+    """单设备模式：<db>.lock 要挡住别的进程（server 与 cli 就是两个进程）。"""
+    import subprocess
+    restore = _env(ONLINE=1, TGND_LOCK="file")
+    o = Store(ctx.client, ctx.st.chat, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+    code = (
+        "import fcntl,os,sys\n"
+        "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o600)\n"
+        "try:\n"
+        "    fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
+        "    print('GOT')\n"
+        "except OSError:\n"
+        "    print('BUSY')\n")
+    def probe():
+        r = subprocess.run([sys.executable, "-c", code, o._lock_path()],
+                           capture_output=True, text=True, timeout=30)
+        return r.stdout.strip()
+    try:
+        await o.acquire_local()
+        assert probe() == "BUSY", "别的进程在持锁期间不应拿到 <db>.lock"
+        await o.release_local()
+        assert probe() == "GOT", "释放后别的进程应该能拿到"
+    finally:
+        await o.release_local()
+        restore()
+
+
+async def t_backup_idle_only(ctx):
+    """写操作只改本地索引；有改动且空闲够久了后台才推快照，推完不重复传。"""
+    restore = _env(ONLINE=1, TGND_LOCK="file", SNAPSHOT_SEC=10)
+    try:
+        c = FakeClient()
+        o = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+        await put_bytes(o, rand(4000), f"{D}/backup/idle")
+        snaps = [m for m in c._msgs.values() if is_db_msg(m)]
+        assert not snaps, f"写操作不该同步推快照，实际有 {len(snaps)} 条"
+        assert o.dirty, "写完应该标脏"
+        assert not await o.backup_if_idle(), "还没空闲够，不该推"
+        assert not [m for m in c._msgs.values() if is_db_msg(m)]
+        o._last_op = time.time() - 3600         # 装成已经空闲一小时
+        assert await o.backup_if_idle(), "空闲够了应该推一次"
+        assert not o.dirty, "推完 dirty 要清掉"
+        assert len([m for m in c._msgs.values() if is_db_msg(m)]) == 1
+        assert not await o.backup_if_idle(0), "没有新改动不该重复上传"
+        assert len([m for m in c._msgs.values() if is_db_msg(m)]) == 1
+    finally:
+        restore()
+
+
+async def t_backup_keep_n(ctx):
+    """SNAPSHOT_KEEP=2：留最近两份，旧的自动删掉；置顶的是最新那份。"""
+    restore = _env(ONLINE=1, TGND_LOCK="file", SNAPSHOT_SEC=0, SNAPSHOT_KEEP=2)
+    try:
+        c = FakeClient()
+        o = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+        for i in range(4):
+            await put_bytes(o, rand(3000), f"{D}/backup/keep{i}")
+            o._last_op = 0
+            assert await o.backup_if_idle()
+        snaps = [m for m in c._msgs.values() if is_db_msg(m)]
+        assert len(snaps) == 2, f"应保留 2 份快照，实际 {len(snaps)}"
+        assert c._pinned_ids == [o.snap_msg_id], f"置顶的不是最新快照: {c._pinned_ids}"
+        # 最新那份必须能用：重新加载后能看到全部 4 个文件
+        o2 = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+        await o2.load()
+        for i in range(4):
+            assert o2.get(f"{D}/backup/keep{i}") is not None, f"快照里丢了 keep{i}"
+    finally:
+        restore()
+
+
+async def t_write_no_tg_rpc(ctx):
+    """单设备模式的写操作（mkdir/move/copy/delete）不该产生任何 TG 往返。"""
+    restore = _env(ONLINE=1, TGND_LOCK="file", SNAPSHOT_SEC=10)
+    try:
+        c = FakeClient()
+        o = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
+        await put_bytes(o, rand(5000), f"{D}/fast/src")
+        o._last_op = 0
+        await o.backup_if_idle()                # 先前推一次，模拟「已经备份过」
+        assert c.rpc > 0
+        before = c.rpc
+        await o.mkdir(f"{D}/fast/dir")
+        await o.move(f"{D}/fast/src", f"{D}/fast/dir/src")
+        await o.copy(f"{D}/fast/dir/src", f"{D}/fast/copy")
+        await o.delete(f"{D}/fast/copy")
+        await o.move(f"{D}/fast/dir/src", f"{D}/fast/moved")
+        n = c.rpc - before
+        assert n == 0, f"写操作碰了 {n} 次 TG（应该全是本地操作）"
+        assert o.get(f"{D}/fast/moved") is not None, "本地索引没更新"
+        assert o.dirty, "改完应该标脏等后台备份"
+    finally:
+        restore()
+
+
 async def main(ctx):
     return [
         ("t_lock_bootstrap", t_lock_bootstrap),
+        ("t_lock_file_across_processes", t_lock_file_across_processes),
+        ("t_write_no_tg_rpc", t_write_no_tg_rpc),
+        ("t_backup_idle_only", t_backup_idle_only),
+        ("t_backup_keep_n", t_backup_keep_n),
         ("t_lock_reacquire", t_lock_reacquire),
         ("t_lock_busy", t_lock_busy),
         ("t_snapshot_dirty_clean", t_snapshot_dirty_clean),

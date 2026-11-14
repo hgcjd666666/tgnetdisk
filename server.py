@@ -25,7 +25,7 @@ from telethon import TelegramClient
 
 import logger
 from store import (cache_file, cache_key, cache_limit, CACHE_DIR, first_hole, LockBusy,
-                   make_session, is_online, partial_commit, partial_open,
+                   make_session, need_tg_lock, partial_commit, partial_open,
                    Store, norm, base_of, staging_dir, staging_hold,
                    staging_ok, staging_path)
 
@@ -906,22 +906,10 @@ async def handle(request, store, up, fill=None):
         log.exception("处理 %s %s 失败: %s", m, request.path, ex)
         return web.Response(status=500, text="internal error")
     finally:
-        # 写操作后把索引推上去，缩短两个节点互相覆盖的窗口。
-        # 有租约任务在跑时交给它（空闲 3 秒统一落库），避免每个请求都 edit 两次；
-        # 没有租约时才自己推，且必须走 snapshot_locked（抢锁）：
-        # 裸调 snapshot() 会在不持锁的情况下改快照 caption，把别的节点的锁清掉。
-        if m in ("PUT", "DELETE", "MKCOL", "MOVE", "COPY") and store.dirty:
-            t = store._lease_task
-            if t is None or t.done():
-                try:
-                    if is_online():
-                        await store.snapshot_locked(nonblock=True)   # 别在锁上等满 60 秒
-                    else:
-                        await store.snapshot()
-                except LockBusy:
-                    pass
-                except Exception as ex:
-                    log.warning("写后快照失败: %s", ex)
+        # 写操作只改本地索引：推送快照是后台的事（server 主循环里 backup_if_idle）。
+        # 在请求路径上压缩整库 + 上传要几秒，MOVE 这种小操作会被它拖住。
+        if m in ("PUT", "DELETE", "MKCOL", "MOVE", "COPY"):
+            store.kick_backup()
     return web.Response(status=405, text="method not allowed",
                         headers={"Allow": ALLOW})
 
@@ -976,7 +964,10 @@ async def main():
     else:
         chat = await ensure_chat(client)
     store = Store(client, chat)
-    await store.load()
+    # 单设备模式本地库就是权威，重启时再从 TG 拉一份旧快照覆盖它纯属多余；
+    # 跨设备模式或第一次运行（本地库是空的）才需要先同步下来。
+    if need_tg_lock() or store.is_empty():
+        await store.load()
     up = Uploader(store, int(os.environ.get("UPLOAD_QUEUE_WORKERS", "1") or 1))
     up.start()
     fill = Filler(store)
@@ -993,20 +984,32 @@ async def main():
     site = web.TCPSite(runner, bind, PORT)
     await site.start()
     log.info("WebDAV 已启动: http://%s:%d/", bind, PORT)
-    while True:
-        await asyncio.sleep(30)
+    # 后台备份：写操作只改本地索引，这里在「空闲 SNAPSHOT_SEC 秒」后统一推一次。
+    # 连续上传/改名的时候不会反复压缩上传整库，安静下来才落一次盘。
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(store._backup_wake.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+            store._backup_wake.clear()
+            try:
+                await store.backup_if_idle()
+            except Exception as e:
+                log.warning("后台备份失败: %s", e)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        # 退出前把没备份的改动推上去：等空闲 10 秒就没人做了
         try:
-            if store.dirty:                 # 兜底：有未落盘的改动就补一次快照
-                try:
-                    # 同样必须抢锁：裸 snapshot() 会改掉别的节点持有的 caption
-                    if is_online():
-                        await store.snapshot_locked(nonblock=True)
-                    else:
-                        await store.snapshot()
-                except LockBusy:
-                    pass
+            if store.dirty:
+                await asyncio.shield(store.backup_if_idle(0))
         except Exception as e:
-            log.warning("后台快照失败: %s", e)
+            log.warning("退出前备份失败: %s", e)
+        try:
+            await store.wait_released()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

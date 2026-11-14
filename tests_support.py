@@ -46,6 +46,7 @@ class FakeClient:
         self._uploads = {}          # file_id -> {part: bytes}  模拟 upload.saveBigFilePart
         self._pinned_ids = []       # 模拟置顶：只有置顶过的消息才会出现在 pinned 过滤里
         self.send_fail_times = 0    # 接下来几次 send_file 直接失败（测建消息重试）
+        self.rpc = 0                # 累计网络调用次数：用来断言「单设备模式的写操作不碰 TG」
 
     def _alloc(self):
         self._id += 1
@@ -69,6 +70,7 @@ class FakeClient:
 
     async def send_file(self, chat, file, caption=None, force_document=True,
                         attributes=None, **kw):
+        self.rpc += 1
         if self.send_fail_times > 0:
             self.send_fail_times -= 1
             raise RuntimeError("模拟 sendMedia 失败")
@@ -84,6 +86,7 @@ class FakeClient:
 
     async def edit_message(self, chat, msg, file=None, caption=None, text=None,
                            attributes=None, **kw):
+        self.rpc += 1
         mid = msg if isinstance(msg, int) else msg.id
         m = self._msgs[mid]
         if file is not None:
@@ -99,6 +102,7 @@ class FakeClient:
         return m
 
     async def get_messages(self, chat, ids=None, limit=None, filter=None, **kw):
+        self.rpc += 1
         if ids is not None:
             if isinstance(ids, (list, tuple)):
                 return [self._msgs[i] for i in ids if i in self._msgs]
@@ -120,6 +124,7 @@ class FakeClient:
             yield self._msgs[i]
 
     async def delete_messages(self, chat, ids):
+        self.rpc += 1
         for i in ids:
             self._msgs.pop(i, None)
             self._blobs.pop(i, None)
@@ -136,6 +141,7 @@ class FakeClient:
         return x
 
     async def pin_message(self, chat, msg, notify=False, **kw):
+        self.rpc += 1
         mid = msg if isinstance(msg, int) else msg.id
         self._pinned_ids = [mid]
 
@@ -160,6 +166,7 @@ class FakeClient:
             yield data[i:i + 512 * 1024]
 
     async def download_media(self, m, file=None, **kw):
+        self.rpc += 1
         data = self._blobs.get(m if isinstance(m, int) else m.id, b"")
         if hasattr(file, "write"):
             file.write(data)
