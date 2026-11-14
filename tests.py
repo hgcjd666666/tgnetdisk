@@ -1,127 +1,585 @@
 #!/usr/bin/env python3
-"""tgnd 自测入口：按组跑用例，默认用内存版 Telegram。
+"""自测：数据层 + WebDAV 协议，全部跑内存版 Telegram。
 
-用法:
-    python tests.py            # 全量用例（零网络）
-    python tests.py -k put     # 只跑名字含 put 的
+    python tests.py            # 全部
+    python tests.py -k 缓存     # 按名字过滤
     python tests.py --real     # 连真 Telegram（会产生真实消息）
-    python tests.py --full     # 连锁与快照一起测
-
-用例分在 tests_store / tests_race / tests_dav / tests_upload / tests_cache /
-tests_edge，公共设施在 tests_support。
 """
 import asyncio
+import datetime
 import os
 import sys
 import tempfile
 import traceback
+from types import SimpleNamespace
 
-import tests_support
-from tests_support import FakeClient, RESULTS, rec
-from store import Store, SqliteBackend, make_session
+os.environ.setdefault("TGND_CACHE", tempfile.mkdtemp(prefix="tgnd_test_cache_"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import cache  # noqa: E402
+import index as IDX  # noqa: E402
+import paths  # noqa: E402
+import tg  # noqa: E402
+from index import Index  # noqa: E402
+
+RESULTS = []
+D = "/_test"
+
+
+class FakeClient:
+    """内存版 Telegram：send_file / get_messages / edit / delete / iter_download。"""
+
+    def __init__(self):
+        self._id = 0
+        self._msgs = {}
+        self._blobs = {}
+        self._uploads = {}
+        self._pinned = []
+        self.downloads = 0
+        self.rpc = 0
+
+    def _alloc(self):
+        self._id += 1
+        return self._id
+
+    def _read(self, src, attrs=None):
+        name = "blob"
+        for a in (attrs or []):
+            fn = getattr(a, "file_name", None)
+            if fn:
+                name = fn
+        if isinstance(src, (bytes, bytearray)):
+            return bytes(src), name
+        if type(src).__name__ in ("InputFileBig", "InputFile"):
+            parts = self._uploads.get(src.id, {})
+            return b"".join(parts[i] for i in sorted(parts)), name
+        if hasattr(src, "read"):
+            return src.read(), name
+        with open(src, "rb") as f:
+            return f.read(), name
+
+    async def send_file(self, chat, file, caption=None, force_document=True,
+                        attributes=None, **kw):
+        self.rpc += 1
+        data, name = self._read(file, attributes)
+        mid = self._alloc()
+        doc = SimpleNamespace(id=mid, size=len(data),
+                              attributes=[SimpleNamespace(file_name=name)])
+        m = SimpleNamespace(id=mid, document=doc, message=caption or "",
+                            date=datetime.datetime.now(datetime.timezone.utc))
+        self._msgs[mid] = m
+        self._blobs[mid] = data
+        return m
+
+    async def edit_message(self, chat, msg, file=None, caption=None, text=None,
+                           attributes=None, **kw):
+        self.rpc += 1
+        mid = msg if isinstance(msg, int) else msg.id
+        m = self._msgs[mid]
+        if file is not None:
+            data, name = self._read(file, attributes)
+            m.document.size = len(data)
+            m.document.attributes = [SimpleNamespace(file_name=name)]
+            self._blobs[mid] = data
+        cap = text if text is not None else caption
+        if cap is not None:
+            m.message = cap
+        return m
+
+    async def get_messages(self, chat, ids=None, limit=None, filter=None, **kw):
+        self.rpc += 1
+        if ids is not None:
+            if isinstance(ids, (list, tuple)):
+                return [self._msgs[i] for i in ids if i in self._msgs]
+            return self._msgs.get(ids)
+        if filter is not None and "Pinned" in type(filter).__name__:
+            msgs = [self._msgs[i] for i in self._pinned if i in self._msgs]
+            return msgs[:limit] if limit else msgs
+        return [self._msgs[i] for i in sorted(self._msgs, reverse=True)[:limit or 1]]
+
+    async def iter_messages(self, chat, limit=None, min_id=0, **kw):
+        ids = sorted(self._msgs)
+        if min_id:
+            ids = [i for i in ids if i > min_id]
+        if not kw.get("reverse"):
+            ids = ids[::-1]
+        if limit:
+            ids = ids[:limit]
+        for i in ids:
+            yield self._msgs[i]
+
+    async def delete_messages(self, chat, ids):
+        self.rpc += 1
+        for i in ids:
+            self._msgs.pop(i, None)
+            self._blobs.pop(i, None)
+            if i in self._pinned:
+                self._pinned.remove(i)
+
+    async def pin_message(self, chat, msg, notify=False, **kw):
+        self.rpc += 1
+        mid = msg if isinstance(msg, int) else msg.id
+        self._pinned = [mid]
+
+    async def download_media(self, m, file=None, **kw):
+        self.rpc += 1
+        data = self._blobs.get(m if isinstance(m, int) else m.id, b"")
+        if hasattr(file, "write"):
+            file.write(data)
+            return file
+        with open(file, "wb") as f:
+            f.write(data)
+        return file
+
+    async def iter_download(self, m, *, offset=0, limit=None, **kw):
+        self.downloads += 1
+        data = self._blobs.get(m.id, b"")
+        if offset:
+            data = data[offset:]
+        if limit is not None:
+            data = data[:limit]
+        yield data
+
+    async def connect(self):
+        pass
+
+    async def disconnect(self):
+        pass
+
+    async def get_entity(self, x):
+        return x
+
+    async def is_user_authorized(self):
+        return True
+
+    async def __call__(self, req):
+        if type(req).__name__ == "SaveBigFilePartRequest":
+            self._uploads.setdefault(req.file_id, {})[req.file_part] = req.bytes
+            return True
+        return SimpleNamespace(full_chat=SimpleNamespace(
+            pinned_msg_id=self._pinned[-1] if self._pinned else None))
+
+
+def rec(name, ok, detail=""):
+    RESULTS.append((name, ok, detail))
+    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"   <<< {detail}" if not ok else ""),
+          flush=True)
+
+
+def rand(n):
+    return os.urandom(n)
+
+
+class Ctx:
+    def __init__(self):
+        self.client = FakeClient()
+        self.index = Index(tempfile.mktemp(suffix=".db"))
+        self.store = tg.TGStore(self.client, 1, self.index, cache)
+        import vfs as V
+        self.vfs = V.VFS(self.index, self.store)
+
+
+async def make_ctx():
+    c = Ctx()
+    return c
+
+
+# ---------------- 用例 ----------------
+async def t_paths(ctx):
+    assert paths.norm("") == "/"
+    assert paths.norm("/") == "/"
+    assert paths.norm("//a///b/") == "/a/b"
+    assert paths.norm("/a/./b/../c") == "/a/c"
+    assert paths.norm("/..") == "/"
+    assert paths.parent("/a/b") == "/a"
+    assert paths.base("/a/b") == "b"
+    assert paths.under("/a/b", "/a") and not paths.under("/ab", "/a")
+    # NFC/NFD 必须归一成同一个键
+    nfc = paths.norm("/café")
+    nfd = paths.norm("/cafe\u0301")
+    assert nfc == nfd, f"NFC 归一失败: {nfc!r} != {nfd!r}"
+    assert paths.bad("/a\x00b") and not paths.bad("/a b")
+
+
+async def t_index(ctx):
+    idx = ctx.index
+    idx.put_dir("/d", 1)
+    idx.put_file("/d/f", "a" * 32, 2)
+    e = idx.get("/d/f")
+    assert e and not e.is_dir and e.hash == "a" * 32
+    assert [x.path for x in idx.children("/d")] == ["/d/f"]
+    idx.content_put("a" * 32, 10, {0: 5})
+    e = idx.get("/d/f")
+    assert e.size == 10 and e.parts == {0: 5}
+    rows = idx.take_under("/d")
+    assert len(rows) == 2, rows
+    assert idx.get("/d") is None and idx.get("/d/f") is None
+
+
+async def t_put_get(ctx):
+    data = rand(300000)
+    v = ctx.vfs
+    await v.mkdir("/p")
+    tmp = v.staging_tmp()
+    with open(tmp, "wb") as f:
+        f.write(data)
+    h = tg.digest_of(tmp)
+    e = v.finish_put("/p/a.bin", tmp, h, len(data), 100)
+    assert e.pending, "第一次写应该是上传中"
+    await v.upload_pending("/p/a.bin")
+    e = v.get("/p/a.bin")
+    assert not e.pending and e.size == len(data), e
+    out = b""
+    async for c in v.iter_content("/p/a.bin"):
+        out += c
+    assert out == data, "内容不一致"
+
+
+async def t_dedup(ctx):
+    data = rand(5000)
+    v = ctx.vfs
+    for name in ("/x/1", "/x/2"):
+        tmp = v.staging_tmp()
+        with open(tmp, "wb") as f:
+            f.write(data)
+        h = tg.digest_of(tmp)
+        v.finish_put(name, tmp, h, len(data), 1)
+        await v.upload_pending(name)
+    a, b = v.get("/x/1"), v.get("/x/2")
+    assert a.hash == b.hash
+    # 同一份内容只应该有一组分片消息
+    assert a.parts == b.parts
+    nm = len([m for m in ctx.client._msgs.values()
+              if any(getattr(at, "file_name", "").startswith(a.hash)
+                     for at in m.document.attributes)])
+    assert nm == 1, f"秒传产生了 {nm} 条分片消息"
+
+
+async def t_move_copy_delete(ctx):
+    data = rand(4000)
+    v = ctx.vfs
+    tmp = v.staging_tmp()
+    with open(tmp, "wb") as f:
+        f.write(data)
+    h = tg.digest_of(tmp)
+    v.finish_put("/m/a.bin", tmp, h, len(data), 1)
+    await v.upload_pending("/m/a.bin")
+    await v.mkdir("/m/sub")
+    await v.move("/m/a.bin", "/m/sub/a.bin")
+    assert v.get("/m/a.bin") is None and v.get("/m/sub/a.bin") is not None
+    await v.copy("/m/sub/a.bin", "/m/b.bin")
+    assert v.get("/m/b.bin") is not None
+    await v.delete("/m")
+    assert v.get("/m") is None and v.get("/m/sub/a.bin") is None
+    assert v.get("/m/b.bin") is None
+
+
+async def t_bad_move(ctx):
+    v = ctx.vfs
+    await v.mkdir("/g")
+    await v.mkdir("/g/sub")
+    try:
+        await v.move("/g", "/g/sub")
+        raise AssertionError("应该拒绝移动到自己子树")
+    except OSError:
+        pass
+    assert v.get("/g") is not None
+
+
+async def t_migrate_legacy(ctx):
+    """旧库（files 里带 size/parts）打开后要自动拆成 content + files。"""
+    import sqlite3, tempfile as tf
+    p = tf.mktemp(suffix=".db")
+    db = sqlite3.connect(p)
+    db.executescript("""
+        CREATE TABLE files(path TEXT PRIMARY KEY, hash TEXT NOT NULL,
+                           size INTEGER DEFAULT 0, mtime INTEGER DEFAULT 0,
+                           parts TEXT DEFAULT '{}');
+        CREATE TABLE dirs(path TEXT PRIMARY KEY, mtime INTEGER DEFAULT 0);
+        CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+        CREATE INDEX idx_files_hash ON files(hash);
+    """)
+    db.execute("ALTER TABLE files ADD COLUMN status INTEGER DEFAULT 0")
+    db.execute("ALTER TABLE files ADD COLUMN expect INTEGER DEFAULT 0")
+    db.execute("INSERT INTO files VALUES('/old/a.bin', ?, 123, 5, ?, 0, 1)",
+               ("b" * 32, '{"0": 77}'))
+    db.execute("INSERT INTO files VALUES('/old/c.bin', ?, 123, 6, ?, 0, 1)",
+               ("b" * 32, '{"0": 77}'))
+    db.commit()
+    db.close()
+    idx = IDX.Index(p)
+    e = idx.get("/old/a.bin")
+    assert e and e.hash == "b" * 32 and e.size == 123 and e.parts == {0: 77}, e
+    assert idx.get("/old/c.bin").hash == "b" * 32
+    assert idx.referenced(["b" * 32]) == {"b" * 32: 2}
+    # 迁移后内容表只有一行
+    import sqlite3 as s3
+    c = s3.connect(p)
+    n = c.execute("SELECT COUNT(*) FROM content").fetchone()[0]
+    cols = {r[1] for r in c.execute("PRAGMA table_info(files)")}
+    c.close()
+    assert n == 1, f"content 应有 1 行，实际 {n}"
+    assert "size" not in cols and "parts" not in cols, f"files 还有旧列: {cols}"
+
+
+async def t_snapshot_roundtrip(ctx):
+    """推一份快照，再用另一个索引从 TG 拉回来。"""
+    v = ctx.vfs
+    tmp = v.staging_tmp()
+    with open(tmp, "wb") as f:
+        f.write(rand(2048))
+    h = tg.digest_of(tmp)
+    v.finish_put("/s/a.bin", tmp, h, 2048, 1)
+    await ctx.store.push_snapshot()
+    assert ctx.store.snap_msg_id
+    idx2 = Index(tempfile.mktemp(suffix=".db"))
+    st2 = tg.TGStore(ctx.client, 1, idx2, cache)
+    assert await st2.pull_snapshot()
+    e = idx2.get("/s/a.bin")
+    assert e and e.hash == h and e.status == 1, e
+
+
+async def t_lock_roundtrip(ctx):
+    """抢锁 → 自己是持有者 → 释放后空闲。"""
+    st = ctx.store
+    st.snap_msg_id = 0
+    await st.acquire(timeout=20)
+    assert st.holding
+    assert await st.check_lock() == "own"
+    await st.push_snapshot()
+    assert await st.check_lock() == "own"
+    await st.release()
+    assert await st.check_lock() == "idle"
+
+
+async def t_multislice(ctx):
+    """切片小一点，走多分片路径：上传、乱序读、Range 都要对。"""
+    old = tg.SLICE
+    tg.SLICE = 64 * 1024
+    try:
+        data = rand(200000)                    # 4 片，最后一片不足
+        v = ctx.vfs
+        tmp = v.staging_tmp()
+        with open(tmp, "wb") as f:
+            f.write(data)
+        h = tg.digest_of(tmp)
+        v.finish_put("/ms/a.bin", tmp, h, len(data), 1)
+        e = await v.upload_pending("/ms/a.bin")
+        assert len(e.parts) == 4, e.parts
+        out = b""
+        async for c in v.iter_content("/ms/a.bin"):
+            out += c
+        assert out == data, "多分片内容不一致"
+        part = b""
+        async for c in v.iter_content("/ms/a.bin", 100000, 500):
+            part += c
+        assert part == data[100000:100500], "跨分片 Range 不对"
+    finally:
+        tg.SLICE = old
+
+
+async def t_concurrent_put(ctx):
+    """并发写不同路径，索引不能串。"""
+    async def one(i):
+        v = ctx.vfs
+        data = rand(3000 + i)
+        tmp = v.staging_tmp()
+        with open(tmp, "wb") as f:
+            f.write(data)
+        h = tg.digest_of(tmp)
+        v.finish_put(f"/conc/{i}.bin", tmp, h, len(data), 1)
+        await v.upload_pending(f"/conc/{i}.bin")
+        return data
+    data = await asyncio.gather(*[one(i) for i in range(8)])
+    for i in range(8):
+        out = b""
+        async for c in ctx.vfs.iter_content(f"/conc/{i}.bin"):
+            out += c
+        assert out == data[i], f"第 {i} 个内容对不上"
+
+
+async def t_uploader(ctx):
+    """后台队列：登记完就不用管，worker 会把它传完。"""
+    import main as M
+    v = ctx.vfs
+    part = b"queued" * 500
+    tmp = v.staging_tmp()
+    with open(tmp, "wb") as f:
+        f.write(part)
+    h = tg.digest_of(tmp)
+    v.finish_put("/q/a.bin", tmp, h, len(part), 1)
+    up = M.Uploader(v, 2)
+    up.start()
+    up.nudge()
+    ok = False
+    for _ in range(200):
+        await asyncio.sleep(0.02)
+        e = v.get("/q/a.bin")
+        if e and not e.pending:
+            ok = True
+            break
+    await up.stop()
+    assert ok, "后台 worker 没传完"
+    out = b""
+    async for c in v.iter_content("/q/a.bin"):
+        out += c
+    assert out == part
+
+
+async def t_reindex(ctx):
+    """扫 TG 消息重建 content 表。"""
+    v = ctx.vfs
+    data = rand(3000)
+    tmp = v.staging_tmp()
+    with open(tmp, "wb") as f:
+        f.write(data)
+    h = tg.digest_of(tmp)
+    v.finish_put("/ri/a.bin", tmp, h, len(data), 1)
+    await v.upload_pending("/ri/a.bin")
+    # 把 content 表清掉，模拟索引丢失（files 还引用着这份内容）
+    import sqlite3
+    c = sqlite3.connect(ctx.index.path)
+    c.execute("DELETE FROM content WHERE hash=?", (h,))
+    c.commit()
+    c.close()
+    assert ctx.index.content(h) is None
+    await ctx.store.reindex()
+    got = ctx.index.content(h)
+    assert got and got[1], f"重建后没有分片: {got}"
+
+
+# ---------------- WebDAV ----------------
+async def make_dav(ctx):
+    from aiohttp.test_utils import TestClient, TestServer
+    import webdav
+    import main as M
+    dav = webdav.DAV(ctx.vfs, None)
+    app = M.make_app(dav)
+    cli = TestClient(TestServer(app))
+    await cli.start_server()
+    return cli
+
+
+async def t_dav_basic(ctx):
+    cli = await make_dav(ctx)
+    try:
+        r = await cli.put("/dav/a.txt", data=b"hello")
+        assert r.status == 201, r.status
+        r = await cli.put("/dav/a.txt", data=b"hello2")
+        assert r.status == 204, r.status
+        r = await cli.get("/dav/a.txt")
+        body = await r.read()
+        assert r.status == 200 and body == b"hello2", (r.status, body)
+        r = await cli.head("/dav/a.txt")
+        assert r.headers.get("Content-Length") == "6"
+        r = await cli.request("PROPFIND", "/dav", headers={"Depth": "1"})
+        txt = await r.text()
+        assert r.status == 207 and "a.txt" in txt, txt[:200]
+        r = await cli.request("OPTIONS", "/dav")
+        assert r.headers.get("DAV") == "1"
+        r = await cli.request("LOCK", "/dav/a.txt")
+        assert r.status == 405
+        # 上传中的文件也要能读
+        r = await cli.put("/dav/pending.bin", data=b"x" * 100)
+        assert r.status == 201
+        r = await cli.get("/dav/pending.bin")
+        assert await r.read() == b"x" * 100
+    finally:
+        await cli.close()
+
+
+async def t_dav_range(ctx):
+    cli = await make_dav(ctx)
+    try:
+        data = bytes(range(256)) * 4000
+        assert (await cli.put("/r/x.bin", data=data)).status == 201
+        r = await cli.get("/r/x.bin", headers={"Range": "bytes=100-199"})
+        assert r.status == 206, r.status
+        assert await r.read() == data[100:200]
+        assert r.headers.get("Content-Range") == f"bytes 100-199/{len(data)}"
+        r = await cli.get("/r/x.bin", headers={"Range": "bytes=-50"})
+        assert r.status == 206 and await r.read() == data[-50:]
+        r = await cli.get("/r/x.bin", headers={"Range": f"bytes={len(data)}-"})
+        assert r.status == 416, r.status
+        r = await cli.get("/r/x.bin", headers={"If-None-Match": r.headers.get("ETag", "")})
+        # 上面 r 是 416 的响应，重新取一次 ETag
+        etag = (await cli.head("/r/x.bin")).headers.get("ETag")
+        r = await cli.get("/r/x.bin", headers={"If-None-Match": etag})
+        assert r.status == 304, r.status
+    finally:
+        await cli.close()
+
+
+async def t_dav_content_range(ctx):
+    cli = await make_dav(ctx)
+    try:
+        data = rand(200000)
+        cut = 80000
+        r = await cli.put("/c/x.bin", data=data[:cut],
+                          headers={"Content-Range": f"bytes 0-{cut-1}/{len(data)}"})
+        assert r.status == 308, (r.status, await r.text())
+        off = int(r.headers.get("X-Upload-Offset"))
+        assert off == cut, off
+        r = await cli.put("/c/x.bin", data=data[cut:],
+                          headers={"Content-Range": f"bytes {cut}-{len(data)-1}/{len(data)}"})
+        assert r.status == 201, (r.status, await r.text())
+        await ctx.vfs.upload_pending("/c/x.bin")
+        r = await cli.get("/c/x.bin")
+        assert await r.read() == data
+    finally:
+        await cli.close()
+
+
+async def t_dav_move_copy(ctx):
+    cli = await make_dav(ctx)
+    try:
+        await cli.put("/mv/a.txt", data=b"1")
+        url = str(cli.make_url("/mv/b.txt"))
+        r = await cli.request("MOVE", "/mv/a.txt", headers={"Destination": url})
+        assert r.status == 201, (r.status, await r.text())
+        assert ctx.vfs.get("/mv/b.txt") is not None
+        r = await cli.request("MOVE", "/mv/b.txt", headers={"Destination": url})
+        assert r.status == 204, r.status
+        r = await cli.request("MKCOL", "/mv/d")
+        assert r.status == 201
+        r = await cli.request("MOVE", "/mv/d", headers={"Destination": str(cli.make_url("/mv/b.txt"))})
+        assert r.status == 409, r.status
+        r = await cli.request("COPY", "/mv/b.txt", headers={"Destination": str(cli.make_url("/mv/c.txt"))})
+        assert r.status == 201, r.status
+        r = await cli.delete("/mv")
+        assert r.status == 204 and ctx.vfs.get("/mv/b.txt") is None
+    finally:
+        await cli.close()
+
+
+async def t_dav_depth_infinity(ctx):
+    cli = await make_dav(ctx)
+    try:
+        r = await cli.request("PROPFIND", "/", headers={"Depth": "infinity"})
+        assert r.status == 403, r.status
+    finally:
+        await cli.close()
 
 
 CASES = [
-    ("空文件", "t_empty"),
-    ("1字节", "t_one_byte"),
-    ("中文+空格", "t_unicode"),
-    ("特殊字符", "t_special"),
-    ("深目录", "t_deep"),
-    ("多分片7片", "t_multislice"),
-    ("秒传共享分片", "t_dedup"),
-    ("同名覆盖", "t_overwrite"),
-    ("cp+mv", "t_copy_move"),
-    ("删除文件", "t_delete"),
-    ("递归删目录", "t_rmdir"),
-    ("mkdir+空目录", "t_mkdir"),
-    ("reindex 全量", "t_reindex"),
-    ("emoji 路径", "t_emoji_path"),
-    ("move 自覆盖保护", "t_move_guard"),
-    ("手动上传归入 lost+found", "t_manual_to_lostfound"),
-    ("历史分片格式", "t_part_list_format"),
-    ("缺分片必须报错", "t_missing_slice"),
-    ("WebDAV 语义", "t_dav_basic"),
-    ("JSON 控制面 /_op", "t_api_op"),
-    (".. 路径规范化", "t_norm_dotdot"),
-    ("覆盖失败保留旧文件", "t_overwrite_fail_keeps_old"),
-    ("父路径是文件", "t_parent_is_file"),
-    ("append 记录总大小", "t_append_total_size"),
-    ("13 片顺序", "t_many_slices"),
-    ("lost+found 不参与秒传", "t_lostfound_not_dedup_source"),
-    ("引用计数按消息 id", "t_refcount_dedup"),
-    ("move 到祖先被拒", "t_move_ancestor"),
-    ("同名 tgnd.db.xz 不丢", "t_manual_named_snapshot"),
-    ("同名 hash.0 不覆盖", "t_foreign_part_msg"),
-    ("环形超长行", "t_ring_long_line"),
-    ("锁-空频道自建快照", "t_lock_bootstrap"),
-    ("锁-重复acquire幂等", "t_lock_reacquire"),
-    ("锁-双节点互斥", "t_lock_busy"),
-    ("快照里的 dirty 恒为 0", "t_snapshot_dirty_clean"),
-    ("竞态-多线程写不同路径", "t_race_backend_writers"),
-    ("竞态-多线程写同一路径", "t_race_backend_same_path"),
-    ("竞态-restore 风暴", "t_race_restore_storm"),
-    ("竞态-dump 与写并发", "t_race_dump_while_write"),
-    ("竞态-三节点抢锁", "t_race_lock_contend"),
-    ("竞态-并发秒传", "t_race_put_dedup"),
-    ("竞态-边删边读", "t_race_delete_read"),
-    ("竞态-双进程共存", "t_race_process_coexist"),
-    ("竞态-并发传不同文件", "t_race_put_many_different"),
-    ("竞态-并发覆盖同路径", "t_race_put_same_path"),
-    ("竞态-边写边读内容", "t_race_write_read_content"),
-    ("竞态-推送中写入", "t_race_snapshot_while_write"),
-    ("竞态-mv 与 cp 并发", "t_race_mv_cp"),
-    ("竞态-kill 后恢复", "t_race_kill_recovery"),
-    ("缓存-默认关闭", "t_cache_default_off"),
-    ("缓存-命中不碰TG", "t_cache_hit"),
-    ("缓存-超上限不落盘", "t_cache_oversize"),
-    ("缓存-LRU淘汰最旧", "t_cache_lru"),
-    ("缓存-覆盖重传失效", "t_cache_invalidate_overwrite"),
-    ("缓存-秒传共享同一份", "t_cache_dedup_share"),
-    ("缓存-move后仍命中", "t_cache_move_hit"),
-    ("缓存-残片丢弃重下", "t_cache_corrupt"),
-    ("缓存-断连不留残迹", "t_cache_abort_no_leftover"),
-    ("缓存-并发读只落一份", "t_cache_concurrent"),
-    ("缓存-传完即本地命中", "t_cache_adopt_after_upload"),
-    ("缓存-删除回收", "t_cache_drop_on_delete"),
-    ("缓存-共享引用不误删", "t_cache_shared_not_dropped"),
-    ("缓存-不同内容互不串", "t_cache_path_independent"),
-    ("上传-建消息失败不重传", "t_sendmedia_retry_reuses_upload"),
-    ("上传-复用已有分片", "t_slice_reuse_from_lostfound"),
-    ("上传-切片变了不复用", "t_slice_reuse_rejects_mismatch"),
-    ("上传-PUT立刻返回", "t_up_accept"),
-    ("上传-后台传完清staging", "t_up_finish"),
-    ("上传-删掉未传完的", "t_up_delete_pending"),
-    ("上传-移动后仍能传完", "t_up_move_pending"),
-    ("上传-覆盖未传完的", "t_up_overwrite_pending"),
-    ("上传-崩溃后重启续传", "t_up_crash_recover"),
-    ("上传-清无主staging", "t_up_gc_orphan_staging"),
-    ("范围-Store分段读", "t_range_store"),
-    ("范围-HTTP 206与416", "t_range_http"),
-    ("范围-传完后从TG读", "t_range_after_upload"),
-    ("范围-命中缓存seek", "t_range_cache_hit"),
-    ("补洞-Range 顺带落盘", "t_fill_from_range"),
-    ("补洞-后台补齐并转正", "t_fill_complete"),
-    ("补洞-全0块打成稀疏", "t_fill_punch_zeros"),
-    ("补洞-已有缓存不重建", "t_fill_no_partial_after_full_get"),
-    ("补洞-缓存关时不建", "t_fill_off_when_cache_off"),
-    ("边界-小于一块的文件", "t_edge_tiny_file"),
-    ("边界-正好一块", "t_edge_one_block"),
-    ("边界-尾块不足一块", "t_edge_tail_block"),
-    ("边界-全份与后缀Range", "t_edge_whole_and_suffix"),
-    ("边界-空文件Range", "t_edge_empty_file"),
-    ("边界-并发Range不同块", "t_edge_concurrent_ranges"),
-    ("边界-部分缓存被篡改", "t_edge_tampered_partial"),
-    ("边界-部分缓存长度变了", "t_edge_partial_size_changed"),
-    ("边界-跨分片Range", "t_edge_multislice_range"),
-    ("边界-上传中Range不建缓存", "t_edge_staging_range"),
-    ("边界-部分缓存不被淘汰", "t_edge_part_not_evicted"),
-    ("边界-部分缓存过期清理", "t_edge_part_ttl"),
-    ("边界-补洞失败保留", "t_edge_fill_failure_keeps_partial"),
-    ("边界-补洞关闭", "t_edge_fill_rate_zero"),
-    ("边界-全量与Range并发", "t_edge_full_get_and_range_race"),
-    ("备份-写完不立即推快照", "t_backup_idle_only"),
-    ("备份-只留最近N份", "t_backup_keep_n"),
-    ("单设备-写操作零 TG 往返", "t_write_no_tg_rpc"),
+    ("路径规范化", t_paths),
+    ("索引基本操作", t_index),
+    ("写入后读出", t_put_get),
+    ("秒传只存一份", t_dedup),
+    ("移动复制删除", t_move_copy_delete),
+    ("拒绝移入子树", t_bad_move),
+    ("多分片读写", t_multislice),
+    ("并发写入", t_concurrent_put),
+    ("后台上传队列", t_uploader),
+    ("重建索引", t_reindex),
+    ("旧库自动迁移", t_migrate_legacy),
+    ("快照上传与拉回", t_snapshot_roundtrip),
+    ("TG 锁获取与释放", t_lock_roundtrip),
+    ("WebDAV 基本语义", t_dav_basic),
+    ("WebDAV Range", t_dav_range),
+    ("WebDAV 断点续传", t_dav_content_range),
+    ("WebDAV MOVE/COPY/DELETE", t_dav_move_copy),
+    ("WebDAV Depth:infinity 拒绝", t_dav_depth_infinity),
 ]
 
 
@@ -129,55 +587,8 @@ async def main():
     only = None
     if "-k" in sys.argv:
         only = sys.argv[sys.argv.index("-k") + 1]
-    group = None
-    if "--group" in sys.argv:
-        group = sys.argv[sys.argv.index("--group") + 1]
-
-    if "--full" in sys.argv:
-        # 默认不锁（单设备）。--full 才把分布式锁接回来，
-        # 那几个锁用例断言的正是 TG 锁协议。
-        os.environ["TGND_LOCK"] = "tg"
-
-    if "--real" in sys.argv:                    # 连真实 Telegram
-        from telethon import TelegramClient
-        api_id = int(os.environ["TG_API_ID"])
-        api_hash = os.environ["TG_API_HASH"]
-        chat = os.environ["TG_CHAT"]
-        chat = int(chat) if str(chat).lstrip("-").isdigit() else chat
-        client = TelegramClient(make_session(os.environ["TG_SESSION"]), api_id, api_hash,
-                                device_model=os.environ.get("TG_DEVICE", "tgnd-test"),
-                                system_version="Linux", app_version="tgnd")
-        await client.connect()
-        st = Store(client, chat)
-        st.fast = "--full" not in sys.argv
-        await st.load()
-    else:                                       # 默认：内存版 TG
-        client = FakeClient()
-        st = Store(client, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
-        st.fast = "--full" not in sys.argv
-
-    ctx = type("Ctx", (), {"st": st, "client": client})()
-
-    # 各组把函数注册成 {名字: 可调用}，入口按 CASES 的原顺序跑，保证输出稳定
-    import tests_store
-    import tests_race
-    import tests_dav
-    import tests_upload
-    import tests_cache
-    import tests_edge
-    fns = {}
-    for mod in (tests_store, tests_race, tests_dav, tests_upload,
-                tests_cache, tests_edge):
-        if group and mod.__name__ != group:
-            continue
-        for name, fn in await mod.main(ctx):
-            assert name not in fns, "用例重名: %s" % name
-            fns[name] = fn
-
-    for label, fname in CASES:
-        if fname not in fns:
-            continue
-        fn = fns[fname]
+    ctx = await make_ctx()
+    for label, fn in CASES:
         if only and only not in label:
             continue
         try:
@@ -186,25 +597,10 @@ async def main():
         except AssertionError as e:
             rec(label, False, str(e) or "断言失败")
         except Exception as e:
-            rec(label, False, "%s: %s" % (type(e).__name__, e))
+            rec(label, False, f"{type(e).__name__}: {e}")
             traceback.print_exc()
-
-    # 收尾：删测试目录并提交索引
-    try:
-        if st.get("/_test"):
-            await st.delete("/_test")
-    except Exception as e:
-        print("清理失败:", e)
-
-    if not st.fast:
-        try:
-            await st.wait_released(10)
-        except Exception:
-            pass
-
-    await client.disconnect()
     ok = sum(1 for _, o, _ in RESULTS if o)
-    print("\n===== PASS=%d FAIL=%d =====" % (ok, len(RESULTS) - ok))
+    print(f"\n===== PASS={ok} FAIL={len(RESULTS) - ok} =====")
     return 0 if ok == len(RESULTS) else 1
 
 

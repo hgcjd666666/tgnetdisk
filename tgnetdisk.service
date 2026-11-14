@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/tgnd
 EnvironmentFile=/opt/tgnd/env
-ExecStart=/opt/venv/bin/python /opt/tgnd/server.py
+ExecStart=/opt/venv/bin/python /opt/tgnd/main.py
 Restart=always
 RestartSec=5
 
