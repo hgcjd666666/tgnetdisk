@@ -101,6 +101,22 @@ def parse_content_range(v: str):
     return a, b, t
 
 
+def parse_progress_query(v: str):
+    """bytes */total 或 bytes */* → total（或 None）；不是进度查询返回 False。
+
+    客户端靠它问「服务端已经收到第几个字节了」，不携带任何 body。
+    必须单独拦住：parse_content_range 认不出来，落到普通 PUT 分支会把
+    一个空 body 当成整份内容，直接把文件覆盖成 0 字节。
+    """
+    if not v:
+        return False
+    m = re.match(r"^\s*bytes\s+\*/(\d+|\*)\s*$", v)
+    if not m:
+        return False
+    t = m.group(1)
+    return None if t == "*" else int(t)
+
+
 def href_for(path: str, is_dir: bool) -> str:
     p = quote(norm(path), safe="/")
     if is_dir and not p.endswith("/"):
@@ -307,7 +323,14 @@ class DAV:
             return Response(409, text="is a collection")
         existed = e is not None
         cl = request.content_length
-        cr = parse_content_range(request.headers.get("Content-Range", ""))
+        raw_cr = request.headers.get("Content-Range", "")
+        q = parse_progress_query(raw_cr)
+        if q is not False:
+            # 进度查询：只回服务端已收到的长度，绝不写字节
+            st = self._resume.get(path)
+            off = st["have"] if st and (q is None or st["want"] == q) else 0
+            return Response(308, headers={"X-Upload-Offset": str(off)})
+        cr = parse_content_range(raw_cr)
         if cr:
             return await self._put_chunked(request, path, cr, existed)
         with cachemod.hold(cl or 0) as ok:
@@ -339,11 +362,18 @@ class DAV:
                 pass
 
     async def _put_chunked(self, request, path, cr, existed):
-        """Content-Range 续传：分多次把同一个文件写完，最后一段收齐才算完成。"""
+        """Content-Range 续传：分多次把同一个文件写完，最后一段收齐才算完成。
+
+        状态（临时文件 + 累计摘要）挂在 self._resume[path] 上活过一次请求：
+        摘要跟着分块累计，收尾时直接取 hex，不再把临时文件整个重读一遍。
+        """
         start, end, total = cr
         st = self._resume.get(path)
         if st is None or st["want"] != total or start == 0:
-            st = {"tmp": self.vfs.staging_tmp("cr"), "have": 0, "want": total}
+            if st is not None:
+                self._forget(path)          # 旧临时文件不能留在 staging 里
+            st = {"tmp": self.vfs.staging_tmp("cr"), "have": 0, "want": total,
+                  "dg": tg.Digest()}
             self._resume[path] = st
         if start != st["have"]:
             return Response(400, text="bad offset",
@@ -355,18 +385,41 @@ class DAV:
             with os.fdopen(fd, "wb") as f:
                 async for chunk in request.content.iter_chunked(CHUNK):
                     await asyncio.to_thread(f.write, chunk)
+                    st["dg"].update(chunk)   # 落盘之后才算，摘要与文件严格同步
                     got += len(chunk)
         except Exception:
+            self._sync(st)                   # 网络断了：把文件截到摘要长度
             raise
         st["have"] = start + got
         if st["have"] < total:
             return Response(308, headers={"X-Upload-Offset": str(st["have"])})
         tmp = st["tmp"]
+        h = st["dg"].hex()
+        size = st["dg"].size
         self._resume.pop(path, None)
-        h = await asyncio.to_thread(tg.digest_of, tmp)
-        size = os.path.getsize(tmp)
         self.vfs.finish_put(path, tmp, h, size, self._mtime(request))
         return Response(204 if existed else 201)
+
+    def _forget(self, path: str):
+        """丢掉一条续传状态，顺手删掉它的临时文件。"""
+        st = self._resume.pop(path, None)
+        if st and st.get("tmp"):
+            try:
+                os.unlink(st["tmp"])
+            except OSError:
+                pass
+
+    def _sync(self, st):
+        """异常中断后把磁盘长度对齐到已算入摘要的字节数。"""
+        try:
+            os.truncate(st["tmp"], st["dg"].size)
+            st["have"] = st["dg"].size
+        except OSError:
+            self._resume = {k: v for k, v in self._resume.items() if v is not st}
+            try:
+                os.unlink(st["tmp"])
+            except OSError:
+                pass
 
     @staticmethod
     def _mtime(request) -> int:

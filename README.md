@@ -115,6 +115,31 @@ rclone mount tg: /mnt/tg
 | `PROPPATCH` | 空 207（客户端设置属性不会报错） |
 | `LOCK` | 不支持，回 405 |
 
+## 断点续传（非标准扩展）
+
+只有 `Content-Range` 一种用法，文件总长必须一开始就告诉服务端。
+
+```
+PUT /big.iso
+Content-Range: bytes 0-10485759/5368709120      # 前 10 MiB
+→ 308, X-Upload-Offset: 10485760
+
+PUT /big.iso
+Content-Range: bytes 10485760-20971519/5368709120
+→ 308, X-Upload-Offset: 20971520
+
+... 最后一块 ...
+
+Content-Range: bytes 5368709119-5368709119/5368709120
+→ 201，此刻才算写完
+```
+
+- offset 必须**严格等于**服务端已收长度，不连续就回 `400` + 真实的 `X-Upload-Offset`。
+- 想先问「传了多长」：`PUT` 空 body + `Content-Range: bytes */<总长>`（或 `bytes */*`），回 `308` + `X-Upload-Offset`，**不写任何字节**。
+- 忘了总长、想重来：`Content-Range: bytes 0-N/总长` 会从头覆盖这次上传。
+- 收尾前不碰目标路径、不碰 TG，字节只躺在 `$CACHE/staging/.cr-*`。
+- 限制：续传状态在进程内存里，**服务重启后续传作废**（客户端会收到 `400` + `X-Upload-Offset: 0`，只能从头发）。
+
 ## 安全
 
 - 不开 `DAV_PASS` 就等于**任何能连到这个端口的人都能读写删**。绑 `0.0.0.0` 前务必设置，或者把 `DAV_BIND` 改成 `127.0.0.1` 走隧道。

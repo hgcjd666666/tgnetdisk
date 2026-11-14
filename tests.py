@@ -7,6 +7,7 @@
 """
 import asyncio
 import datetime
+import hashlib
 import os
 import sys
 import tempfile
@@ -554,18 +555,41 @@ async def t_dav_content_range(ctx):
     cli = await make_dav(ctx)
     try:
         data = rand(200000)
-        cut = 80000
+        cut, cut2 = 80000, 150000
         r = await cli.put("/c/x.bin", data=data[:cut],
                           headers={"Content-Range": f"bytes 0-{cut-1}/{len(data)}"})
         assert r.status == 308, (r.status, await r.text())
-        off = int(r.headers.get("X-Upload-Offset"))
-        assert off == cut, off
-        r = await cli.put("/c/x.bin", data=data[cut:],
-                          headers={"Content-Range": f"bytes {cut}-{len(data)-1}/{len(data)}"})
+        assert int(r.headers.get("X-Upload-Offset")) == cut
+        # 进度查询：不写字节，只回已收长度
+        r = await cli.put("/c/x.bin", data=b"",
+                          headers={"Content-Range": f"bytes */{len(data)}"})
+        assert r.status == 308 and int(r.headers.get("X-Upload-Offset")) == cut
+        assert "X-Upload-Offset" in r.headers
+        # 顺序错了要 400 并告诉真实位置
+        r = await cli.put("/c/x.bin", data=data[cut2:],
+                          headers={"Content-Range": f"bytes {cut2}-{len(data)-1}/{len(data)}"})
+        assert r.status == 400 and int(r.headers.get("X-Upload-Offset")) == cut
+        r = await cli.put("/c/x.bin", data=data[cut:cut2],
+                          headers={"Content-Range": f"bytes {cut}-{cut2-1}/{len(data)}"})
+        assert r.status == 308 and int(r.headers.get("X-Upload-Offset")) == cut2
+        # 查询在第二块之后也对
+        r = await cli.put("/c/x.bin", data=b"", headers={"Content-Range": "bytes */*"})
+        assert int(r.headers.get("X-Upload-Offset")) == cut2
+        r = await cli.put("/c/x.bin", data=data[cut2:],
+                          headers={"Content-Range": f"bytes {cut2}-{len(data)-1}/{len(data)}"})
         assert r.status == 201, (r.status, await r.text())
         await ctx.vfs.upload_pending("/c/x.bin")
         r = await cli.get("/c/x.bin")
         assert await r.read() == data
+        # 跨三块的累计摘要必须和整份一致
+        e = ctx.index.get("/c/x.bin")
+        assert e.size == len(data)
+        assert e.hash == hashlib.shake_128(data).hexdigest(16), "跨请求累计摘要不一致"
+        # 没有任何状态时查询回 0，而不是把文件写坏
+        r = await cli.put("/c/none.bin", data=b"",
+                          headers={"Content-Range": "bytes */999"})
+        assert r.status == 308 and r.headers.get("X-Upload-Offset") == "0"
+        assert ctx.index.get("/c/none.bin") is None
     finally:
         await cli.close()
 
