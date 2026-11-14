@@ -482,6 +482,10 @@ async def t_lostfound_fragments(ctx):
     assert got2 == p2, "分片 2 的内容不对"
     # 不该凭空合成一个完整的 /lost+found/<hash>
     assert ctx.vfs.get(f"/lost+found/{h}") is None
+    # 内容键要带原始序号，不是重编号成 0
+    assert ctx.index.content(f"{h}.0") is not None
+    assert ctx.index.content(f"{h}.2") is not None
+    assert ctx.index.content(f"{h}.1") is None
 
 
 # ---------------- WebDAV ----------------

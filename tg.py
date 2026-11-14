@@ -70,9 +70,9 @@ def is_db_msg(msg) -> bool:
     return False
 
 
-def slice_key(h: str, idx: int) -> str:
-    """残片单独成一条内容时用的键。带序号，不会和完整内容的 hash 撞。"""
-    return "%s-s%d" % (h, idx)
+def fragment_key(h: str, idx: int) -> str:
+    """残片单独成一条内容时的键：保留它原始的序号。"""
+    return "%s.%d" % (h, idx)
 
 
 def slice_name(h: str, idx: int) -> str:
@@ -567,12 +567,12 @@ class TGStore:
                 self.index.content_put(h, size, parts)
             else:
                 # 序号不连续：拼起来就是错位的字节流，不能当一份内容。
-                # 每个分片单独记成一条内容（重编号成 0），各自可下载。
+                # 每个分片单独记一条（保留原始序号），各自可下载。
                 for idx in idxs:
                     m = await self.client.get_messages(self.chat, ids=parts[idx])
                     size = int(getattr(getattr(m, "document", None), "size", 0) or 0)
                     if size > 0:
-                        self.index.content_put(slice_key(h, idx), size, {0: parts[idx]})
+                        self.index.content_put(fragment_key(h, idx), size, {0: parts[idx]})
         # 已有路径如果内容变完整了，把上传中标记改成完成
         for path, h, mtime, status in self.index.all_files():
             if status == STATUS_PENDING and h and self.index.content(h):
@@ -597,7 +597,7 @@ class TGStore:
                 # 残片就按分片一条条列出来：/lost+found/<hash>.<序号>，
                 # 每个都能单独下载，交付的是那一片真实的字节
                 for idx in idxs:
-                    key = slice_key(h, idx)
+                    key = fragment_key(h, idx)
                     got = self.index.content(key)
                     if not got or not got[1]:
                         continue
