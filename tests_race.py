@@ -401,36 +401,9 @@ def _env(**kw):
     return restore
 
 
-async def t_lock_file_across_processes(ctx):
-    """单设备模式：<db>.lock 要挡住别的进程（server 与 cli 就是两个进程）。"""
-    import subprocess
-    restore = _env(ONLINE=1, TGND_LOCK="file")
-    o = Store(ctx.client, ctx.st.chat, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
-    code = (
-        "import fcntl,os,sys\n"
-        "fd=os.open(sys.argv[1], os.O_CREAT|os.O_RDWR, 0o600)\n"
-        "try:\n"
-        "    fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)\n"
-        "    print('GOT')\n"
-        "except OSError:\n"
-        "    print('BUSY')\n")
-    def probe():
-        r = subprocess.run([sys.executable, "-c", code, o._lock_path()],
-                           capture_output=True, text=True, timeout=30)
-        return r.stdout.strip()
-    try:
-        await o.acquire_local()
-        assert probe() == "BUSY", "别的进程在持锁期间不应拿到 <db>.lock"
-        await o.release_local()
-        assert probe() == "GOT", "释放后别的进程应该能拿到"
-    finally:
-        await o.release_local()
-        restore()
-
-
 async def t_backup_idle_only(ctx):
     """写操作只改本地索引；有改动且空闲够久了后台才推快照，推完不重复传。"""
-    restore = _env(ONLINE=1, TGND_LOCK="file", SNAPSHOT_SEC=10)
+    restore = _env(ONLINE=1, TGND_LOCK="none", SNAPSHOT_SEC=10)
     try:
         c = FakeClient()
         o = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
@@ -452,7 +425,7 @@ async def t_backup_idle_only(ctx):
 
 async def t_backup_keep_n(ctx):
     """SNAPSHOT_KEEP=2：留最近两份，旧的自动删掉；置顶的是最新那份。"""
-    restore = _env(ONLINE=1, TGND_LOCK="file", SNAPSHOT_SEC=0, SNAPSHOT_KEEP=2)
+    restore = _env(ONLINE=1, TGND_LOCK="none", SNAPSHOT_SEC=0, SNAPSHOT_KEEP=2)
     try:
         c = FakeClient()
         o = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
@@ -474,7 +447,7 @@ async def t_backup_keep_n(ctx):
 
 async def t_write_no_tg_rpc(ctx):
     """单设备模式的写操作（mkdir/move/copy/delete）不该产生任何 TG 往返。"""
-    restore = _env(ONLINE=1, TGND_LOCK="file", SNAPSHOT_SEC=10)
+    restore = _env(ONLINE=1, TGND_LOCK="none", SNAPSHOT_SEC=10)
     try:
         c = FakeClient()
         o = Store(c, 1, backend=SqliteBackend(tempfile.mktemp(suffix=".db")))
@@ -499,7 +472,6 @@ async def t_write_no_tg_rpc(ctx):
 async def main(ctx):
     return [
         ("t_lock_bootstrap", t_lock_bootstrap),
-        ("t_lock_file_across_processes", t_lock_file_across_processes),
         ("t_write_no_tg_rpc", t_write_no_tg_rpc),
         ("t_backup_idle_only", t_backup_idle_only),
         ("t_backup_keep_n", t_backup_keep_n),

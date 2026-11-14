@@ -9,7 +9,6 @@
 import abc
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
-import fcntl
 import functools
 import hashlib
 import io
@@ -472,24 +471,23 @@ def is_online() -> bool:
     return os.environ.get("ONLINE", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
-LOCK_MODES = ("tg", "file", "none")
-
-
 def lock_mode() -> str:
-    """写索引时的互斥方式。
+    """要不要跨设备协调索引写入。
 
-    tg   —— 跨设备：锁挂在 TG 置顶快照的 caption 上，每写一次都要先等别人让出来。
-    file —— 单设备（默认）：flock 一个 <db>.lock。同一台机器上的 server 与 cli
-            本来就是同一个索引文件，进程间互斥用文件锁就够了，不碰 TG。
-    none —— 只靠 sqlite 自己串行（测试用）。
+    tg   —— 多设备：锁挂在 TG 置顶快照的 caption 上，写前抢、写完推快照并放锁。
+    none —— 单设备（默认）：不锁。同一台机器上的 server 与 cli 本来就是同一个
+            sqlite 文件，WAL + busy timeout 已经把并发写串起来了，再加一层锁
+            只是让 MOVE 多等几趟网络。
 
-    只有 tg 需要跨设备协调：它保证「读-改-写」期间没有第二个节点推快照，
-    代价是每笔写操作至少三次网络往返。单设备时这几趟 RPC 纯属浪费。
+    锁存在的唯一理由是「防止别的设备同时改索引」：两个节点各推各的快照，
+    后推的会整库覆盖先推的。只有一台设备在写时这个风险不存在。
     """
     if not is_online():
         return "none"
-    m = (os.environ.get("TGND_LOCK") or "file").strip().lower()
-    return m if m in LOCK_MODES else "file"
+    m = (os.environ.get("TGND_LOCK") or "none").strip().lower()
+    if m == "file":
+        m = "none"          # 旧配置：本机文件锁已取消，等价于不锁
+    return "tg" if m == "tg" else "none"
 
 
 def need_tg_lock() -> bool:
@@ -1182,22 +1180,18 @@ class _WriteGuard:
         s = self.s
         await s.mutex.acquire()
         try:
-            if not s.fast:
-                if need_tg_lock():
-                    await s.ensure_fresh()
-                    if not s._holding:
-                        await s.acquire()
-                    if self.lease > 0:
-                        s._lease = self.lease
-                        s._touch()
-                        if s._lease_task is None or s._lease_task.done():
-                            s._lease_task = asyncio.create_task(s._lease_watch())
-                elif lock_mode() == "file":
-                    await s.acquire_local()
+            if not s.fast and need_tg_lock():
+                await s.ensure_fresh()
+                if not s._holding:
+                    await s.acquire()
+                if self.lease > 0:
+                    s._lease = self.lease
+                    s._touch()
+                    if s._lease_task is None or s._lease_task.done():
+                        s._lease_task = asyncio.create_task(s._lease_watch())
             s._in_guard = True
             return self
         except Exception:
-            await s.release_local()
             s.mutex.release()
             raise
 
@@ -1205,7 +1199,6 @@ class _WriteGuard:
         s = self.s
         s._in_guard = False
         s._touch()                    # 后台备份靠它判断「空闲了多久」
-        await s.release_local()
         s.mutex.release()
 
 
@@ -1233,8 +1226,6 @@ class Store:
         self._replaced = {}           # register 覆盖掉的旧条目，等 upload_pending 成功后清理
         self._graveyard = []          # 索引里已经删掉、等着删 TG 消息的分片 id
         self._flush_task = None
-        self._lock_fd = None          # file 模式：<db>.lock 的 fd
-        self._lock_held = False
         self._snap_ids = []           # TG 上保留的快照消息 id（最近的在最后）
         self._backup_wake = asyncio.Event()   # 写操作结束后叫一声后台备份
         # 单设备模式启动时不拉远端快照，得从本地 meta 里认出「上一版是哪条消息」，
@@ -1262,39 +1253,6 @@ class Store:
             return self.backend.get("/") is None and not self.backend.children("/")
         except Exception:
             return True
-
-    # ---------- 本机进程间互斥 ----------
-    def _lock_path(self) -> str:
-        path = getattr(self.backend, "path", None) or DB_PATH
-        return os.path.abspath(path) + ".lock"
-
-    async def acquire_local(self):
-        """flock 一个 <db>.lock：同一台机器上的 server 与 cli 靠它串行。
-
-        调用方必须已经持有 self.mutex。同一进程里两个协程共用同一个 fd，
-        flock 会把它们当成同一个持有者（第二次上锁直接成功），进程内的互斥
-        只能靠 mutex，flock 只负责挡住别的进程。
-        """
-        if self._lock_held:
-            return
-        if self._lock_fd is None:
-            path = self._lock_path()
-            self._lock_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            await asyncio.to_thread(fcntl.flock, self._lock_fd, fcntl.LOCK_EX)
-        except OSError as ex:
-            log.warning("本地文件锁获取失败（继续无锁写）: %s", ex)
-            return
-        self._lock_held = True
-
-    async def release_local(self):
-        if not self._lock_held:
-            return
-        self._lock_held = False
-        try:
-            await asyncio.to_thread(fcntl.flock, self._lock_fd, fcntl.LOCK_UN)
-        except OSError as ex:
-            log.warning("本地文件锁释放失败: %s", ex)
 
     async def _open_cached(self, cp: str, e, path: str):
         """打开缓存条目；长度不对就丢掉重下。返回文件对象或 None。"""
@@ -2325,8 +2283,6 @@ class Store:
         nonblock=True 时锁被别的节点占着就立刻抛 LockBusy（给 WebDAV 的收尾用，
         否则每个写请求都要在锁上等满 acquire 的 timeout）。
         """
-        # 不拿本地写锁：dump 是 sqlite 事务读，推送是网络 IO，都阻塞不了索引写入。
-        # 两个进程同时推只会多发一条内容等价的消息，比让请求等几秒划算得多。
         fd, tmp = tempfile.mkstemp(prefix="tgnd_db_", suffix=".xz")
         os.close(fd)
         try:
@@ -2429,7 +2385,7 @@ class Store:
             pass
 
     def _lock_text(self) -> str:
-        """锁状态写在快照消息的 caption 里：空闲 lock:null，锁定 lock:<hash>。单机模式留空。"""
+        """锁状态写在快照消息的 caption 里：空闲 lock:null，锁定 lock:<hash>。单设备模式留空。"""
         if not need_tg_lock():
             return ""
         return (LOCK_PREFIX + self.token) if self._holding else LOCK_IDLE
@@ -2461,7 +2417,7 @@ class Store:
         空闲时是 `lock:null`，被占用时是 `lock:<sha256(盐+token)>`。
         token 本身是 TG_SESSION 的 sha256 派生值，不暴露 session。
         """
-        if not need_tg_lock():                  # file/none 模式：不碰 TG，直接认为持有
+        if not need_tg_lock():                  # 单设备模式：不碰 TG，直接认为持有
             self._holding = True
             return
         mine = LOCK_PREFIX + self.token
@@ -2582,8 +2538,7 @@ class Store:
         """写操作统一入口（CLI 用：进程短命，退出前必须把索引推上去）。
 
         tg   —— 抢分布式锁 → 干完 → 推快照 → 放锁；lease>0 时落库交给 _lease_watch。
-        file —— 只拿本地文件锁；干完立刻推快照，没有后台进程替它兜底。
-        none —— 不碰任何锁，只按 dirty 推快照。
+        none —— 不碰锁（单设备：sqlite 自己串行），干完立刻推快照。
         """
         if self._in_guard:                      # 重入
             self._touch()
@@ -2596,8 +2551,6 @@ class Store:
                 await self.ensure_fresh()
                 if not self._holding:
                     await self.acquire(timeout=timeout, nonblock=(timeout <= 0))
-            elif mode == "file":
-                await self.acquire_local()
         except Exception:
             self._in_guard = False
             raise
@@ -2626,8 +2579,6 @@ class Store:
             finally:
                 if mode == "tg":
                     await self.release()
-                elif mode == "file":
-                    await self.release_local()
                 self._in_guard = False
 
     def kick_backup(self):
@@ -2645,6 +2596,8 @@ class Store:
         gap = snap_idle() if idle is None else idle
         if time.time() - self._last_op < gap:
             return False
+        if self.mutex.locked():
+            return False               # 正好有写操作在跑，下一轮再来，别跟它抢
         try:
             await self.snapshot_locked(nonblock=True)
             return True
@@ -2680,6 +2633,9 @@ class Store:
 
         但如果本地库里记着「上次有改动没推上去」，先把自己推上去，否则会被旧快照覆盖。
         """
+        return await self._load_locked(pid)
+
+    async def _load_locked(self, pid: int | None = None):
         if self.backend.get_meta("dirty") == "1":
             log.info("本地有未落库的改动，先推快照")
             try:
